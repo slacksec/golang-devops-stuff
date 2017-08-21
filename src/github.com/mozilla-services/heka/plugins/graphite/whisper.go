@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,15 +16,16 @@ package graphite
 
 import (
 	"fmt"
-	. "github.com/mozilla-services/heka/pipeline"
-	"github.com/mozilla-services/heka/plugins"
-	"github.com/rafrombrc/whisper-go/whisper"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+
+	. "github.com/mozilla-services/heka/pipeline"
+	"github.com/mozilla-services/heka/plugins"
+	"github.com/rafrombrc/whisper-go/whisper"
 )
 
 // WhisperRunners listen for *whisper.Point data values to come in on an input
@@ -110,6 +111,7 @@ type WhisperOutput struct {
 	defaultArchiveInfo []whisper.ArchiveInfo
 	dbs                map[string]WhisperRunner
 	folderPerm         os.FileMode
+	pConfig            *PipelineConfig
 }
 
 // WhisperOutput config struct.
@@ -141,15 +143,21 @@ func (o *WhisperOutput) ConfigStruct() interface{} {
 	}
 }
 
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (o *WhisperOutput) SetPipelineConfig(pConfig *PipelineConfig) {
+	o.pConfig = pConfig
+}
+
 func (o *WhisperOutput) Init(config interface{}) (err error) {
 	conf := config.(*WhisperOutputConfig)
-	o.basePath = PrependBaseDir(conf.BasePath)
+	globals := o.pConfig.Globals
+	o.basePath = globals.PrependBaseDir(conf.BasePath)
 	o.defaultAggMethod = conf.DefaultAggMethod
 
 	var intPerm int64
 	if intPerm, err = strconv.ParseInt(conf.FolderPerm, 8, 32); err != nil {
-		err = fmt.Errorf("WhisperOutput '%s' can't parse `folder_perm`, ",
-			"is it an octal integer string?", o.basePath)
+		err = fmt.Errorf("WhisperOutput '%s' can't parse `folder_perm`, is it an octal integer string?", o.basePath)
 		return
 	}
 	o.folderPerm = os.FileMode(intPerm)
@@ -205,7 +213,8 @@ func (o *WhisperOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 
 	for pack = range or.InChan() {
 		lines := strings.Split(strings.Trim(pack.Message.GetPayload(), " \n"), "\n")
-		pack.Recycle() // Once we've copied the payload we're done w/ the pack.
+		or.UpdateCursor(pack.QueueCursor)
+		pack.Recycle(nil) // Once we've copied the payload we're done w/ the pack.
 		for _, line := range lines {
 			// `fields` should be "<name> <value> <timestamp>"
 			fields = strings.Fields(line)

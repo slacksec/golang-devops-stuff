@@ -16,29 +16,31 @@ Sandbox plugins. The are consumed by Heka when it initializes the plugin.
 - preserve_data (bool):
     True if the sandbox global data should be preserved/restored on plugin
     shutdown/startup. When true this works in conjunction with a global Lua
-    _PRESERVATION_VERSION variable which is examined during restoration;
-    if the previous version does not match the current version the restoration
-    will be aborted and the sandbox will start cleanly. _PRESERVATION_VERSION
-    should be incremented any time an incompatible change is made to the global
-    data schema. If no version is set the check will always succeed and a 
-    version of zero is assumed.
+    _PRESERVATION_VERSION variable which is examined during restoration; if the
+    previous version does not match the current version the restoration will be
+    aborted and the sandbox will start cleanly. _PRESERVATION_VERSION should be
+    incremented any time an incompatible change is made to the global data
+    schema. If no version is set the check will always succeed and a version of
+    zero is assumed.
 
 - memory_limit (uint):
     The number of bytes the sandbox is allowed to consume before being
-    terminated (max 8MiB, default max).
+    terminated (default 8MiB).
 
 - instruction_limit (uint):
-    The number of instructions the sandbox is allowed the execute during the
-    process_message function before being terminated (max 1M, default max).
+    The number of instructions the sandbox is allowed to execute during the
+    process_message/timer_event functions before being terminated (default 1M).
 
 - output_limit (uint):
-    The number of bytes the sandbox output buffer can hold before before being
-    terminated (max 63KiB, default max).  Anything less than 64B is set to
-    64B.
+    The number of bytes the sandbox output buffer can hold before being
+    terminated (default 63KiB). Warning: messages exceeding 64KiB will generate
+    an error and be discarded by the standard output plugins (File, TCP, UDP)
+    since they exceed the maximum message size.
 
 - module_directory (string):
-    The directory where 'require' will attempt to load the external Lua
-    modules from.  Defaults to ${SHARE_DIR}/lua_modules.
+    The directory or directories where 'require' will attempt to load the
+    external Lua modules from. Supports multiple paths separated by
+    semicolons. Defaults to ${SHARE_DIR}/lua_modules.
 
 - config (object):
     A map of configuration variables available to the sandbox via read_config.

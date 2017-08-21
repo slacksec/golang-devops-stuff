@@ -4,12 +4,13 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012-2014
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
 #   Victor Ng (vng@mozilla.com)
 #   Rob Miller (rmiller@mozilla.com)
+#   Justin Judd (justin@justinjudd.org)
 #
 # ***** END LICENSE BLOCK *****/
 
@@ -19,12 +20,101 @@ import (
 	"errors"
 	"fmt"
 	"github.com/mozilla-services/heka/message"
-	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// multiDecoderNode is used for making sure MultiDecoder dependencies are addressed
+type multiDecoderNode struct {
+	name            string
+	subs            []string
+	dependencyCount int
+}
+
+func newMultiDecoderNode(name string, subs []string) multiDecoderNode {
+	return multiDecoderNode{name, subs, -1}
+}
+
+// multiDecoderNodeList fulfills sort.Interface
+type multiDecoderNodeList []multiDecoderNode
+
+func (m multiDecoderNodeList) Len() int {
+	return len(m)
+}
+
+func (m multiDecoderNodeList) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+func (m multiDecoderNodeList) Less(i, j int) bool {
+	a := m[i]
+	b := m[j]
+
+	return a.dependencyCount < b.dependencyCount
+}
+
+// utility function to make a copy of a map
+func copyMap(m map[string]bool) map[string]bool {
+	d := map[string]bool{}
+	for k, v := range m {
+		d[k] = v
+	}
+	return d
+}
+
+// orderDependencies determines MultiDecoder hierarchy and orders them accordingly
+func orderDependencies(decoders []multiDecoderNode) ([]multiDecoderNode, error) {
+
+	nodeMap := make(map[string]multiDecoderNode, 0)
+	for _, node := range decoders {
+		nodeMap[node.name] = node
+	}
+
+	// rankFunc is a recursive function to traverse graphs from nodes to the root
+	var rankFunc func(name string, seen map[string]bool) (int, error)
+	rankFunc = func(name string, seen map[string]bool) (int, error) {
+		if seen[name] { // If this node has been seen in this path, it means that there is a circular dependency
+			return -1, errors.New("circular dependency detected")
+		}
+		node := nodeMap[name]
+		if node.dependencyCount >= 0 { // If dependency count is not -1, than we have already calculated it
+			return node.dependencyCount, nil
+		}
+		dependencyCount := len(node.subs)
+		seen[name] = true
+		for _, sub := range node.subs {
+			c, err := rankFunc(sub, copyMap(seen))
+			if err != nil {
+				return -1, err
+			}
+			dependencyCount += c
+		}
+		node.dependencyCount = dependencyCount
+		nodeMap[name] = node
+		return dependencyCount, nil
+	}
+
+	// Make sure that rankFunc is called for each multiDecoderNode
+	for _, node := range decoders {
+		_, err := rankFunc(node.name, map[string]bool{})
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Compile all nodes with dependency count into slice
+	finishedNodes := make(multiDecoderNodeList, 0)
+	for _, node := range nodeMap {
+		finishedNodes = append(finishedNodes, node)
+	}
+
+	// sort nodes so that those with no dependencies are earlier in the list
+	sort.Sort(finishedNodes)
+
+	return finishedNodes, nil
+}
 
 // DecoderRunner wrapper that the MultiDecoder will hand to any subs that ask
 // for one. Shadows some data and methods, but doesn't spin up any goroutines.
@@ -52,11 +142,11 @@ func (mdr *mDRunner) Decoder() Decoder {
 }
 
 func (mdr *mDRunner) LogError(err error) {
-	log.Printf("SubDecoder '%s' error: %s", mdr.name, err)
+	LogError.Printf("SubDecoder '%s' error: %s", mdr.name, err)
 }
 
 func (mdr *mDRunner) LogMessage(msg string) {
-	log.Printf("SubDecoder '%s': %s", mdr.name, msg)
+	LogInfo.Printf("SubDecoder '%s': %s", mdr.name, msg)
 }
 
 type MultiDecoder struct {
@@ -71,11 +161,13 @@ type MultiDecoder struct {
 	sampleDenominator      int
 	sample                 bool
 	reportLock             sync.RWMutex
+	pConfig                *PipelineConfig
 	Config                 *MultiDecoderConfig
 	Name                   string
 	Decoders               []Decoder
 	dRunner                DecoderRunner
 	CascStrat              int
+	neverTrustEncodes      bool
 }
 
 type MultiDecoderConfig struct {
@@ -102,6 +194,12 @@ func (md *MultiDecoder) SetName(name string) {
 	md.Name = name
 }
 
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (md *MultiDecoder) SetPipelineConfig(pConfig *PipelineConfig) {
+	md.pConfig = pConfig
+}
+
 func (md *MultiDecoder) Init(config interface{}) (err error) {
 	md.Config = config.(*MultiDecoderConfig)
 
@@ -111,7 +209,6 @@ func (md *MultiDecoder) Init(config interface{}) (err error) {
 	}
 
 	md.Decoders = make([]Decoder, len(md.Config.Subs))
-	pConfig := Globals().PipelineConfig
 
 	var (
 		ok      bool
@@ -123,17 +220,36 @@ func (md *MultiDecoder) Init(config interface{}) (err error) {
 	}
 
 	for i, name := range md.Config.Subs {
-		if decoder, ok = pConfig.Decoder(name); !ok {
+		if decoder, ok = md.pConfig.Decoder(name); !ok {
 			return fmt.Errorf("Non-existent subdecoder: %s", name)
 		}
 		md.Decoders[i] = decoder
+	}
+
+	// We can trust the embedded decoders to leave the pack.MsgBytes and
+	// pack.TrustMsgBytes values in the right state in all cases except when
+	// cascade_strategy == "all", an earlier decoder sets the encoding, but
+	// the last one in the list does not. We check for this case and, if so,
+	// explicitly set pack.TrustMsgBytes to false for all packs on every
+	// successful decode.
+	if md.CascStrat == CASC_ALL {
+		lastDecoder := md.Decoders[len(md.Decoders)-1]
+		_, ok = lastDecoder.(EncodesMsgBytes)
+		if !ok {
+			for _, d := range md.Decoders {
+				if _, ok = d.(EncodesMsgBytes); ok {
+					md.neverTrustEncodes = true
+					break
+				}
+			}
+		}
 	}
 
 	md.processMessageCount = make([]int64, numSubs)
 	md.processMessageFailures = make([]int64, numSubs)
 	md.processMessageSamples = make([]int64, numSubs)
 	md.processMessageDuration = make([]int64, numSubs)
-	md.sampleDenominator = Globals().SampleDenominator
+	md.sampleDenominator = md.pConfig.Globals.SampleDenominator
 	return nil
 }
 
@@ -280,7 +396,7 @@ func (md *MultiDecoder) Decode(pack *PipelinePack) (packs []*PipelinePack, err e
 		err = errors.New("All subdecoders failed.")
 		packs = nil
 	} else {
-		// If we get here we know cascade_strategy == "all.
+		// If we get here we know cascade_strategy == "all".
 		var anyMatch bool
 		md.idx = 0
 		packs, anyMatch = md.getDecodedPacks(md.Decoders, []*PipelinePack{pack})
@@ -288,9 +404,17 @@ func (md *MultiDecoder) Decode(pack *PipelinePack) (packs []*PipelinePack, err e
 			atomic.AddInt64(&md.totalMessageFailures, 1)
 			err = errors.New("All subdecoders failed.")
 			packs = nil
+		} else if md.neverTrustEncodes {
+			for _, p := range packs {
+				p.TrustMsgBytes = false
+			}
 		}
 	}
 	return
+}
+
+func (md *MultiDecoder) EncodesMsgBytes() bool {
+	return true
 }
 
 func (md *MultiDecoder) ReportMsg(msg *message.Message) error {

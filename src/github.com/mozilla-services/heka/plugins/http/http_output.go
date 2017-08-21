@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2014
+# Portions created by the Initial Developer are Copyright (C) 2014-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -18,14 +18,15 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/pipeline"
-	"github.com/mozilla-services/heka/plugins/tcp"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/mozilla-services/heka/pipeline"
+	"github.com/mozilla-services/heka/plugins/tcp"
 )
 
 type HttpOutput struct {
@@ -43,7 +44,7 @@ type HttpOutputConfig struct {
 	Headers     http.Header
 	Username    string `toml:"username"`
 	Password    string `toml:"password"`
-	Tls         *tcp.TlsConfig
+	Tls         tcp.TlsConfig
 }
 
 func (o *HttpOutput) ConfigStruct() interface{} {
@@ -76,9 +77,9 @@ func (o *HttpOutput) Init(config interface{}) (err error) {
 	if o.Username != "" || o.Password != "" {
 		o.useBasicAuth = true
 	}
-	if o.url.Scheme == "https" && o.Tls != nil {
+	if o.url.Scheme == "https" {
 		transport := &http.Transport{}
-		if transport.TLSClientConfig, err = tcp.CreateGoTlsConfig(o.Tls); err != nil {
+		if transport.TLSClientConfig, err = tcp.CreateGoTlsConfig(&o.Tls); err != nil {
 			return fmt.Errorf("TLS init error: %s", err.Error())
 		}
 		o.client.Transport = transport
@@ -99,13 +100,22 @@ func (o *HttpOutput) Run(or pipeline.OutputRunner, h pipeline.PluginHelper) (err
 
 	for pack := range inChan {
 		outBytes, e = or.Encode(pack)
-		pack.Recycle()
 		if e != nil {
-			or.LogError(e)
+			or.UpdateCursor(pack.QueueCursor)
+			pack.Recycle(fmt.Errorf("can't encode: %s", e))
+			continue
+		}
+		if outBytes == nil {
+			or.UpdateCursor(pack.QueueCursor)
+			pack.Recycle(nil)
 			continue
 		}
 		if e = o.request(or, outBytes); e != nil {
-			or.LogError(e)
+			e = pipeline.NewRetryMessageError(e.Error())
+			pack.Recycle(e)
+		} else {
+			or.UpdateCursor(pack.QueueCursor)
+			pack.Recycle(nil)
 		}
 	}
 
@@ -137,11 +147,13 @@ func (o *HttpOutput) request(or pipeline.OutputRunner, outBytes []byte) (err err
 	if resp, err = o.client.Do(req); err != nil {
 		return fmt.Errorf("Error making HTTP request: %s", err.Error())
 	}
+	defer resp.Body.Close()
+	io.Copy(ioutil.Discard, resp.Body)
+
 	if resp.StatusCode >= 400 {
-		var body []byte
-		if resp.ContentLength > 0 {
-			body = make([]byte, resp.ContentLength)
-			resp.Body.Read(body)
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("Error reading HTTP response: %s", err.Error())
 		}
 		return fmt.Errorf("HTTP Error code returned: %d %s - %s",
 			resp.StatusCode, resp.Status, string(body))

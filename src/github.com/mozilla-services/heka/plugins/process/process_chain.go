@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -28,18 +28,7 @@ import (
 // has been exceeded. A timeout duration value of 0 indicates that no timeout
 // is enforced.
 type ManagedCmd struct {
-	exec.Cmd
-
-	Path string
-	Args []string
-	// Env specifies the environment of the process. If Env is nil, Run uses
-	// the current process's environment.
-	Env []string
-
-	// Dir specifies the working directory of the command. If Dir is the empty
-	// string, the calling process's current directory will be used as the
-	// working directory.
-	Dir string
+	*exec.Cmd
 
 	done     chan error
 	Stopchan chan bool
@@ -55,27 +44,18 @@ type ManagedCmd struct {
 }
 
 func NewManagedCmd(path string, args []string, timeout time.Duration) (mc *ManagedCmd) {
-	mc = &ManagedCmd{Path: path, Args: args, timeout_duration: timeout}
+	mc = &ManagedCmd{timeout_duration: timeout}
 	mc.done = make(chan error)
 	mc.Stopchan = make(chan bool, 1)
-	mc.Cmd = *exec.Command(mc.Path, mc.Args...)
-	mc.Cmd.Env = mc.Env
-	mc.Cmd.Dir = mc.Dir
+	mc.Cmd = exec.Command(path, args...)
 	return mc
 }
 
 func (mc *ManagedCmd) Start(pipeOutput bool) (err error) {
 	if pipeOutput {
-		var stdout_w *io.PipeWriter
-		var stderr_w *io.PipeWriter
-
-		mc.Stdout_r, stdout_w = io.Pipe()
-		mc.Stderr_r, stderr_w = io.Pipe()
-
-		mc.Cmd.Stdout = stdout_w
-		mc.Cmd.Stderr = stderr_w
+		mc.Stdout_r, mc.Stdout = io.Pipe()
+		mc.Stderr_r, mc.Stderr = io.Pipe()
 	}
-
 	return mc.Cmd.Start()
 }
 
@@ -130,13 +110,17 @@ func (mc *ManagedCmd) kill() (err error) {
 	}
 	// killing process will make Wait() return
 	<-mc.done
-	return fmt.Errorf("subprocess was killed: [%s %s]", mc.Path, strings.Join(mc.Args, " "))
+	return fmt.Errorf("subprocess was killed: [%s]", strings.Join(mc.Args, " "))
 }
 
-// This resets a command so that we can run the command again.
-// Usually so that a chain can be restarted.
+// This resets a command so that we can run the command again. Usually so that
+// a chain can be restarted.
 func (mc *ManagedCmd) clone() (clone *ManagedCmd) {
-	clone = NewManagedCmd(mc.Path, mc.Args, mc.timeout_duration)
+	// mc.Args[0] should always be == mc.Path, so mc.Args[1:] should be safe
+	// to use here.
+	clone = NewManagedCmd(mc.Path, mc.Args[1:], mc.timeout_duration)
+	clone.Env = mc.Env
+	clone.Dir = mc.Dir
 	return clone
 }
 
@@ -149,18 +133,27 @@ type CommandChain struct {
 	// pipeline should run for before the Wait() returns a timeout error.
 	timeout_duration time.Duration
 
-	done     chan error
+	done     chan CommandChainStatus
 	Stopchan chan bool
+}
+
+// A CommandChainStatus records the return execution result of a command chain.
+// ReturnStatus stores the return status of the command chain, which is the
+// return status of the last successfully executed command.
+// SubcmdErrors stores the errors of each subcommand.
+type CommandChainStatus struct {
+	ExitStatus   error
+	SubcmdErrors error
 }
 
 func NewCommandChain(timeout time.Duration) (cc *CommandChain) {
 	cc = &CommandChain{timeout_duration: timeout}
-	cc.done = make(chan error)
+	cc.done = make(chan CommandChainStatus)
 	cc.Stopchan = make(chan bool, 1)
 	return cc
 }
 
-// Add a single command to our command chain, piping stdout to stdin for each
+// Add A single command to our command chain, piping stdout to stdin for each
 // stage.
 func (cc *CommandChain) AddStep(Path string, Args ...string) (cmd *ManagedCmd) {
 	cmd = NewManagedCmd(Path, Args, cc.timeout_duration)
@@ -200,8 +193,7 @@ func (cc *CommandChain) Start() (err error) {
 		}
 
 		if err != nil {
-			return fmt.Errorf("Command [%s %s] triggered an error: [%s]",
-				cmd.Path,
+			return fmt.Errorf("Command [%s] triggered an error: [%s]",
 				strings.Join(cmd.Args, " "),
 				err.Error())
 		}
@@ -209,19 +201,22 @@ func (cc *CommandChain) Start() (err error) {
 	return nil
 }
 
-func (cc *CommandChain) Wait() (err error) {
+func (cc *CommandChain) Wait() (cc_status CommandChainStatus) {
 	/* You need to Wait and close the stdout for each
 	   stage in order, except that you do *not* want to close the last
 	   output pipe as we need to use that to get the final results.  */
 	go func() {
 		var subcmd_err error
+		var cc_status CommandChainStatus
 		subcmd_errors := make([]string, 0)
 
 		for i, cmd := range cc.Cmds {
 			subcmd_err = cmd.Wait()
+			cc_status.ExitStatus = subcmd_err
+
 			if subcmd_err != nil {
 				subcmd_errors = append(subcmd_errors,
-					fmt.Sprintf("Subcommand returned an error: [%s]", subcmd_err.Error()))
+					fmt.Sprintf("Subcommand[%d] returned an error: [%s]", i, subcmd_err.Error()))
 			}
 			if i < (len(cc.Cmds) - 1) {
 				subcmd_err = cmd.Stdout.(*io.PipeWriter).Close()
@@ -232,16 +227,17 @@ func (cc *CommandChain) Wait() (err error) {
 			}
 		}
 		if len(subcmd_errors) > 0 {
-			cc.done <- fmt.Errorf(strings.Join(subcmd_errors, "\n"))
+			cc_status.SubcmdErrors = fmt.Errorf(strings.Join(subcmd_errors, "\n"))
+			cc.done <- cc_status
 		} else {
-			cc.done <- nil
+			cc.done <- cc_status
 		}
 	}()
 
 	done := false
 	for !done {
 		select {
-		case err = <-cc.done:
+		case cc_status = <-cc.done:
 			done = true
 		case <-cc.Stopchan:
 			for i := 0; i < len(cc.Cmds); i++ {
@@ -250,15 +246,19 @@ func (cc *CommandChain) Wait() (err error) {
 			}
 		}
 	}
-	return err
+	return cc_status
 }
 
 // This resets a command so that we can run the command again.
 // Usually so that a chain can be restarted.
 func (cc *CommandChain) clone() (clone *CommandChain) {
 	clone = NewCommandChain(cc.timeout_duration)
-	for _, cmd := range cc.Cmds {
-		clone.AddStep(cmd.Path, cmd.Args...)
+	for _, orig := range cc.Cmds {
+		// mc.Args[0] should always be == mc.Path, so mc.Args[1:] should be
+		// safe to use here.
+		cmd := clone.AddStep(orig.Path, orig.Args[1:]...)
+		cmd.Env = orig.Env
+		cmd.Dir = orig.Dir
 	}
 	return clone
 }

@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -29,8 +29,11 @@ func ProcessChainSpec(c gs.Context) {
 
 	readCommandOutput := func(reader io.Reader, resultChan chan string) {
 		data, err := ioutil.ReadAll(reader)
-		c.Expect(err, gs.IsNil)
-		resultChan <- string(data)
+		if err != nil {
+			resultChan <- fmt.Sprintf("TESTERROR: %s", err.Error())
+		} else {
+			resultChan <- string(data)
+		}
 	}
 
 	c.Specify("A ManagedCommand", func() {
@@ -58,7 +61,8 @@ func ProcessChainSpec(c gs.Context) {
 			go readCommandOutput(cmd.Stdout_r, output)
 			cmd.Wait()
 			end := time.Now()
-			<-output
+			outputStr := <-output
+			c.Expect(strings.HasPrefix(outputStr, "TESTERROR"), gs.IsFalse)
 			actualDuration := end.Sub(start)
 			c.Expect(actualDuration < time.Second*10, gs.Equals, true)
 		})
@@ -77,7 +81,9 @@ func ProcessChainSpec(c gs.Context) {
 
 			// Error messages will vary platform to platform, just check that
 			// there is some message which will be about "No such file found".
-			c.Expect(len(<-stderrResults) > 0, gs.Equals, true)
+			errOutput := <-stderrResults
+			c.Expect(len(errOutput) > 0, gs.Equals, true)
+			c.Expect(strings.HasPrefix(errOutput, "TESTERROR"), gs.IsFalse)
 			c.Expect(<-stdoutResults, gs.Equals, "")
 		})
 
@@ -140,8 +146,8 @@ func ProcessChainSpec(c gs.Context) {
 			go readCommandOutput(stdoutReader, stdoutResult)
 			go readCommandOutput(stderrReader, stderrResult)
 
-			err = chain.Wait()
-			c.Expect(err, gs.IsNil)
+			cc := chain.Wait()
+			c.Expect(cc.SubcmdErrors, gs.IsNil)
 
 			c.Expect(<-stderrResult, gs.Equals, "")
 			c.Expect(<-stdoutResult, gs.Equals, PIPE_CMD_OUTPUT)
@@ -160,11 +166,11 @@ func ProcessChainSpec(c gs.Context) {
 			err = chain.Start()
 			start := time.Now()
 			c.Expect(err, gs.IsNil)
-			err = chain.Wait()
+			cc := chain.Wait()
 			end := time.Now()
 			actual_duration := end.Sub(start)
-			c.Expect(err, gs.Not(gs.IsNil))
-			c.Expect(strings.Contains(err.Error(), "was killed"), gs.Equals, true)
+			c.Expect(cc.SubcmdErrors, gs.Not(gs.IsNil))
+			c.Expect(strings.Contains(cc.SubcmdErrors.Error(), "was killed"), gs.Equals, true)
 			c.Expect(actual_duration < time.Second*10, gs.Equals, true)
 		})
 
@@ -182,10 +188,10 @@ func ProcessChainSpec(c gs.Context) {
 			time.Sleep(NONZERO_TIMEOUT)
 
 			chain.Stopchan <- true
-			err = chain.Wait()
+			cc := chain.Wait()
 			end := time.Now()
 			actual_duration := end.Sub(start)
-			c.Expect(err, gs.Not(gs.IsNil))
+			c.Expect(cc.SubcmdErrors, gs.Not(gs.IsNil))
 			c.Expect(actual_duration < timeout, gs.Equals, true)
 		})
 
@@ -211,8 +217,8 @@ func ProcessChainSpec(c gs.Context) {
 			go readCommandOutput(stdoutReader, stdoutResult)
 			go readCommandOutput(stderrReader, stderrResult)
 
-			err = chain.Wait()
-			c.Expect(err, gs.IsNil)
+			cc := chain.Wait()
+			c.Expect(cc.SubcmdErrors, gs.IsNil)
 
 			c.Expect(<-stderrResult, gs.Equals, "")
 			c.Expect(<-stdoutResult, gs.Equals, PIPE_CMD_OUTPUT)
@@ -232,8 +238,8 @@ func ProcessChainSpec(c gs.Context) {
 			go readCommandOutput(stdoutReader, stdoutResult)
 			go readCommandOutput(stderrReader, stderrResult)
 
-			err = chain.Wait()
-			c.Expect(err, gs.IsNil)
+			cc = chain.Wait()
+			c.Expect(cc.SubcmdErrors, gs.IsNil)
 
 			c.Expect(<-stderrResult, gs.Equals, "")
 			c.Expect(<-stdoutResult, gs.Equals, PIPE_CMD_OUTPUT)

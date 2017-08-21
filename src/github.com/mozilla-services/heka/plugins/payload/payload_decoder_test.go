@@ -17,13 +17,13 @@
 package payload
 
 import (
-	"code.google.com/p/gomock/gomock"
 	"errors"
 	"fmt"
 	"github.com/mozilla-services/heka/message"
 	. "github.com/mozilla-services/heka/pipeline"
 	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
 	"github.com/mozilla-services/heka/pipelinemock"
+	"github.com/rafrombrc/gomock/gomock"
 	"github.com/rafrombrc/gospec/src/gospec"
 	gs "github.com/rafrombrc/gospec/src/gospec"
 	"io/ioutil"
@@ -187,6 +187,34 @@ func PayloadDecodersSpec(c gospec.Context) {
 				time.UTC)
 			_, err = decoder.Decode(pack)
 			c.Expect(pack.Message.GetTimestamp(), gs.Equals, cur_date.UnixNano())
+			pack.Zero()
+		})
+
+		c.Specify("supports Epoch timestamp", func() {
+			conf.MatchRegex = `\[(?P<Timestamp>[^\]]+)\]`
+			conf.TimestampLayout = "Epoch"
+			err := decoder.Init(conf)
+			c.Assume(err, gs.IsNil)
+			dRunner := pipelinemock.NewMockDecoderRunner(ctrl)
+			decoder.SetDecoderRunner(dRunner)
+			pack.Message.SetPayload("[1414448234]")
+			_, err = decoder.Decode(pack)
+			c.Expect(err, gs.IsNil)
+			c.Expect(pack.Message.GetTimestamp(), gs.Equals, int64(1414448234000000000))
+			pack.Zero()
+		})
+
+		c.Specify("supports Epoch timestamp w/ float", func() {
+			conf.MatchRegex = `\[(?P<Timestamp>[^\]]+)\]`
+			conf.TimestampLayout = "Epoch"
+			err := decoder.Init(conf)
+			c.Assume(err, gs.IsNil)
+			dRunner := pipelinemock.NewMockDecoderRunner(ctrl)
+			decoder.SetDecoderRunner(dRunner)
+			pack.Message.SetPayload("[1414448234.638504391]")
+			_, err = decoder.Decode(pack)
+			c.Expect(err, gs.IsNil)
+			c.Expect(pack.Message.GetTimestamp(), gs.Equals, int64(1414448234638504391))
 			pack.Zero()
 		})
 

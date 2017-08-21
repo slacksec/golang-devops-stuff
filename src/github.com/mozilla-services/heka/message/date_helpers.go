@@ -4,18 +4,20 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
 #   Ben Bangert (bbangert@mozilla.com)
+#   Rob Miller (rmiller@mozilla.com)
 #
 # ***** END LICENSE BLOCK *****/
 
 package message
 
 import (
-	"regexp"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -38,129 +40,76 @@ var (
 		"StampMicro":  time.StampMicro,
 		"StampNano":   time.StampNano,
 	}
-
-	dateMatchStrings = []string{
-		// Mon Jan _2 15:04:05 2006
-		"SDAY SMONTH\\s{1,2}\\d{1,2} \\d{2}:\\d{2}:\\d{2} \\d{4}",
-		// Mon Jan _2 15:04:05 MST 2006
-		"SDAY SMONTH\\s{1,2}\\d{1,2} \\d{2}:\\d{2}:\\d{2} \\w{3} \\d{4}",
-		// Mon Jan 02 15:04:05 -0700 2006
-		"SDAY SMONTH \\d{2} \\d{2}:\\d{2}:\\d{2} -\\d{4} \\d{4}",
-		// 02 Jan 06 15:04 MST
-		"SDAY SMONTH \\d{2} \\d{2}:\\d{2} \\w{3}",
-		// 02 Jan 06 15:04 -0700
-		"\\d{2} SMONTH \\d{2} \\d{2}:\\d{2} \\w{3} -\\d{4}",
-		// Monday, 02-Jan-06 15:04:05 MST
-		"DAY \\d{2}-SMONTH-\\d{2} \\d{2}:\\d{2}:\\d{2} \\w{3}",
-		// Mon, 02 Jan 2006 15:04:05 MST
-		"SDAY \\d{2} SMONTH \\d{4} \\d{2}:\\d{2}:\\d{2} \\w{3}",
-		// Mon, 02 Jan 2006 15:04:05 -0700
-		"SDAY \\d{2} SMONTH \\d{4} \\d{2}:\\d{2}:\\d{2} \\w{3} -\\d{4}",
-		// 2006-01-02T15:04:05Z07:00
-		"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z\\d{2}:\\d{2}",
-		// 2006-01-02T15:04:05.999999999Z07:00
-		"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d+Z\\d{2}:\\d{2}",
-		// 3:04PM - Kitchen format.... really? Kitchen? sigh.
-		"\\d{1,2}:\\d{2}[AP]M",
-		// Jan _2 15:04:05
-		"SMONTH\\s{1,2}\\d{1,2} \\d{2}:\\d{2}:\\d{2}",
-		// Jan _2 15:04:05.000
-		"SMONTH\\s{1,2}\\d{1,2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}",
-		// Jan _2 15:04:05.000000
-		"SMONTH\\s{1,2}\\d{1,2} \\d{2}:\\d{2}:\\d{2}\\.\\d{6}",
-		// Jan _2 15:04:05.000000000
-		"SMONTH\\s{1,2}\\d{1,2} \\d{2}:\\d{2}:\\d{2}\\.\\d{9}",
-	}
-
-	// We have to duplicate this, cause time doesn't export them. Blech.
-	longDayNames = []string{
-		"Sunday",
-		"Monday",
-		"Tuesday",
-		"Wednesday",
-		"Thursday",
-		"Friday",
-		"Saturday",
-	}
-
-	shortDayNames = []string{
-		"Sun",
-		"Mon",
-		"Tue",
-		"Wed",
-		"Thu",
-		"Fri",
-		"Sat",
-	}
-
-	shortMonthNames = []string{
-		"---",
-		"Jan",
-		"Feb",
-		"Mar",
-		"Apr",
-		"May",
-		"Jun",
-		"Jul",
-		"Aug",
-		"Sep",
-		"Oct",
-		"Nov",
-		"Dec",
-	}
-
-	// A mapping that returns a complex regular expression string for
-	// a commonly matched portion rather than having to construct one.
-	//
-	// Currently HelperRegexSubs has the following keys upon startup that
-	// may be used:
-	//     TIMESTAMP  -  A complex regular expression string that matches
-	//                   any of the Go time const layouts.
-	HelperRegexSubs map[string]string
 )
 
 // Parse a time with the supplied timeLayout, falling back to all the
 // basicTimeLayouts.
-func ForgivingTimeParse(timeLayout, inputTime string, loc *time.Location) (
-	parsedTime time.Time, err error) {
+func ForgivingTimeParse(timeLayout, inputTime string, loc *time.Location) (time.Time, error) {
 
-	parsedTime, err = time.ParseInLocation(timeLayout, inputTime, loc)
-	if err == nil {
-		return
+	var (
+		parsedTime time.Time
+		err        error
+	)
+
+	if strings.HasPrefix(timeLayout, "Epoch") {
+		var (
+			parsedInt  uint64
+			multiplier int
+		)
+
+		switch timeLayout {
+		case "Epoch":
+			multiplier = 9
+		case "EpochMilli":
+			multiplier = 6
+		case "EpochMicro":
+			multiplier = 3
+		case "EpochNano":
+			multiplier = 0
+		default:
+			err := fmt.Errorf("Unrecognized `Epoch` time format: %s", timeLayout)
+			return parsedTime, err
+		}
+
+		i := strings.Index(inputTime, ".")
+		if i == -1 {
+			// Integer values are easy, we append the right number of 0s and
+			// we're done.
+			zeroes := strings.Repeat("0", multiplier)
+			inputTime = inputTime + zeroes
+			parsedInt, err = strconv.ParseUint(inputTime, 10, 64)
+		} else {
+			// Noninteger need more care, we can't use floats or we'll lose
+			// timestamp precision. First calculate the number of decimal
+			// digits.
+			decDigits := len(inputTime) - i - 1
+			if decDigits < multiplier {
+				// Pad out zeroes to nanosecond resolution.
+				zeroes := strings.Repeat("0", multiplier-decDigits)
+				inputTime = inputTime + zeroes
+			} else if decDigits > multiplier {
+				// Truncate to nanosecond resolution.
+				inputTime = inputTime[:len(inputTime)-(decDigits-multiplier)]
+			}
+			// Finally remove the decimal and parse the value as an integer.
+			intStr := fmt.Sprintf("%s%s", inputTime[:i], inputTime[i+1:])
+			parsedInt, err = strconv.ParseUint(intStr, 10, 64)
+		}
+		if err != nil {
+			err = fmt.Errorf("Error parsing %s time: %s", timeLayout, err.Error())
+			return parsedTime, err
+		}
+		return time.Unix(0, int64(parsedInt)), nil
 	}
+
+	if parsedTime, err = time.ParseInLocation(timeLayout, inputTime, loc); err == nil {
+		return parsedTime, nil
+	}
+
 	for _, layout := range basicTimeLayouts {
-		parsedTime, err = time.ParseInLocation(layout, inputTime, loc)
-		if err == nil {
-			return
+		if parsedTime, err = time.ParseInLocation(layout, inputTime, loc); err == nil {
+			return parsedTime, nil
 		}
 	}
-	return
-}
-
-func init() {
-	HelperRegexSubs = make(map[string]string)
-
-	smonths := "(?:" + strings.Join(shortMonthNames, "|") + ")"
-	sdays := "(?:" + strings.Join(shortDayNames, "|") + ")"
-	days := "(?:" + strings.Join(longDayNames, "|") + ")"
-
-	newMatchStrings := make([]string, 0, 15)
-	replaceShorts, _ := regexp.Compile("(SDAY|DAY|SMONTH)")
-	for _, dateStr := range dateMatchStrings {
-		newStr := replaceShorts.ReplaceAllStringFunc(dateStr,
-			func(match string) string {
-				switch match {
-				case "SDAY":
-					return sdays
-				case "DAY":
-					return days
-				case "SMONTH":
-					return smonths
-				}
-				return match
-			})
-		newMatchStrings = append(newMatchStrings, "(?:"+newStr+")")
-	}
-	tsRegexString := "(?P<Timestamp>" + strings.Join(newMatchStrings, "|") + ")"
-	HelperRegexSubs["TIMESTAMP"] = tsRegexString
+	return parsedTime, err
 }

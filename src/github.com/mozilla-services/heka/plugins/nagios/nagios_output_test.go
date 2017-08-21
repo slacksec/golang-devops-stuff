@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,12 +16,7 @@ package nagios
 
 import (
 	"bufio"
-	"code.google.com/p/gomock/gomock"
 	"fmt"
-	"github.com/mozilla-services/heka/pipeline"
-	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
-	"github.com/mozilla-services/heka/pipelinemock"
-	gs "github.com/rafrombrc/gospec/src/gospec"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +25,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/mozilla-services/heka/pipeline"
+	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
+	"github.com/mozilla-services/heka/pipelinemock"
+	"github.com/rafrombrc/gomock/gomock"
+	gs "github.com/rafrombrc/gospec/src/gospec"
 )
 
 func TestAllSpecs(t *testing.T) {
@@ -66,13 +67,13 @@ func NagiosOutputSpec(c gs.Context) {
 		pack := pipeline.NewPipelinePack(recycleChan)
 		msg := pipeline_ts.GetTestMessage()
 		pack.Message = msg
-		pack.Decoded = true
 
 		var req *http.Request
 		var outputWg, reqWg sync.WaitGroup
 
 		run := func() {
 			mockOutputRunner.EXPECT().InChan().Return(inChan)
+			mockOutputRunner.EXPECT().UpdateCursor("").AnyTimes()
 			output.Run(mockOutputRunner, mockHelper)
 			outputWg.Done()
 		}
@@ -93,10 +94,7 @@ func NagiosOutputSpec(c gs.Context) {
 				reqWg.Done()
 			})
 
-			go func() {
-				e := http.Serve(listener, mux)
-				c.Assume(e, gs.Not(gs.IsNil))
-			}()
+			go http.Serve(listener, mux)
 
 			c.Specify("sends a valid HTTP POST", func() {
 				err = output.Init(config)

@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2013-2014
+# Portions created by the Initial Developer are Copyright (C) 2013-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,12 +16,7 @@
 package plugins
 
 import (
-	"code.google.com/p/goprotobuf/proto"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	"github.com/mozilla-services/heka/pipeline"
-	. "github.com/mozilla-services/heka/sandbox"
-	"github.com/mozilla-services/heka/sandbox/lua"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -29,6 +24,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gogo/protobuf/proto"
+	"github.com/mozilla-services/heka/message"
+	"github.com/mozilla-services/heka/pipeline"
+	. "github.com/mozilla-services/heka/sandbox"
+	"github.com/mozilla-services/heka/sandbox/lua"
+	"github.com/pborman/uuid"
 )
 
 // Decoder for converting structured/unstructured data into Heka messages.
@@ -40,19 +42,19 @@ type SandboxDecoder struct {
 	sb                     Sandbox
 	sbc                    *SandboxConfig
 	preservationFile       string
-	reportLock             sync.RWMutex
+	reportLock             sync.Mutex
 	sample                 bool
-	err                    error
 	pack                   *pipeline.PipelinePack
 	packs                  []*pipeline.PipelinePack
 	dRunner                pipeline.DecoderRunner
 	name                   string
 	tz                     *time.Location
 	sampleDenominator      int
+	pConfig                *pipeline.PipelineConfig
 }
 
 func (s *SandboxDecoder) ConfigStruct() interface{} {
-	return NewSandboxConfig()
+	return NewSandboxConfig(s.pConfig.Globals)
 }
 
 func (s *SandboxDecoder) SetName(name string) {
@@ -60,10 +62,18 @@ func (s *SandboxDecoder) SetName(name string) {
 	s.name = re.ReplaceAllString(name, "_")
 }
 
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (s *SandboxDecoder) SetPipelineConfig(pConfig *pipeline.PipelineConfig) {
+	s.pConfig = pConfig
+}
+
 func (s *SandboxDecoder) Init(config interface{}) (err error) {
 	s.sbc = config.(*SandboxConfig)
-	s.sbc.ScriptFilename = pipeline.PrependShareDir(s.sbc.ScriptFilename)
-	s.sampleDenominator = pipeline.Globals().SampleDenominator
+	globals := s.pConfig.Globals
+	s.sbc.ScriptFilename = globals.PrependShareDir(s.sbc.ScriptFilename)
+	s.sbc.PluginType = "decoder"
+	s.sampleDenominator = globals.SampleDenominator
 
 	s.tz = time.UTC
 	if tz, ok := s.sbc.Config["tz"]; ok {
@@ -73,7 +83,7 @@ func (s *SandboxDecoder) Init(config interface{}) (err error) {
 		}
 	}
 
-	data_dir := pipeline.PrependBaseDir(DATA_DIR)
+	data_dir := globals.PrependBaseDir(DATA_DIR)
 	if !fileExists(data_dir) {
 		err = os.MkdirAll(data_dir, 0700)
 		if err != nil {
@@ -96,11 +106,6 @@ func copyMessageHeaders(dst *message.Message, src *message.Message) {
 		return
 	}
 
-	if cap(src.Uuid) > 0 {
-		dst.SetUuid(src.Uuid)
-	} else {
-		dst.Uuid = nil
-	}
 	if src.Timestamp != nil {
 		dst.SetTimestamp(*src.Timestamp)
 	} else {
@@ -140,35 +145,40 @@ func (s *SandboxDecoder) SetDecoderRunner(dr pipeline.DecoderRunner) {
 
 	s.dRunner = dr
 	var original *message.Message
+	var err error
 
 	switch s.sbc.ScriptType {
 	case "lua":
-		s.sb, s.err = lua.CreateLuaSandbox(s.sbc)
+		s.sb, err = lua.CreateLuaSandbox(s.sbc)
 	default:
-		s.err = fmt.Errorf("unsupported script type: %s", s.sbc.ScriptType)
+		err = fmt.Errorf("unsupported script type: %s", s.sbc.ScriptType)
 	}
 
-	if s.err == nil {
-		s.preservationFile = filepath.Join(pipeline.PrependBaseDir(DATA_DIR), dr.Name()+DATA_EXT)
+	if err == nil {
+		s.preservationFile = filepath.Join(s.pConfig.Globals.PrependBaseDir(DATA_DIR),
+			dr.Name()+DATA_EXT)
 		if s.sbc.PreserveData && fileExists(s.preservationFile) {
-			s.err = s.sb.Init(s.preservationFile, "decoder")
+			err = s.sb.Init(s.preservationFile)
 		} else {
-			s.err = s.sb.Init("", "decoder")
+			err = s.sb.Init("")
 		}
 	}
-	if s.err != nil {
-		dr.LogError(s.err)
+	if err != nil {
+		dr.LogError(err)
 		if s.sb != nil {
 			s.sb.Destroy("")
 			s.sb = nil
 		}
-		pipeline.Globals().ShutDown()
+		s.pConfig.Globals.ShutDown(1)
 		return
 	}
 
 	s.sb.InjectMessage(func(payload, payload_type, payload_name string) int {
 		if s.pack == nil {
 			s.pack = dr.NewPack()
+			if s.pack == nil {
+				return 5 // We're aborting, exit out.
+			}
 			if original == nil && len(s.packs) > 0 {
 				original = s.packs[0].Message // payload injections have the original header data in the first pack
 			}
@@ -176,11 +186,21 @@ func (s *SandboxDecoder) SetDecoderRunner(dr pipeline.DecoderRunner) {
 			original = nil // processing a new message, clear the old message
 		}
 		if len(payload_type) == 0 { // heka protobuf message
+			// write protobuf encoding to MsgBytes
+			needed := len(payload)
+			if cap(s.pack.MsgBytes) < needed {
+				s.pack.MsgBytes = make([]byte, len(payload))
+			} else {
+				s.pack.MsgBytes = s.pack.MsgBytes[:len(payload)]
+			}
+			copy(s.pack.MsgBytes, payload)
+			s.pack.TrustMsgBytes = true
+
 			if original == nil {
 				original = new(message.Message)
 				copyMessageHeaders(original, s.pack.Message) // save off the header values since unmarshal will wipe them out
 			}
-			if nil != proto.Unmarshal([]byte(payload), s.pack.Message) {
+			if nil != proto.Unmarshal(s.pack.MsgBytes, s.pack.Message) {
 				return 1
 			}
 			if s.tz != time.UTC {
@@ -189,8 +209,10 @@ func (s *SandboxDecoder) SetDecoderRunner(dr pipeline.DecoderRunner) {
 				t = t.In(time.UTC)
 				ct, _ := time.ParseInLocation(layout, t.Format(layout), s.tz)
 				s.pack.Message.SetTimestamp(ct.UnixNano())
+				s.pack.TrustMsgBytes = false
 			}
 		} else {
+			s.pack.TrustMsgBytes = false
 			s.pack.Message.SetPayload(payload)
 			ptype, _ := message.NewField("payload_type", payload_type, "file-extension")
 			s.pack.Message.AddField(ptype)
@@ -201,25 +223,32 @@ func (s *SandboxDecoder) SetDecoderRunner(dr pipeline.DecoderRunner) {
 			// if future injections fail to set the standard headers, use the values
 			// from the original message.
 			if s.pack.Message.Uuid == nil {
-				s.pack.Message.SetUuid(original.GetUuid())
+				s.pack.Message.SetUuid(uuid.NewRandom()) // UUID should always be unique
+				s.pack.TrustMsgBytes = false
 			}
 			if s.pack.Message.Timestamp == nil {
 				s.pack.Message.SetTimestamp(original.GetTimestamp())
+				s.pack.TrustMsgBytes = false
 			}
 			if s.pack.Message.Type == nil {
 				s.pack.Message.SetType(original.GetType())
+				s.pack.TrustMsgBytes = false
 			}
 			if s.pack.Message.Hostname == nil {
 				s.pack.Message.SetHostname(original.GetHostname())
+				s.pack.TrustMsgBytes = false
 			}
 			if s.pack.Message.Logger == nil {
 				s.pack.Message.SetLogger(original.GetLogger())
+				s.pack.TrustMsgBytes = false
 			}
 			if s.pack.Message.Severity == nil {
 				s.pack.Message.SetSeverity(original.GetSeverity())
+				s.pack.TrustMsgBytes = false
 			}
 			if s.pack.Message.Pid == nil {
 				s.pack.Message.SetPid(original.GetPid())
+				s.pack.TrustMsgBytes = false
 			}
 		}
 		s.packs = append(s.packs, s.pack)
@@ -229,20 +258,31 @@ func (s *SandboxDecoder) SetDecoderRunner(dr pipeline.DecoderRunner) {
 }
 
 func (s *SandboxDecoder) Shutdown() {
-	if s.sb != nil {
-		if s.sbc.PreserveData {
-			s.err = s.sb.Destroy(s.preservationFile)
-		} else {
-			s.err = s.sb.Destroy("")
-		}
-		s.sb = nil
-		if s.err != nil {
-			s.dRunner.LogError(s.err)
-		}
+	err := s.destroy()
+	if err != nil {
+		s.dRunner.LogError(err)
 	}
 }
 
-func (s *SandboxDecoder) Decode(pack *pipeline.PipelinePack) (packs []*pipeline.PipelinePack, err error) {
+func (s *SandboxDecoder) destroy() error {
+	s.reportLock.Lock()
+
+	var err error
+	if s.sb != nil {
+		if s.sbc.PreserveData {
+			err = s.sb.Destroy(s.preservationFile)
+		} else {
+			err = s.sb.Destroy("")
+		}
+		s.sb = nil
+	}
+	s.reportLock.Unlock()
+	return err
+}
+
+func (s *SandboxDecoder) Decode(pack *pipeline.PipelinePack) (packs []*pipeline.PipelinePack,
+	err error) {
+
 	if s.sb == nil {
 		err = fmt.Errorf("SandboxDecoder has been terminated")
 		return
@@ -264,20 +304,21 @@ func (s *SandboxDecoder) Decode(pack *pipeline.PipelinePack) (packs []*pipeline.
 	}
 	s.sample = 0 == rand.Intn(s.sampleDenominator)
 	if retval > 0 {
-		s.err = fmt.Errorf("FATAL: %s", s.sb.LastError())
-		s.dRunner.LogError(s.err)
-		pipeline.Globals().ShutDown()
+		err = fmt.Errorf("FATAL: %s", s.sb.LastError())
+		s.dRunner.LogError(err)
+		s.pConfig.Globals.ShutDown(1)
 	}
 	if retval < 0 {
 		atomic.AddInt64(&s.processMessageFailures, 1)
 		if s.pack != nil {
-			s.err = fmt.Errorf("Failed parsing: %s", s.pack.Message.GetPayload())
+			err = fmt.Errorf("Failed parsing: %s payload: %s",
+				s.sb.LastError(), s.pack.Message.GetPayload())
 		} else {
-			s.err = fmt.Errorf("Failed after a successful inject_message call")
+			err = fmt.Errorf("Failed after a successful inject_message call: %s", s.sb.LastError())
 		}
 		if len(s.packs) > 1 {
 			for _, p := range s.packs[1:] {
-				p.Recycle()
+				p.Recycle(nil)
 			}
 		}
 		s.packs = nil
@@ -291,18 +332,22 @@ func (s *SandboxDecoder) Decode(pack *pipeline.PipelinePack) (packs []*pipeline.
 		packs = s.packs
 	}
 	s.packs = nil
-	err = s.err
-	return
+	return packs, err
+}
+
+func (s *SandboxDecoder) EncodesMsgBytes() bool {
+	return true
 }
 
 // Satisfies the `pipeline.ReportingPlugin` interface to provide sandbox state
 // information to the Heka report and dashboard.
 func (s *SandboxDecoder) ReportMsg(msg *message.Message) error {
+	s.reportLock.Lock()
+	defer s.reportLock.Unlock()
+
 	if s.sb == nil {
 		return fmt.Errorf("Decoder is not running")
 	}
-	s.reportLock.RLock()
-	defer s.reportLock.RUnlock()
 
 	message.NewIntField(msg, "Memory", int(s.sb.Usage(TYPE_MEMORY,
 		STAT_CURRENT)), "B")

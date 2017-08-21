@@ -4,11 +4,12 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
 #   Ben Bangert (bbangert@mozilla.com)
+#   Rob Miller (rmiller@mozilla.com)
 #
 # ***** END LICENSE BLOCK *****/
 
@@ -21,19 +22,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/ringbuf"
 	"io"
+	"io/ioutil"
 	"os"
-	"strings"
+
+	"github.com/mozilla-services/heka/ringbuf"
 )
 
 // A location in a logstream indicating the farthest that has been read
 type LogstreamLocation struct {
-	SeekPosition int64            `json:"seek"`
-	Filename     string           `json:"file_name"`
-	Hash         string           `json:"last_hash"`
-	JournalPath  string           `json:"-"`
-	lastLine     *ringbuf.Ringbuf `json:"-"`
+	SeekPosition int64  `json:"seek"`
+	Filename     string `json:"file_name"`
+	Hash         string `json:"last_hash"`
+	JournalPath  string `json:"-"`
+	lastLine     *ringbuf.Ringbuf
 }
 
 var LINEBUFFERLEN = 500
@@ -90,7 +92,7 @@ func LogstreamLocationFromFile(path string) (l *LogstreamLocation, err error) {
 }
 
 func (l *LogstreamLocation) Debug() string {
-	return fmt.Sprintf("Location:\n\tFilename: %s\n\tJournal: %s\n\tSeek: %s\n\tHash: %s\n",
+	return fmt.Sprintf("Location:\n\tFilename: %s\n\tJournal: %s\n\tSeek: %d\n\tHash: %s\n",
 		l.Filename,
 		l.JournalPath,
 		l.SeekPosition,
@@ -98,18 +100,27 @@ func (l *LogstreamLocation) Debug() string {
 	)
 }
 
-// If the buffer is large enough, generate a hash value in the position
+// GenerateHash generates a hash value from the contents of the ringbuffer.
+// Uses the entire buffer if it is full. If we haven't advanced far enough in
+// the file to fill the ring buffer, we prepend 0 bytes to pad out to the
+// intended buffer length (500 bytes) before hashing.
 func (l *LogstreamLocation) GenerateHash() {
-	if l.lastLine.Size() == LINEBUFFERLEN {
-		lastLine := make([]byte, LINEBUFFERLEN)
+	lastLine := make([]byte, LINEBUFFERLEN)
+	var logline string
+	rBufSize := l.lastLine.Size()
+	if rBufSize == LINEBUFFERLEN {
 		n := l.lastLine.Read(lastLine)
-		logline := string(lastLine[:n])
+		logline = string(lastLine[:n])
+	} else {
+		idx := LINEBUFFERLEN - rBufSize
+		n := l.lastLine.Read(lastLine[idx:])
+		logline = string(lastLine[:idx+n])
+	}
 
-		if logline != "" {
-			h := sha1.New()
-			io.WriteString(h, logline)
-			l.Hash = fmt.Sprintf("%x", h.Sum(nil))
-		}
+	if logline != "" {
+		h := sha1.New()
+		io.WriteString(h, logline)
+		l.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
 }
 
@@ -123,12 +134,6 @@ func (l *LogstreamLocation) Reset() {
 func (l *LogstreamLocation) Save() error {
 	// If we don't have a JournalPath, ignore
 	if l.JournalPath == "" {
-		return nil
-	}
-
-	// Don't save if we had a prior has and haven't read more than
-	// LINEBUFFERLEN bytes into the file
-	if l.lastLine.Size() < LINEBUFFERLEN {
 		return nil
 	}
 
@@ -174,9 +179,17 @@ func (l *Logstream) NewerFileAvailable() (file string, ok bool) {
 		return "", false
 	}
 
+	priorWasEmpty := false
+	lastSize := currentInfo.Size()
+	newSize := fInfo.Size()
 	// 1. If our size is greater than the file at this filename, we're not the
-	// same file
-	if currentInfo.Size() > fInfo.Size() {
+	// same file.
+	if lastSize > newSize {
+		ok = true
+	} else if lastSize < newSize && lastSize == 0 {
+		// We have to double-check for cases where an empty file might have
+		// been deleted out from under us.
+		priorWasEmpty = true
 		ok = true
 	} else if l.FileHashMismatch() {
 		// Our file-hash didn't verify, not the same file
@@ -202,11 +215,10 @@ func (l *Logstream) NewerFileAvailable() (file string, ok bool) {
 			defer l.lfMutex.RUnlock()
 			if len(l.logfiles) > 0 {
 				file = l.logfiles[0].FileName
-				return
+				return file, ok
 			} else {
 				// Apparently no logfiles at all, retain this fd
-				ok = false
-				return
+				return file, false
 			}
 		}
 
@@ -222,7 +234,7 @@ func (l *Logstream) NewerFileAvailable() (file string, ok bool) {
 	if fileIndex == -1 {
 		// We couldn't find our filename in the list? Then there's nothing
 		// newer
-		return
+		return file, ok
 	}
 
 	if fileIndex+1 < len(l.logfiles) {
@@ -230,72 +242,45 @@ func (l *Logstream) NewerFileAvailable() (file string, ok bool) {
 		return l.logfiles[fileIndex+1].FileName, true
 	}
 
-	return
+	// Filename didn't change, but currently opened fd is empty and file system
+	// file is bigger. No way to tell if the file system file is the same or if
+	// it was replaced by a new file before the content was appended, so we
+	// force the file to be repoened.
+	if priorWasEmpty {
+		return l.position.Filename, true
+	}
+	return file, ok
 }
 
-// Determine if the file hash is a mismatch to whats in the file at the moment.
-// Only returns true if there is a mismatch.
-// Rationale:
-// This function is intended to return true in all cases except the case where
-// we are 100% certain that the filename at this location is *not* the one we
-// think it is. Thus the 'return true' on attempting to open the file if it fails
-// which could merely indicate some permissions got mangled but is not enough
-// to declare with certainty that the filename at this location is no longer what
-// we think it is. Note that when starting a logstream, the hash is verified
-// separately rather than calling this function (due to issues of fd movement).
+// FileHashMismatch uses the file path, seek location, and hash stored in the
+// Logstream's `position` attribute. It checks to see if the hash matches the
+// contents of the stored file path at the specified position. It returns true
+// if and only if it can be *concretely* shown that the stored hash in fact
+// does *not* match the contents of the file. If there is a match, or if for
+// any reason we can't determine if there is a match, then FileHashMismatch
+// will return false.
 func (l *Logstream) FileHashMismatch() bool {
 	// We always match our hash if we have no hash
 	if l.position.Hash == "" {
 		return false
 	}
 
-	fd, err := os.Open(l.position.Filename)
-	if err != nil {
-		return false
+	fd, _, err := SeekInFile(l.position.Filename, l.position)
+	if err == ErrorCantSeekPosition {
+		return true
+	} else if err == nil {
+		fd.Close()
 	}
-	defer fd.Close()
-
-	// Try to seek (or read, if the file is gzipped) to the last line but one.
-	var reader io.Reader
-	seekPos := l.position.SeekPosition - int64(LINEBUFFERLEN)
-
-	if isGzipFile(l.position.Filename) {
-		reader, err = gzip.NewReader(fd)
-		if err != nil {
-			return false
-		}
-		garbage := make([]byte, seekPos)
-		n, err := reader.Read(garbage)
-		if err != nil || int64(n) != seekPos {
-			return false
-		}
-	} else {
-		reader = fd
-		_, err = fd.Seek(l.position.SeekPosition-int64(LINEBUFFERLEN), 0)
-		if err != nil {
-			return false
-		}
-	}
-
-	// Check if the last line corresponds to the current hash.
-	buf := make([]byte, LINEBUFFERLEN)
-	n, err := reader.Read(buf)
-	if err == nil && n == LINEBUFFERLEN {
-		h := sha1.New()
-		h.Write(buf)
-		tmp := fmt.Sprintf("%x", h.Sum(nil))
-		if tmp == l.position.Hash {
-			return false
-		}
-	}
-	return true
+	return false
 }
 
 // Locate and return a file handle seeked to the appropriate location. An error will be
 // returned if the prior location cannot be located.
 // If the logfile this location for has changed names, the position will be updated to
 // reflect the move.
-func (l *Logstream) LocatePriorLocation(checkFilename bool) (fd *os.File, reader io.Reader, err error) {
+func (l *Logstream) LocatePriorLocation(checkFilename bool) (fd *os.File, reader io.Reader,
+	err error) {
+
 	var info os.FileInfo
 	l.lfMutex.RLock()
 	defer l.lfMutex.RUnlock()
@@ -359,23 +344,49 @@ func createFileReader(path string, fd *os.File) (reader io.Reader, err error) {
 	return
 }
 
-// Guesses if the given file is gzipped. Currently this uses the filename,
-// but it could sniff the file header.
+// Guesses if the given file is gzipped.
 func isGzipFile(path string) bool {
-	return strings.HasSuffix(path, ".gz")
-}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
 
-// Seek into a file, return an error if a match wasn't found
-func SeekInFile(path string, position *LogstreamLocation) (fd *os.File, reader io.Reader, err error) {
-	if fd, err = os.Open(path); err != nil {
-		return
+	magic := make([]byte, 2)
+	numbytes, err := file.Read(magic)
+	if numbytes != 2 || err != nil {
+		return false
 	}
 
+	return (magic[0] == 0x1f && magic[1] == 0x8b)
+}
+
+var ErrorCantSeekPosition = errors.New("Unable to locate position")
+var ErrorCantGzipToPosition = errors.New("Couldn't read gzip to seek position")
+
+// SeekInFile opens the file at the given path, seeks to the location
+// specified in the given position, hashes the contents of the file at that
+// position, and compares that to the hash value stored in the position
+// argument. If the hashes match, or if the seek position is the beginning of
+// the file so there's no hash to compare, then it will return the open file
+// descriptor and related io.Reader. If they do not, or anything goes wrong
+// along the way, then an error will be returned. Note that the fd and the
+// io.Reader will be the same except in cases where the file was gzipped, in
+// which case the io.Reader will be the gzip reader and not the raw file
+// descriptor.
+func SeekInFile(path string, position *LogstreamLocation) (*os.File, io.Reader, error) {
+	fd, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var reader io.Reader
+
 	// Try to get to our seek position, if our seek is 0, then start at the
-	// beginning
+	// beginning.
 	if position.SeekPosition == 0 {
 		reader, err = createFileReader(path, fd)
-		return
+		return fd, reader, err
 	}
 
 	seekPos := position.SeekPosition - int64(LINEBUFFERLEN)
@@ -385,30 +396,43 @@ func SeekInFile(path string, position *LogstreamLocation) (fd *os.File, reader i
 		if err != nil {
 			return nil, nil, err
 		}
-		garbage := make([]byte, seekPos)
-		n, err := reader.Read(garbage)
-		if err != nil {
-			return nil, nil, err
+		if seekPos > 0 {
+			n, err := io.CopyN(ioutil.Discard, reader, seekPos)
+			if err != nil {
+				return nil, nil, err
+			}
+			if n != seekPos {
+				return nil, nil, ErrorCantGzipToPosition
+			}
 		}
-		if int64(n) != seekPos {
-			return nil, nil, errors.New("Couldn't read gzip to seek position")
-		}
-
 	} else {
 		reader = fd
-		_, err = fd.Seek(seekPos, 0)
-		if err != nil {
-			return nil, nil, err
+		if seekPos > 0 {
+			_, err = fd.Seek(seekPos, 0)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
-	// We should be at the beginning of the last line read the last
-	// time Heka ran.
+	// At this point we have seeked into the file to the beginning of the
+	// content used to generate the hash last time Heka ran. Now we copy that
+	// data into a byte slice (prepending zero bytes if necessary) and
+	// recalculate the hash to see if we're in fact looking at the same
+	// content.
 	buf := make([]byte, LINEBUFFERLEN)
-	var n int
-	n, err = reader.Read(buf)
-
-	if err == nil && n == LINEBUFFERLEN {
+	var (
+		n         int
+		expectedN int64
+	)
+	if seekPos >= 0 {
+		n, err = io.ReadFull(reader, buf)
+		expectedN = int64(LINEBUFFERLEN)
+	} else {
+		n, err = reader.Read(buf[-seekPos:])
+		expectedN = position.SeekPosition
+	}
+	if err == nil && int64(n) == expectedN {
 		h := sha1.New()
 		h.Write(buf)
 		tmp := fmt.Sprintf("%x", h.Sum(nil))
@@ -417,8 +441,7 @@ func SeekInFile(path string, position *LogstreamLocation) (fd *os.File, reader i
 			return fd, reader, nil
 		}
 	}
-
-	return nil, nil, errors.New("Unable to locate position")
+	return nil, nil, ErrorCantSeekPosition
 }
 
 // TODO:: Refactor into a different heka package for use by all plugins
@@ -538,6 +561,10 @@ func (l *Logstream) readBytes(p []byte) (n int, err error) {
 
 	// Return now if we didn't get an error
 	if err == nil {
+		// Had an EOF before, clear it
+		if l.priorEOF {
+			l.priorEOF = false
+		}
 		return
 	}
 

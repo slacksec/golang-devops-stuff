@@ -16,8 +16,9 @@
 package pipeline
 
 import (
-	"github.com/rafrombrc/gospec/src/gospec"
 	"testing"
+
+	"github.com/rafrombrc/gospec/src/gospec"
 )
 
 func mockDecoderCreator() map[string]Decoder {
@@ -36,13 +37,17 @@ func TestAllSpecs(t *testing.T) {
 	r := gospec.NewRunner()
 	r.Parallel = false
 
-	r.AddSpec(BufferedOutputSpec)
+	r.AddSpec(HekaFramingSpec)
 	r.AddSpec(InputRunnerSpec)
+	r.AddSpec(MessageTemplateSpec)
 	r.AddSpec(OutputRunnerSpec)
 	r.AddSpec(ProtobufDecoderSpec)
+	r.AddSpec(QueueBufferSpec)
+	r.AddSpec(RegexSpec)
 	r.AddSpec(ReportSpec)
+	r.AddSpec(SplitterRunnerSpec)
 	r.AddSpec(StatAccumInputSpec)
-	r.AddSpec(StreamParserSpec)
+	r.AddSpec(TokenSpec)
 
 	gospec.MainGoTest(r, t)
 }

@@ -1,6 +1,9 @@
+.. _config_dashboard_output:
 
-DashboardOutput
-===============
+Dashboard Output
+================
+
+Plugin Name: **DashboardOutput**
 
 Specialized output plugin that listens for certain Heka reporting message
 types and generates JSON data which is made available via HTTP for use in web
@@ -28,6 +31,14 @@ Config:
     The Heka process must have read access to this directory. Relative paths
     will be evaluated relative to the Heka base directory. Defaults to
     `${SHARE_DIR}/dasher`.
+
+.. versionadded:: 0.7
+
+- headers (subsection, optional):
+    It is possible to inject arbitrary HTTP headers into each outgoing response
+    by adding a TOML subsection entitled "headers" to you HttpOutput config
+    section. All entries in the subsection must be a list of string values.
+
 
 Example:
 

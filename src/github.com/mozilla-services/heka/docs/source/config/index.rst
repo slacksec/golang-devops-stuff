@@ -6,11 +6,11 @@ Configuring hekad
 
 .. start-hekad-config
 
-A hekad configuration file specifies what inputs, decoders, filters, encoders,
-and outputs will be loaded. The configuration file is in `TOML
-<https://github.com/mojombo/toml>`_ format. TOML looks very similar to INI
-configuration formats, but with slightly more rich data structures and nesting
-support.
+A hekad configuration file specifies what inputs, splitters, decoders,
+filters, encoders, and outputs will be loaded. The configuration file is in
+`TOML <https://github.com/mojombo/toml>`_ format. TOML looks very similar to
+INI configuration formats, but with slightly more rich data structures and
+nesting support.
 
 If hekad's config file is specified to be a directory, all contained files
 with a filename ending in ".toml" will be loaded and merged into a single
@@ -29,7 +29,7 @@ instance of Heka's plugin type "TcpInput":
 
     [tcp:5565]
     type = "TcpInput"
-    parser_type = "message.proto"
+    splitter = "HekaFramingSplitter"
     decoder = "ProtobufDecoder"
     address = ":5565"
 
@@ -42,7 +42,7 @@ be used as the type. Thus, the following section describes a plugin named
 
     [TcpInput]
     address = ":5566"
-    parser_type = "message.proto"
+    splitter = "HekaFramingSplitter"
     decoder = "ProtobufDecoder"
 
 Note that it's fine to have more than one instance of the same plugin type, as
@@ -60,7 +60,7 @@ likely stop accepting messages until the plugin resumes operation (this
 applies only to filters/output plugins).
 
 Plugins specify that they support restarting by implementing the Restarting
-interface (see :ref:`restarting_plugins`). Plugins supporting Restarting can
+interface (see :ref:`restarting_plugin`). Plugins supporting Restarting can
 have :ref:`their restarting behavior configured <configuring_restarting>`.
 
 An internal diagnostic runner runs every 30 seconds to sweep the packs used
@@ -116,19 +116,17 @@ Config:
     Enable memory profiling; output is logged to the `output_file`.
 
 - poolsize (int):
-    Specify the pool size of maximum messages that can exist; default is 100
-    which is usually sufficient and of optimal performance.
+    Specify the pool size of maximum messages that can exist. Default is 100.
 
 - plugin_chansize (int):
     Specify the buffer size for the input channel for the various Heka
-    plugins. Defaults to 50, which is usually sufficient and of optimal
-    performance.
+    plugins. Defaults to 30.
 
 - base_dir (string):
     Base working directory Heka will use for persistent storage through
     process and server restarts. The hekad process must have read and write
     access to this directory. Defaults to `/var/cache/hekad` (or
-    `c:\var\cache\hekad` on Windows).
+    `c:\\var\\cache\\hekad` on Windows).
 
 - share_dir (string):
     Root path of Heka's "share directory", where Heka will expect to find
@@ -137,6 +135,7 @@ Config:
     `c:\\usr\\share\\heka` on Windows).
 
 .. versionadded:: 0.6
+
 - sample_denominator (int):
     Specifies the denominator of the sample rate Heka will use when computing
     the time required to perform certain operations, such as for the
@@ -145,6 +144,7 @@ Config:
     calculated for one message out of 1000.
 
 .. versionadded:: 0.6
+
 - pid_file (string):
     Optionally specify the location of a pidfile where the process id of
     the running hekad process will be written. The hekad process must have
@@ -152,6 +152,32 @@ Config:
     created). On a successful exit the pidfile will be removed. If the path
     already exists the contained pid will be checked for a running process.
     If one is found, the current process will exit with an error.
+
+.. versionadded:: 0.9
+
+- hostname (string):
+    Specifies the hostname to use whenever Heka is asked to provide the local
+    host's hostname. Defaults to whatever is provided by Go's `os.Hostname()`
+    call.
+
+- max_message_size (uint32):
+    The maximum size (in bytes) of message can be sent during processing.
+    Defaults to 64KiB.
+
+.. versionadded:: 0.10
+
+- log_flags (int):
+    Control the prefix for STDOUT and STDERR logs. Common values are 3 (date
+    and time, the default) or 0 (no prefix). See
+    `https://golang.org/pkg/log/#pkg-constants Go documentation`_ for details.
+
+- full_buffer_max_retries (int):
+    When Heka shuts down due to a buffer filling to capacity, the next time
+    Heka starts it will delay startup briefly to give the buffer a chance to
+    drain, to alleviate the back-pressure. This setting specifies the maximum
+    number of intervals (max 1s in duration) Heka should wait for the buffer
+    size to get below 90% of capacity before deciding that the issue is not
+    resolved and continuing startup (or shutting down).
 
 Example hekad.toml file
 =======================
@@ -180,7 +206,7 @@ Example hekad.toml file
     password = "smtp-pass"
     host = "mail.example.com:25"
     encoder = "AlertEncoder"
-    
+
     # User friendly formatting of alert messages
     [AlertEncoder]
     type = "SandboxEncoder"
@@ -218,21 +244,41 @@ Example hekad.toml file
 
 .. end-hekad-toml
 
-.. _configuring_restarting:
+Using Environment Variables
+===========================
+
+If you wish to use environmental variables in your config files as a way to
+configure values, you can simply use ``%ENV[VARIABLE_NAME]`` and the text will
+be replaced with the value of the environmental variable ``VARIABLE_NAME``.
+
+Example:
+
+.. code-block:: ini
+
+    [AMQPInput]
+    url = "amqp://%ENV[USER]:%ENV[PASSWORD]@rabbitmq/"
+    exchange = "testout"
+    exchangeType = "fanout"
+
 
 .. start-restarting
+
+.. _configuring_restarting:
 
 Configuring Restarting Behavior
 ===============================
 
-Plugins that support being restarted have a set of options that govern how the
-restart is handled. If preferred, the plugin can be configured to not restart
-at which point hekad will exit, or it could be restarted only 100 times, or
-restart attempts can proceed forever.
+Plugins that support being restarted have a set of options that govern how a
+restart is handled if they exit with an error.  If preferred, the plugin can be
+configured to not restart, or it could be restarted only 100 times, or restart
+attempts can proceed forever.
+Once the `max_retries` have been exceeded the plugin will be unregistered,
+potentially triggering hekad to shutdown (depending on the plugin's `can_exit`
+configuration).
 
-Adding the restarting configuration is done by adding a config section to the
-plugins' config called `retries`. A small amount of jitter will be added to
-the delay between restart attempts.
+Adding the restarting configuration is done by adding a config section to a
+plugin's configuration called `retries`. A small amount of jitter will be
+added to the delay between restart attempts.
 
 Config:
 
@@ -249,23 +295,23 @@ Config:
     larger than the `max_delay`. Defaults to 250ms.
 - max_retries (int):
     Maximum amount of times to attempt restarting the plugin before giving up
-    and shutting down hekad. Use 0 for no retry attempt, and -1 to continue
+    and exiting the plugin. Use 0 for no retry attempt, and -1 to continue
     trying forever (note that this will cause hekad to halt possibly forever
-    if the plugin cannot be restarted).
+    if the plugin cannot be restarted). Defaults to -1.
 
-Example (UdpInput does not actually support nor need restarting, illustrative
-purposes only):
+Example:
 
 .. code-block:: ini
 
-    [UdpInput]
-    address = "127.0.0.1:4880"
-    parser_type = "message.proto"
-    decoder = "ProtobufDecoder"
+    [AMQPOutput]
+    url = "amqp://guest:guest@rabbitmq/"
+    exchange = "testout"
+    exchange_type = "fanout"
+    message_matcher = 'Logger == "TestWebserver"'
 
-    [UdpInput.retries]
-    max_delay = 30s
-    delay = 250ms
+    [AMQPOutput.retries]
+    max_delay = "30s"
+    delay = "250ms"
     max_retries = 5
 
 .. end-restarting

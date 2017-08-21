@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2014
+# Portions created by the Initial Developer are Copyright (C) 2014-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -15,16 +15,18 @@
 package logstreamer
 
 import (
-	"code.google.com/p/go-uuid/uuid"
+	"errors"
 	"fmt"
-	ls "github.com/mozilla-services/heka/logstreamer"
-	"github.com/mozilla-services/heka/message"
-	p "github.com/mozilla-services/heka/pipeline"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
+
+	ls "github.com/mozilla-services/heka/logstreamer"
+	"github.com/mozilla-services/heka/message"
+	p "github.com/mozilla-services/heka/pipeline"
 )
 
 type LogstreamerInputConfig struct {
@@ -47,25 +49,18 @@ type LogstreamerInputConfig struct {
 	// Rescan interval declares how often the full directory scanner
 	// runs to locate more logfiles/streams
 	RescanInterval string `toml:"rescan_interval"`
-	// Name of configured decoder instance.
-	Decoder string
-	// Type of parser used to break the log file up into messages
-	ParserType string `toml:"parser_type"`
-	// Delimiter used to split the log stream into log messages
-	Delimiter string
-	// String indicating if the delimiter is at the start or end of the line,
-	// only used for regexp delimiters
-	DelimiterLocation string `toml:"delimiter_location"`
+	// So we can default to TokenSplitter.
+	Splitter string
 }
 
 type LogstreamerInput struct {
+	pConfig            *p.PipelineConfig
 	logstreamSet       *ls.LogstreamSet
 	logstreamSetLock   sync.RWMutex
 	rescanInterval     time.Duration
 	plugins            map[string]*LogstreamInput
 	stopLogstreamChans []chan chan bool
 	stopChan           chan bool
-	decoderName        string
 	parser             string
 	delimiter          string
 	delimiterLocation  string
@@ -73,13 +68,20 @@ type LogstreamerInput struct {
 	pluginName         string
 }
 
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (li *LogstreamerInput) SetPipelineConfig(pConfig *p.PipelineConfig) {
+	li.pConfig = pConfig
+}
+
 func (li *LogstreamerInput) ConfigStruct() interface{} {
+	baseDir := li.pConfig.Globals.BaseDir
 	return &LogstreamerInputConfig{
 		RescanInterval:   "1m",
-		ParserType:       "token",
 		OldestDuration:   "720h",
 		LogDirectory:     "/var/log",
-		JournalDirectory: filepath.Join(p.Globals().BaseDir, "logstreamer"),
+		JournalDirectory: filepath.Join(baseDir, "logstreamer"),
+		Splitter:         "TokenSplitter",
 	}
 }
 
@@ -95,32 +97,29 @@ func (li *LogstreamerInput) Init(config interface{}) (err error) {
 	)
 	conf := config.(*LogstreamerInputConfig)
 
-	// Setup the journal dir
+	// Setup the journal dir.
 	if err = os.MkdirAll(conf.JournalDirectory, 0744); err != nil {
 		return err
 	}
 
+	if conf.FileMatch == "" {
+		return errors.New("`file_match` setting is required.")
+	}
 	if len(conf.FileMatch) > 0 && conf.FileMatch[len(conf.FileMatch)-1:] != "$" {
 		conf.FileMatch += "$"
 	}
 
-	li.decoderName = conf.Decoder
-	li.parser = conf.ParserType
-	li.delimiter = conf.Delimiter
-	li.delimiterLocation = conf.DelimiterLocation
 	li.plugins = make(map[string]*LogstreamInput)
 
-	// Setup the rescan interval
+	// Setup the rescan interval.
 	if li.rescanInterval, err = time.ParseDuration(conf.RescanInterval); err != nil {
 		return
 	}
-
-	// Parse the oldest duration
+	// Parse the oldest duration.
 	if oldest, err = time.ParseDuration(conf.OldestDuration); err != nil {
 		return
 	}
-
-	// If no differentiator is present than we use the plugin
+	// If no differentiator is present then we use the plugin name.
 	if len(conf.Differentiator) == 0 {
 		conf.Differentiator = []string{li.pluginName}
 	}
@@ -146,26 +145,19 @@ func (li *LogstreamerInput) Init(config interface{}) (err error) {
 	// Create the main logstream set
 	li.logstreamSetLock.Lock()
 	defer li.logstreamSetLock.Unlock()
-	li.logstreamSet = ls.NewLogstreamSet(sp, oldest, conf.LogDirectory, conf.JournalDirectory)
-
+	li.logstreamSet, err = ls.NewLogstreamSet(sp, oldest, conf.LogDirectory,
+		conf.JournalDirectory)
+	if err != nil {
+		return
+	}
 	// Initial scan for logstreams
 	plugins, errs = li.logstreamSet.ScanForLogstreams()
 	if errs.IsError() {
 		return errs
 	}
-
-	// Verify we can make a parser
-	if _, _, err = CreateParser(li.parser, li.delimiter,
-		li.delimiterLocation, li.decoderName); err != nil {
-		return
-	}
-
 	// Declare our hostname
 	if conf.Hostname == "" {
-		li.hostName, err = os.Hostname()
-		if err != nil {
-			return
-		}
+		li.hostName = li.pConfig.Hostname()
 	} else {
 		li.hostName = conf.Hostname
 	}
@@ -176,40 +168,40 @@ func (li *LogstreamerInput) Init(config interface{}) (err error) {
 		if !ok {
 			continue
 		}
-		stParser, parserFunc, _ := CreateParser(li.parser, li.delimiter,
-			li.delimiterLocation, li.decoderName)
-		li.plugins[name] = NewLogstreamInput(stream, stParser, parserFunc,
-			name, li.hostName)
+		li.plugins[name] = NewLogstreamInput(stream, name, li.hostName)
 	}
 	li.stopLogstreamChans = make([]chan chan bool, 0, len(plugins))
 	li.stopChan = make(chan bool)
 	return
 }
 
-// Main Logstreamer Input runner
-// This runner kicks off all the other logstream inputs, and handles rescanning for
-// updates to the filesystem that might affect file visibility for the logstream
-// inputs
+// Creates deliverer and stop channel and starts the provided LogstreamInput.
+func (li *LogstreamerInput) startLogstreamInput(logstream *LogstreamInput, i int,
+	ir p.InputRunner, h p.PluginHelper) {
+
+	stop := make(chan chan bool, 1)
+	token := strconv.Itoa(i)
+	deliverer := ir.NewDeliverer(token)
+	sRunner := ir.NewSplitterRunner(token)
+	li.stopLogstreamChans = append(li.stopLogstreamChans, stop)
+	go logstream.Run(ir, h, stop, deliverer, sRunner)
+}
+
+// Main Logstreamer Input runner. This runner kicks off all the other
+// logstream inputs, and handles rescanning for updates to the filesystem that
+// might affect file visibility for the logstream inputs.
 func (li *LogstreamerInput) Run(ir p.InputRunner, h p.PluginHelper) (err error) {
 	var (
 		ok         bool
-		dRunner    p.DecoderRunner
 		errs       *ls.MultipleError
 		newstreams []string
 	)
 
-	// Setup the decoder runner that will be used
-	if li.decoderName != "" {
-		if dRunner, ok = h.DecoderRunner(li.decoderName, fmt.Sprintf("%s-%s", li.pluginName, li.decoderName)); !ok {
-			return fmt.Errorf("Decoder not found: %s", li.decoderName)
-		}
-	}
-
 	// Kick off all the current logstreams we know of
+	i := 0
 	for _, logstream := range li.plugins {
-		stop := make(chan chan bool, 1)
-		go logstream.Run(ir, h, stop, dRunner)
-		li.stopLogstreamChans = append(li.stopLogstreamChans, stop)
+		i++
+		li.startLogstreamInput(logstream, i, ir, h)
 	}
 
 	ok = true
@@ -243,26 +235,20 @@ func (li *LogstreamerInput) Run(ir p.InputRunner, h p.PluginHelper) (err error) 
 			for _, name := range newstreams {
 				stream, ok := li.logstreamSet.GetLogstream(name)
 				if !ok {
-					ir.LogError(fmt.Errorf("Found new logstream: %s, but couldn't fetch it.", name))
+					ir.LogError(fmt.Errorf("Found new logstream: %s, but couldn't fetch it.",
+						name))
 					continue
 				}
 
-				// Setup a new logstream input for this logstream and start it running
-				stParser, parserFunc, _ := CreateParser(li.parser, li.delimiter,
-					li.delimiterLocation, li.decoderName)
-
-				lsi := NewLogstreamInput(stream, stParser, parserFunc, name,
-					li.hostName)
+				lsi := NewLogstreamInput(stream, name, li.hostName)
 				li.plugins[name] = lsi
-				stop := make(chan chan bool, 1)
-				go lsi.Run(ir, h, stop, dRunner)
-				li.stopLogstreamChans = append(li.stopLogstreamChans, stop)
+				i++
+				li.startLogstreamInput(lsi, i, ir, h)
 			}
 			li.logstreamSetLock.Unlock()
 		}
 	}
-	err = nil
-	return
+	return nil
 }
 
 func (li *LogstreamerInput) Stop() {
@@ -270,51 +256,42 @@ func (li *LogstreamerInput) Stop() {
 	<-li.stopChan
 }
 
-type Deliver func(pack *p.PipelinePack)
-
 type LogstreamInput struct {
-	stream        *ls.Logstream
-	parser        p.StreamParser
-	parseFunction string
-	loggerIdent   string
-	hostName      string
-	recordCount   int
-	stopped       chan bool
+	stream              *ls.Logstream
+	loggerIdent         string
+	hostName            string
+	recordCount         int
+	stopped             chan bool
+	prevMsgWasTruncated bool
+	ir                  p.InputRunner
+	stopChan            chan chan bool
+	deliverer           p.Deliverer
+	sRunner             p.SplitterRunner
 }
 
-func NewLogstreamInput(stream *ls.Logstream, parser p.StreamParser, parserFunction,
-	loggerIdent, hostName string) *LogstreamInput {
+func NewLogstreamInput(stream *ls.Logstream, loggerIdent,
+	hostName string) *LogstreamInput {
+
 	return &LogstreamInput{
-		stream:        stream,
-		parser:        parser,
-		parseFunction: parserFunction,
-		loggerIdent:   loggerIdent,
-		hostName:      hostName,
+		stream:              stream,
+		loggerIdent:         loggerIdent,
+		hostName:            hostName,
+		prevMsgWasTruncated: false,
 	}
 }
 
 func (lsi *LogstreamInput) Run(ir p.InputRunner, h p.PluginHelper, stopChan chan chan bool,
-	dRunner p.DecoderRunner) {
+	deliverer p.Deliverer, sRunner p.SplitterRunner) {
 
-	var (
-		parser func(ir p.InputRunner, deliver Deliver, stop chan chan bool) error
-		err    error
-	)
-
-	if lsi.parseFunction == "payload" {
-		parser = lsi.payloadParser
-	} else if lsi.parseFunction == "messageProto" {
-		parser = lsi.messageProtoParser
+	if !sRunner.UseMsgBytes() {
+		sRunner.SetPackDecorator(lsi.packDecorator)
 	}
 
-	// Setup our pack delivery function appropriately for the configuration
-	deliver := func(pack *p.PipelinePack) {
-		if dRunner == nil {
-			ir.Inject(pack)
-		} else {
-			dRunner.InChan() <- pack
-		}
-	}
+	lsi.ir = ir
+	lsi.stopChan = stopChan
+	lsi.deliverer = deliverer
+	lsi.sRunner = sRunner
+	var err error
 
 	// Check for more data interval
 	interval, _ := time.ParseDuration("250ms")
@@ -325,11 +302,12 @@ func (lsi *LogstreamInput) Run(ir p.InputRunner, h p.PluginHelper, stopChan chan
 		// Clear our error
 		err = nil
 
-		// Attempt to read as many as we can
-		err = parser(ir, deliver, stopChan)
-
-		// Save our location after reading as much as we can
-		lsi.stream.SavePosition()
+		// Attempt to read and deliver as many as we can.
+		err = lsi.deliverRecords()
+		// Save our position if the stream hasn't done so for us.
+		if err != io.EOF {
+			lsi.stream.SavePosition()
+		}
 		lsi.recordCount = 0
 
 		if err != nil && err != io.EOF {
@@ -351,77 +329,62 @@ func (lsi *LogstreamInput) Run(ir p.InputRunner, h p.PluginHelper, stopChan chan
 		}
 	}
 	close(lsi.stopped)
+	deliverer.Done()
+	sRunner.Done()
 }
 
-// Standard text log file parser
-func (lsi *LogstreamInput) payloadParser(ir p.InputRunner, deliver Deliver, stop chan chan bool) (err error) {
+func (lsi *LogstreamInput) deliverRecords() (err error) {
 	var (
-		pack   *p.PipelinePack
 		record []byte
 		n      int
 	)
 	for err == nil {
 		select {
-		case lsi.stopped = <-stop:
+		case lsi.stopped = <-lsi.stopChan:
 			return
 		default:
 		}
-		n, record, err = lsi.parser.Parse(lsi.stream)
+		isMessageTruncated := false
+		n, record, err = lsi.sRunner.GetRecordFromStream(lsi.stream)
 		if err == io.ErrShortBuffer {
-			ir.LogError(fmt.Errorf("record exceeded MAX_RECORD_SIZE %d", message.MAX_RECORD_SIZE))
+			if lsi.sRunner.KeepTruncated() {
+				err = fmt.Errorf("record exceeded MAX_RECORD_SIZE %d and was truncated",
+					message.MAX_RECORD_SIZE)
+			} else {
+				err = fmt.Errorf("record exceeded MAX_RECORD_SIZE %d and was dropped",
+					message.MAX_RECORD_SIZE)
+			}
+			lsi.ir.LogError(err)
 			err = nil // non-fatal, keep going
+			isMessageTruncated = true
 		}
 		if n > 0 {
 			lsi.stream.FlushBuffer(n)
 		}
 		if len(record) > 0 {
-			payload := string(record)
-			pack = <-ir.InChan()
-			pack.Message.SetUuid(uuid.NewRandom())
-			pack.Message.SetTimestamp(time.Now().UnixNano())
-			pack.Message.SetType("logfile")
-			pack.Message.SetHostname(lsi.hostName)
-			pack.Message.SetLogger(lsi.loggerIdent)
-			pack.Message.SetPayload(payload)
-			deliver(pack)
-			lsi.countRecord()
+			if lsi.prevMsgWasTruncated == false {
+				// Send the message only if previous record had normal size.
+				if !isMessageTruncated || lsi.sRunner.KeepTruncated() {
+					lsi.sRunner.DeliverRecord(record, lsi.deliverer)
+					lsi.countRecord()
+				}
+			}
+		} else if err == io.EOF && lsi.sRunner.IncompleteFinal() {
+			record = lsi.sRunner.GetRemainingData()
+			if len(record) > 0 {
+				lsi.sRunner.DeliverRecord(record, lsi.deliverer)
+				lsi.countRecord()
+			}
 		}
+		lsi.prevMsgWasTruncated = isMessageTruncated
 	}
-	return
+	return err
 }
 
-// Framed protobuf message parser
-func (lsi *LogstreamInput) messageProtoParser(ir p.InputRunner, deliver Deliver, stop chan chan bool) (err error) {
-	var (
-		pack   *p.PipelinePack
-		record []byte
-		n      int
-	)
-	for err == nil {
-		select {
-		case lsi.stopped = <-stop:
-			return
-		default:
-		}
-		n, record, err = lsi.parser.Parse(lsi.stream)
-		if n > 0 {
-			lsi.stream.FlushBuffer(n)
-		}
-		if len(record) > 0 {
-			pack = <-ir.InChan()
-			headerLen := int(record[1]) + 3 // recsep+len+header+unitsep
-			messageLen := len(record) - headerLen
-			// ignore authentication headers
-			if messageLen > cap(pack.MsgBytes) {
-				pack.MsgBytes = make([]byte, messageLen)
-			}
-			pack.MsgBytes = pack.MsgBytes[:messageLen]
-			copy(pack.MsgBytes, record[headerLen:])
-			deliver(pack)
-			lsi.countRecord()
-		}
-	}
-	return
+func (lsi *LogstreamInput) packDecorator(pack *p.PipelinePack) {
+	pack.Message.SetType("logfile")
+	pack.Message.SetHostname(lsi.hostName)
+	pack.Message.SetLogger(lsi.loggerIdent)
 }
 
 func (lsi *LogstreamInput) countRecord() {
@@ -430,44 +393,6 @@ func (lsi *LogstreamInput) countRecord() {
 		lsi.stream.SavePosition()
 		lsi.recordCount = 0
 	}
-}
-
-func CreateParser(parserType, delimiter, delimiterLocation, decoder string) (parser p.StreamParser,
-	parseFunction string, err error) {
-	parseFunction = "payload"
-	if parserType == "" || parserType == "token" {
-		tp := p.NewTokenParser()
-		switch len(delimiter) {
-		case 0: // use default
-		case 1:
-			tp.SetDelimiter(delimiter[0])
-		default:
-			err = fmt.Errorf("invalid delimiter: %s", delimiter)
-		}
-		parser = tp
-	} else if parserType == "regexp" {
-		rp := p.NewRegexpParser()
-		if len(delimiter) > 0 {
-			err = rp.SetDelimiter(delimiter)
-		}
-		err = rp.SetDelimiterLocation(delimiterLocation)
-		parser = rp
-	} else if parserType == "message.proto" {
-		parser = p.NewMessageProtoParser()
-		parseFunction = "messageProto"
-		if decoder == "" {
-			err = fmt.Errorf("The message.proto parser must have a decoder")
-		}
-	} else {
-		err = fmt.Errorf("unknown parser type: %s", parserType)
-	}
-	return
-}
-
-func init() {
-	p.RegisterPlugin("LogstreamerInput", func() interface{} {
-		return new(LogstreamerInput)
-	})
 }
 
 // ReportMsg provides plugin state to Heka report and dashboard.
@@ -484,4 +409,10 @@ func (li *LogstreamerInput) ReportMsg(msg *message.Message) error {
 		}
 	}
 	return nil
+}
+
+func init() {
+	p.RegisterPlugin("LogstreamerInput", func() interface{} {
+		return new(LogstreamerInput)
+	})
 }

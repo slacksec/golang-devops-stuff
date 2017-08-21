@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -70,7 +70,8 @@ func (this *CounterFilter) Run(fr FilterRunner, h PluginHelper) (err error) {
 			}
 			msgLoopCount = pack.MsgLoopCount
 			this.count++
-			pack.Recycle()
+			fr.UpdateCursor(pack.QueueCursor)
+			pack.Recycle(nil)
 		case <-ticker:
 			this.tally(fr, h, msgLoopCount)
 		}
@@ -78,8 +79,17 @@ func (this *CounterFilter) Run(fr FilterRunner, h PluginHelper) (err error) {
 	return
 }
 
+func (this *CounterFilter) CleanupForRestart() {
+	this.lastCount = 0
+	this.count = 0
+	this.rate = 0
+	this.rates = nil
+}
+
 func (this *CounterFilter) tally(fr FilterRunner, h PluginHelper,
 	msgLoopCount uint) {
+	const msgType = "heka.counter-output"
+
 	msgsSent := this.count - this.lastCount
 	if msgsSent == 0 {
 		return
@@ -92,13 +102,13 @@ func (this *CounterFilter) tally(fr FilterRunner, h PluginHelper,
 	this.rate = float64(msgsSent) / elapsedTime.Seconds()
 	this.rates = append(this.rates, this.rate)
 
-	pack := h.PipelinePack(msgLoopCount)
-	if pack == nil {
-		fr.LogError(fmt.Errorf("exceeded MaxMsgLoops = %d",
-			Globals().MaxMsgLoops))
+	pack, e := h.PipelinePack(msgLoopCount)
+	if e != nil {
+		fr.LogError(e)
 		return
 	}
-	pack.Message.SetType("heka.counter-output")
+	pack.Message.SetLogger(fr.Name())
+	pack.Message.SetType(msgType)
 	pack.Message.SetPayload(fmt.Sprintf("Got %d messages. %0.2f msg/sec",
 		this.count, this.rate))
 	fr.Inject(pack)
@@ -113,13 +123,13 @@ func (this *CounterFilter) tally(fr FilterRunner, h PluginHelper,
 			sum += val
 		}
 		mean := sum / float64(samples)
-		pack := h.PipelinePack(msgLoopCount)
-		if pack == nil {
-			fr.LogError(fmt.Errorf("exceeded MaxMsgLoops = %d",
-				Globals().MaxMsgLoops))
+		pack, e := h.PipelinePack(msgLoopCount)
+		if e != nil {
+			fr.LogError(e)
 			return
 		}
-		pack.Message.SetType("heka.counter-output")
+		pack.Message.SetLogger(fr.Name())
+		pack.Message.SetType(msgType)
 		pack.Message.SetPayload(
 			fmt.Sprintf("AGG Sum. Min: %0.2f    Max: %0.2f    Mean: %0.2f",
 				min, max, mean))

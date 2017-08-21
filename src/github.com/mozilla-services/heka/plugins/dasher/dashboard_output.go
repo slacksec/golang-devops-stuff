@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012-2014
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -18,8 +18,6 @@ package dasher
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	. "github.com/mozilla-services/heka/pipeline"
 	"io"
 	"net/http"
 	"os"
@@ -28,6 +26,10 @@ import (
 	"regexp"
 	"sync"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
+	. "github.com/mozilla-services/heka/pipeline"
+	httpPlugin "github.com/mozilla-services/heka/plugins/http"
 )
 
 type DashboardOutputConfig struct {
@@ -49,6 +51,8 @@ type DashboardOutputConfig struct {
 	TickerInterval uint `toml:"ticker_interval"`
 	// Default message matcher.
 	MessageMatcher string
+	// Custom http headers
+	Headers http.Header
 }
 
 func (self *DashboardOutput) ConfigStruct() interface{} {
@@ -67,15 +71,29 @@ type DashboardOutput struct {
 	relDataPath      string
 	dataDirectory    string
 	server           *http.Server
+	handler          http.Handler
+	pConfig          *PipelineConfig
+	starterFunc      func(output *DashboardOutput) error
+}
+
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (self *DashboardOutput) SetPipelineConfig(pConfig *PipelineConfig) {
+	self.pConfig = pConfig
 }
 
 func (self *DashboardOutput) Init(config interface{}) (err error) {
 	conf := config.(*DashboardOutputConfig)
 
-	self.staticDirectory = PrependShareDir(conf.StaticDirectory)
-	self.workingDirectory = PrependBaseDir(conf.WorkingDirectory)
+	globals := self.pConfig.Globals
+	self.staticDirectory = globals.PrependShareDir(conf.StaticDirectory)
+	self.workingDirectory = globals.PrependBaseDir(conf.WorkingDirectory)
 	self.relDataPath = "data"
 	self.dataDirectory = filepath.Join(self.workingDirectory, self.relDataPath)
+
+	if self.starterFunc == nil {
+		self.starterFunc = defaultStarter
+	}
 
 	if err = os.MkdirAll(self.dataDirectory, 0700); err != nil {
 		return fmt.Errorf("DashboardOutput: Can't create working directory: %s", err)
@@ -130,18 +148,18 @@ func (self *DashboardOutput) Init(config interface{}) (err error) {
 		return
 	}
 
-	if err = filepath.Walk(self.staticDirectory, copier); err != nil {
-		return fmt.Errorf("Error copying static dashboard files: %s", err)
+	if self.handler == nil {
+		if err = filepath.Walk(self.staticDirectory, copier); err != nil {
+			return fmt.Errorf("Error copying static dashboard files: %s", err)
+		}
+		self.handler = http.FileServer(http.Dir(self.workingDirectory))
 	}
-
-	h := http.FileServer(http.Dir(self.workingDirectory))
 	self.server = &http.Server{
 		Addr:         conf.Address,
-		Handler:      h,
+		Handler:      httpPlugin.CustomHeadersHandler(self.handler, conf.Headers),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
-	go self.server.ListenAndServe()
 
 	return
 }
@@ -149,6 +167,7 @@ func (self *DashboardOutput) Init(config interface{}) (err error) {
 func (self *DashboardOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	inChan := or.InChan()
 	ticker := or.Ticker()
+	go self.starterFunc(self)
 
 	var (
 		ok   = true
@@ -228,13 +247,19 @@ func (self *DashboardOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 					sbxsLock.Unlock()
 				}
 			case "heka.sandbox-terminated":
+				var filterName string
+				tmp, _ := msg.GetFieldValue("plugin")
+				if s, ok := tmp.(string); ok {
+					filterName = s
+				} else {
+					break
+				}
 				fn := filepath.Join(self.dataDirectory, "heka_sandbox_termination.tsv")
-				filterName := msg.GetLogger()
 				if file, err := os.OpenFile(fn, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644); err == nil {
 					var line string
 					if _, ok := msg.GetFieldValue("ProcessMessageCount"); !ok {
 						line = fmt.Sprintf("%d\t%s\t%v\n", msg.GetTimestamp()/1e9,
-							msg.GetLogger(), msg.GetPayload())
+							filterName, msg.GetPayload())
 					} else {
 						pmc, _ := msg.GetFieldValue("ProcessMessageCount")
 						pms, _ := msg.GetFieldValue("ProcessMessageSamples")
@@ -262,12 +287,17 @@ func (self *DashboardOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 				delete(sandboxes, filterName)
 				sbxsLock.Unlock()
 			}
-			pack.Recycle()
+			or.UpdateCursor(pack.QueueCursor)
+			pack.Recycle(nil)
 		case <-ticker:
 			go h.PipelineConfig().AllReportsMsg()
 		}
 	}
 	return
+}
+
+func defaultStarter(output *DashboardOutput) error {
+	return output.server.ListenAndServe()
 }
 
 func overwriteFile(filename, s string) (err error) {
@@ -304,6 +334,7 @@ func overwritePluginListFile(dir string, sbxs map[string]*DashPluginListItem) (e
 	if file, err = os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC+os.O_CREATE, 0644); err == nil {
 		enc := json.NewEncoder(file)
 		err = enc.Encode(output)
+		file.Close()
 	}
 	return
 }

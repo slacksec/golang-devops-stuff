@@ -1,6 +1,9 @@
+.. _config_stat_accum_input:
 
-StatAccumInput
-==============
+Stat Accumulator Input
+======================
+
+Plugin Name: **StatAccumInput**
 
 Provides an implementation of the `StatAccumulator` interface which other
 plugins can use to submit `Stat` objects for aggregation and roll-up.
@@ -52,3 +55,12 @@ Config:
 - delete_idle_stats (bool):
     Don't emit values for inactive stats instead of sending 0 or in the case
     of gauges, sending the previous value. Defaults to false.
+
+Example:
+
+.. code-block:: ini
+
+    [StatAccumInput]
+    emit_in_fields = true
+    delete_idle_stats = true
+    ticker_interval = 5

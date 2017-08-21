@@ -14,6 +14,8 @@
 
 package message
 
+import "strings"
+
 // MatcherSpecification used by the message router to distribute messages
 type MatcherSpecification struct {
 	vm   *tree
@@ -97,10 +99,19 @@ func getNumericValue(msg *Message, stmt *Statement) float64 {
 }
 
 func stringTest(s string, stmt *Statement) bool {
+	if stmt.value.tokenId == NUMERIC_VALUE {
+		return false
+	}
 	switch stmt.op.tokenId {
 	case OP_EQ:
+		if stmt.value.tokenId == NIL_VALUE {
+			return false
+		}
 		return (s == stmt.value.token)
 	case OP_NE:
+		if stmt.value.tokenId == NIL_VALUE {
+			return true
+		}
 		return (s != stmt.value.token)
 	case OP_LT:
 		return (s < stmt.value.token)
@@ -111,18 +122,39 @@ func stringTest(s string, stmt *Statement) bool {
 	case OP_GTE:
 		return (s >= stmt.value.token)
 	case OP_RE:
-		return stmt.value.regexp.MatchString(s)
+		if stmt.value.regexp != nil {
+			return stmt.value.regexp.MatchString(s)
+		} else if stmt.value.fieldIndex == STARTS_WITH {
+			return strings.HasPrefix(s, stmt.value.token)
+		} else if stmt.value.fieldIndex == ENDS_WITH {
+			return strings.HasSuffix(s, stmt.value.token)
+		}
 	case OP_NRE:
-		return !stmt.value.regexp.MatchString(s)
+		if stmt.value.regexp != nil {
+			return !stmt.value.regexp.MatchString(s)
+		} else if stmt.value.fieldIndex == STARTS_WITH {
+			return !strings.HasPrefix(s, stmt.value.token)
+		} else if stmt.value.fieldIndex == ENDS_WITH {
+			return !strings.HasSuffix(s, stmt.value.token)
+		}
 	}
 	return false
 }
 
 func numericTest(f float64, stmt *Statement) bool {
+	if !(stmt.value.tokenId == NUMERIC_VALUE || stmt.value.tokenId == NIL_VALUE) {
+		return false
+	}
 	switch stmt.op.tokenId {
 	case OP_EQ:
+		if stmt.value.tokenId == NIL_VALUE {
+			return false
+		}
 		return (f == stmt.value.double)
 	case OP_NE:
+		if stmt.value.tokenId == NIL_VALUE {
+			return true
+		}
 		return (f != stmt.value.double)
 	case OP_LT:
 		return (f < stmt.value.double)
@@ -134,6 +166,10 @@ func numericTest(f float64, stmt *Statement) bool {
 		return (f >= stmt.value.double)
 	}
 	return false
+}
+
+func testNonExistence(stmt *Statement) bool {
+	return (stmt.value.tokenId == NIL_VALUE && stmt.op.tokenId == OP_EQ)
 }
 
 func testExpr(msg *Message, stmt *Statement) bool {
@@ -157,38 +193,44 @@ func testExpr(msg *Message, stmt *Statement) bool {
 			if fi != 0 {
 				fields := msg.FindAllFields(stmt.field.token)
 				if fi >= len(fields) {
-					return false
+					return testNonExistence(stmt)
 				}
 				field = fields[fi]
 			} else {
 				if field = msg.FindFirstField(stmt.field.token); field == nil {
-					return false
+					return testNonExistence(stmt)
 				}
 			}
 			switch field.GetValueType() {
 			case Field_STRING:
 				if ai >= len(field.ValueString) {
-					return false
+					return testNonExistence(stmt)
 				}
 				return stringTest(field.ValueString[ai], stmt)
 			case Field_BYTES:
 				if ai >= len(field.ValueBytes) {
-					return false
+					return testNonExistence(stmt)
 				}
 				return stringTest(string(field.ValueBytes[ai]), stmt)
 			case Field_INTEGER:
 				if ai >= len(field.ValueInteger) {
-					return false
+					return testNonExistence(stmt)
 				}
 				return numericTest(float64(field.ValueInteger[ai]), stmt)
 			case Field_DOUBLE:
 				if ai >= len(field.ValueDouble) {
-					return false
+					return testNonExistence(stmt)
 				}
 				return numericTest(field.ValueDouble[ai], stmt)
 			case Field_BOOL:
 				if ai >= len(field.ValueBool) {
-					return false
+					return testNonExistence(stmt)
+				}
+				if stmt.value.tokenId == NIL_VALUE {
+					if stmt.op.tokenId == OP_EQ {
+						return false
+					}
+					return true
 				}
 				b := field.ValueBool[ai]
 				if stmt.value.tokenId == TRUE {

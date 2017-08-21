@@ -15,13 +15,14 @@
 package pipeline
 
 import (
-	"code.google.com/p/go-uuid/uuid"
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/mozilla-services/heka/message"
+	"github.com/pborman/uuid"
 )
 
 // Populated by the init function, this regex matches the MessageFields values
@@ -54,12 +55,18 @@ func (mt MessageTemplate) PopulateMessage(msg *message.Message, subs map[string]
 		case "Hostname":
 			msg.SetHostname(val)
 		case "Pid":
-			int_part := strings.Split(val, ".")[0]
-			pid, err := strconv.ParseInt(int_part, 10, 32)
+			intPart := strings.Split(val, ".")[0]
+			pid, err := strconv.ParseInt(intPart, 10, 32)
 			if err != nil {
 				return err
 			}
 			msg.SetPid(int32(pid))
+		case "Severity":
+			severity, err := strconv.ParseInt(val, 10, 32)
+			if err != nil {
+				return err
+			}
+			msg.SetSeverity(int32(severity))
 		case "Uuid":
 			if len(val) == message.UUID_SIZE {
 				msg.SetUuid([]byte(val))

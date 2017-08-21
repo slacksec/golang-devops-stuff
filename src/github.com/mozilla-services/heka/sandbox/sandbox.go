@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -35,7 +35,8 @@ const (
 
 type Sandbox interface {
 	// Sandbox control
-	Init(dataFile, pluginType string) error
+	Init(dataFile string) error
+	Stop()
 	Destroy(dataFile string) error
 
 	// Sandbox state
@@ -52,23 +53,29 @@ type Sandbox interface {
 }
 
 type SandboxConfig struct {
-	ScriptType       string `toml:"script_type"`
-	ScriptFilename   string `toml:"filename"`
-	ModuleDirectory  string `toml:"module_directory"`
-	PreserveData     bool   `toml:"preserve_data"`
-	MemoryLimit      uint   `toml:"memory_limit"`
-	InstructionLimit uint   `toml:"instruction_limit"`
-	OutputLimit      uint   `toml:"output_limit"`
-	Profile          bool
-	Config           map[string]interface{}
+	ScriptType           string `toml:"script_type"`
+	ScriptFilename       string `toml:"filename"`
+	ModuleDirectory      string `toml:"module_directory"`
+	PreserveData         bool   `toml:"preserve_data"`
+	MemoryLimit          uint   `toml:"memory_limit"`
+	InstructionLimit     uint   `toml:"instruction_limit"`
+	OutputLimit          uint   `toml:"output_limit"`
+	CanExit              bool   `toml:"can_exit"`
+	TimerEventOnShutdown bool   `toml:"timer_event_on_shutdown"`
+	Profile              bool
+	Config               map[string]interface{}
+	Globals              *pipeline.GlobalConfigStruct
+	PluginType           string
 }
 
-func NewSandboxConfig() interface{} {
+func NewSandboxConfig(globals *pipeline.GlobalConfigStruct) interface{} {
 	return &SandboxConfig{
-		ModuleDirectory:  pipeline.PrependShareDir("lua_modules"),
+		ModuleDirectory:  globals.PrependShareDir("lua_modules"),
 		MemoryLimit:      8 * 1024 * 1024,
 		InstructionLimit: 1e6,
 		OutputLimit:      63 * 1024,
 		ScriptType:       "lua",
+		Globals:          globals,
+		CanExit:          true,
 	}
 }

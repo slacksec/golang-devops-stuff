@@ -20,17 +20,18 @@ Heka Sandbox Manager
 package main
 
 import (
-	"code.google.com/p/go-uuid/uuid"
 	"crypto/tls"
 	"flag"
+	"io/ioutil"
+	"os"
+	"time"
+
 	"github.com/bbangert/toml"
 	"github.com/mozilla-services/heka/client"
 	"github.com/mozilla-services/heka/message"
+	"github.com/mozilla-services/heka/pipeline"
 	"github.com/mozilla-services/heka/plugins/tcp"
-	"io/ioutil"
-	"log"
-	"os"
-	"time"
+	"github.com/pborman/uuid"
 )
 
 type SbmgrConfig struct {
@@ -50,7 +51,7 @@ func main() {
 
 	var config SbmgrConfig
 	if _, err := toml.DecodeFile(*configFile, &config); err != nil {
-		log.Printf("Error decoding config file: %s", err)
+		client.LogError.Printf("Error decoding config file: %s", err)
 		return
 	}
 	var sender *client.NetworkSender
@@ -59,21 +60,21 @@ func main() {
 		var goTlsConfig *tls.Config
 		goTlsConfig, err = tcp.CreateGoTlsConfig(&config.Tls)
 		if err != nil {
-			log.Fatalf("Error creating TLS config: %s\n", err)
+			client.LogError.Fatalf("Error creating TLS config: %s\n", err)
 		}
 		sender, err = client.NewTlsSender("tcp", config.IpAddress, goTlsConfig)
 	} else {
 		sender, err = client.NewNetworkSender("tcp", config.IpAddress)
 	}
 	if err != nil {
-		log.Fatalf("Error creating sender: %s\n", err.Error())
+		client.LogError.Fatalf("Error creating sender: %s\n", err.Error())
 	}
 	encoder := client.NewProtobufEncoder(&config.Signer)
 	manager := client.NewClient(sender, encoder)
 
 	hostname, _ := os.Hostname()
 	msg := &message.Message{}
-	msg.SetLogger("heka-sbmgr")
+	msg.SetLogger(pipeline.HEKA_DAEMON) // identify the message as 'internal' for filtering purposes
 	msg.SetType("heka.control.sandbox")
 	msg.SetTimestamp(time.Now().UnixNano())
 	msg.SetUuid(uuid.NewRandom())
@@ -83,13 +84,13 @@ func main() {
 	case "load":
 		code, err := ioutil.ReadFile(*scriptFile)
 		if err != nil {
-			log.Printf("Error reading scriptFile: %s\n", err.Error())
+			client.LogError.Printf("Error reading scriptFile: %s\n", err.Error())
 			return
 		}
 		msg.SetPayload(string(code))
 		conf, err := ioutil.ReadFile(*scriptConfig)
 		if err != nil {
-			log.Printf("Error reading scriptConfig: %s\n", err.Error())
+			client.LogError.Printf("Error reading scriptConfig: %s\n", err.Error())
 			return
 		}
 		f, _ := message.NewField("config", string(conf), "toml")
@@ -98,13 +99,13 @@ func main() {
 		f, _ := message.NewField("name", *filterName, "")
 		msg.AddField(f)
 	default:
-		log.Printf("Invalid action: %s", *action)
+		client.LogError.Printf("Invalid action: %s", *action)
 	}
 
 	f1, _ := message.NewField("action", *action, "")
 	msg.AddField(f1)
 	err = manager.SendMessage(msg)
 	if err != nil {
-		log.Printf("Error sending message: %s\n", err.Error())
+		client.LogError.Printf("Error sending message: %s\n", err.Error())
 	}
 }

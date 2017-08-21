@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,12 +16,13 @@ package message
 
 import (
 	"bytes"
-	"code.google.com/p/go-uuid/uuid"
-	"github.com/rafrombrc/gospec/src/gospec"
-	gs "github.com/rafrombrc/gospec/src/gospec"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/pborman/uuid"
+	"github.com/rafrombrc/gospec/src/gospec"
+	gs "github.com/rafrombrc/gospec/src/gospec"
 )
 
 func TestAllSpecs(t *testing.T) {
