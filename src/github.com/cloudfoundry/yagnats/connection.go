@@ -2,8 +2,9 @@ package yagnats
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -63,15 +64,62 @@ func NewConnection(addr, user, pass string) *Connection {
 	}
 }
 
+func NewTLSConnection(addr, user, pass string, certPool *x509.CertPool, clientCert *tls.Certificate) *Connection {
+	connection := NewConnection(addr, user, pass)
+	connection.dial = func(network, address string) (net.Conn, error) {
+		conn, err := net.DialTimeout(network, address, 5*time.Second)
+		if err != nil {
+			return nil, err
+		}
+
+		br := bufio.NewReaderSize(conn, 32768)
+		_, err = Parse(br)
+		if err != nil {
+			return nil, err
+		}
+
+		hostname, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+
+		config := tls.Config{
+			RootCAs:    certPool,
+			ServerName: hostname,
+		}
+
+		// When client certificate is provided, we are expecting mutual TLS.
+		if clientCert != nil {
+			config.Certificates = []tls.Certificate{*clientCert}
+		}
+
+		conn = tls.Client(conn, &config)
+
+		tlsConn := conn.(*tls.Conn)
+		err = tlsConn.Handshake()
+		return tlsConn, err
+	}
+	return connection
+}
+
 type ConnectionInfo struct {
 	Addr     string
 	Username string
 	Password string
 	Dial     func(network, address string) (net.Conn, error)
+
+	CertPool   *x509.CertPool
+	ClientCert *tls.Certificate
 }
 
 func (c *ConnectionInfo) ProvideConnection() (*Connection, error) {
-	conn := NewConnection(c.Addr, c.Username, c.Password)
+	var conn *Connection
+	if c.CertPool == nil {
+		conn = NewConnection(c.Addr, c.Username, c.Password)
+	} else {
+		conn = NewTLSConnection(c.Addr, c.Username, c.Password, c.CertPool, c.ClientCert)
+	}
+
 	if c.Dial != nil {
 		conn.dial = c.Dial
 	}
@@ -95,8 +143,14 @@ type ConnectionCluster struct {
 	Members []ConnectionProvider
 }
 
-func (c *ConnectionCluster) ProvideConnection() (*Connection, error) {
-	return c.Members[rand.Intn(len(c.Members))].ProvideConnection()
+func (c *ConnectionCluster) ProvideConnection() (conn *Connection, err error) {
+	for _, cp := range c.Members {
+		conn, err = cp.ProvideConnection()
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, err
 }
 
 func (c *Connection) Dial() error {
@@ -127,7 +181,6 @@ func (c *Connection) Disconnect() {
 
 func (c *Connection) ErrOrOK() error {
 	c.Logger().Debug("connection.err-or-ok.wait")
-
 	select {
 	case err := <-c.errs:
 		c.Logger().Warnd(map[string]interface{}{"error": err.Error()}, "connection.err-or-ok.err")
@@ -186,6 +239,7 @@ func (c *Connection) receivePackets() {
 		packet, err := Parse(io)
 		if err != nil {
 			c.Logger().Errord(map[string]interface{}{"error": err.Error()}, "connection.packet.read-error")
+			c.Disconnect()
 			c.disconnected()
 			break
 		}
