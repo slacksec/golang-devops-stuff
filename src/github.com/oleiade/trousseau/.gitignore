@@ -1,3 +1,6 @@
+# Build artefacts
+build/
+
 # Makefile generated paths
 .gopath
 .sw?
@@ -37,3 +40,11 @@ _testmain.go
 
 # Documentation files
 docs/build/
+
+
+# Intellij
+.idea
+
+# Vim files
+*.swp
+*.swo
