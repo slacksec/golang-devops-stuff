@@ -8,7 +8,7 @@ type FileChanges struct {
 
 func NewFileChanges() *FileChanges {
 	return &FileChanges{
-		make(chan bool), make(chan bool), make(chan bool)}
+		make(chan bool, 1), make(chan bool, 1), make(chan bool, 1)}
 }
 
 func (fc *FileChanges) NotifyModified() {
@@ -21,12 +21,6 @@ func (fc *FileChanges) NotifyTruncated() {
 
 func (fc *FileChanges) NotifyDeleted() {
 	sendOnlyIfEmpty(fc.Deleted)
-}
-
-func (fc *FileChanges) Close() {
-	close(fc.Modified)
-	close(fc.Truncated)
-	close(fc.Deleted)
 }
 
 // sendOnlyIfEmpty sends on a bool channel only if the channel has no

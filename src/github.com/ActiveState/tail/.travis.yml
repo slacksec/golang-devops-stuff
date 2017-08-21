@@ -1,10 +1,19 @@
 language: go
 
-# depman needs to be installed with GOPATH pointing to a single directory.
 script:
-  - GOPATH=$HOME/gopath go get github.com/vube/depman
-  - GOPATH=$HOME/gopath $HOME/gopath/bin/depman
-  - go test -v ./...
+  - go test -race -v ./...
 
 go:
-  - 1.2.1
+  - 1.5
+  - 1.6
+  - 1.7
+  - 1.8
+  - tip
+
+matrix:
+  allow_failures:
+    - go: tip
+
+install:
+  - go get gopkg.in/fsnotify.v1
+  - go get gopkg.in/tomb.v1

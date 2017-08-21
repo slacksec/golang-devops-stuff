@@ -1,24 +1,28 @@
+// Copyright (c) 2015 HPE Software Inc. All rights reserved.
 // Copyright (c) 2013 ActiveState Software Inc. All rights reserved.
 
 package tail
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
-	"github.com/ActiveState/tail/ratelimiter"
-	"github.com/ActiveState/tail/util"
-	"github.com/ActiveState/tail/watch"
-	"gopkg.in/tomb.v1"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/hpcloud/tail/ratelimiter"
+	"github.com/hpcloud/tail/util"
+	"github.com/hpcloud/tail/watch"
+	"gopkg.in/tomb.v1"
 )
 
 var (
-	ErrStop = fmt.Errorf("tail should now stop")
+	ErrStop = errors.New("tail should now stop")
 )
 
 type Line struct {
@@ -38,6 +42,18 @@ type SeekInfo struct {
 	Whence int // os.SEEK_*
 }
 
+type logger interface {
+	Fatal(v ...interface{})
+	Fatalf(format string, v ...interface{})
+	Fatalln(v ...interface{})
+	Panic(v ...interface{})
+	Panicf(format string, v ...interface{})
+	Panicln(v ...interface{})
+	Print(v ...interface{})
+	Printf(format string, v ...interface{})
+	Println(v ...interface{})
+}
+
 // Config is used to specify how a file must be tailed.
 type Config struct {
 	// File-specifc
@@ -45,6 +61,7 @@ type Config struct {
 	ReOpen      bool      // Reopen recreated files (tail -F)
 	MustExist   bool      // Fail early if the file does not exist
 	Poll        bool      // Poll for file changes instead of using inotify
+	Pipe        bool      // Is a named pipe (mkfifo)
 	RateLimiter *ratelimiter.LeakyBucket
 
 	// Generic IO
@@ -53,7 +70,7 @@ type Config struct {
 
 	// Logger, when nil, is set to tail.DefaultLogger
 	// To disable logging: set field to tail.DiscardingLogger
-	Logger *log.Logger
+	Logger logger
 }
 
 type Tail struct {
@@ -61,12 +78,15 @@ type Tail struct {
 	Lines    chan *Line
 	Config
 
-	file    *os.File
-	reader  *bufio.Reader
+	file   *os.File
+	reader *bufio.Reader
+
 	watcher watch.FileWatcher
 	changes *watch.FileChanges
 
 	tomb.Tomb // provides: Done, Kill, Dying
+
+	lk sync.Mutex
 }
 
 var (
@@ -124,9 +144,17 @@ func (tail *Tail) Tell() (offset int64, err error) {
 		return
 	}
 	offset, err = tail.file.Seek(0, os.SEEK_CUR)
-	if err == nil {
-		offset -= int64(tail.reader.Buffered())
+	if err != nil {
+		return
 	}
+
+	tail.lk.Lock()
+	defer tail.lk.Unlock()
+	if tail.reader == nil {
+		return
+	}
+
+	offset -= int64(tail.reader.Buffered())
 	return
 }
 
@@ -136,17 +164,28 @@ func (tail *Tail) Stop() error {
 	return tail.Wait()
 }
 
+// StopAtEOF stops tailing as soon as the end of the file is reached.
+func (tail *Tail) StopAtEOF() error {
+	tail.Kill(errStopAtEOF)
+	return tail.Wait()
+}
+
+var errStopAtEOF = errors.New("tail: stop at eof")
+
 func (tail *Tail) close() {
 	close(tail.Lines)
+	tail.closeFile()
+}
+
+func (tail *Tail) closeFile() {
 	if tail.file != nil {
 		tail.file.Close()
+		tail.file = nil
 	}
 }
 
 func (tail *Tail) reopen() error {
-	if tail.file != nil {
-		tail.file.Close()
-	}
+	tail.closeFile()
 	for {
 		var err error
 		tail.file, err = OpenFile(tail.Filename)
@@ -169,7 +208,9 @@ func (tail *Tail) reopen() error {
 }
 
 func (tail *Tail) readLine() (string, error) {
+	tail.lk.Lock()
 	line, err := tail.reader.ReadString('\n')
+	tail.lk.Unlock()
 	if err != nil {
 		// Note ReadString "returns the data read before the error" in
 		// case of an error, including EOF, so we return it as is. The
@@ -209,35 +250,60 @@ func (tail *Tail) tailFileSync() {
 
 	tail.openReader()
 
+	var offset int64
+	var err error
+
 	// Read line by line.
 	for {
+		// do not seek in named pipes
+		if !tail.Pipe {
+			// grab the position in case we need to back up in the event of a half-line
+			offset, err = tail.Tell()
+			if err != nil {
+				tail.Kill(err)
+				return
+			}
+		}
+
 		line, err := tail.readLine()
 
 		// Process `line` even if err is EOF.
-		if err == nil || (err == io.EOF && line != "") {
+		if err == nil {
 			cooloff := !tail.sendLine(line)
 			if cooloff {
 				// Wait a second before seeking till the end of
 				// file when rate limit is reached.
-				msg := fmt.Sprintf(
-					"Too much log activity; waiting a second " +
-						"before resuming tailing")
-				tail.Lines <- &Line{msg, time.Now(), fmt.Errorf(msg)}
+				msg := ("Too much log activity; waiting a second " +
+					"before resuming tailing")
+				tail.Lines <- &Line{msg, time.Now(), errors.New(msg)}
 				select {
 				case <-time.After(time.Second):
 				case <-tail.Dying():
 					return
 				}
-				err = tail.seekEnd()
-				if err != nil {
+				if err := tail.seekEnd(); err != nil {
 					tail.Kill(err)
 					return
 				}
 			}
 		} else if err == io.EOF {
 			if !tail.Follow {
+				if line != "" {
+					tail.sendLine(line)
+				}
 				return
 			}
+
+			if tail.Follow && line != "" {
+				// this has the potential to never return the last line if
+				// it's not followed by a newline; seems a fair trade here
+				err := tail.seekTo(SeekInfo{Offset: offset, Whence: 0})
+				if err != nil {
+					tail.Kill(err)
+					return
+				}
+			}
+
 			// When EOF is reached, wait for more data to become
 			// available. Wait strategy is based on the `tail.watcher`
 			// implementation (inotify or polling).
@@ -256,6 +322,9 @@ func (tail *Tail) tailFileSync() {
 
 		select {
 		case <-tail.Dying():
+			if tail.Err() == errStopAtEOF {
+				continue
+			}
 			return
 		default:
 		}
@@ -267,11 +336,14 @@ func (tail *Tail) tailFileSync() {
 // reopened if ReOpen is true. Truncated files are always reopened.
 func (tail *Tail) waitForChanges() error {
 	if tail.changes == nil {
-		st, err := tail.file.Stat()
+		pos, err := tail.file.Seek(0, os.SEEK_CUR)
 		if err != nil {
 			return err
 		}
-		tail.changes = tail.watcher.ChangeEvents(&tail.Tomb, st)
+		tail.changes, err = tail.watcher.ChangeEvents(&tail.Tomb, pos)
+		if err != nil {
+			return err
+		}
 	}
 
 	select {
@@ -317,7 +389,11 @@ func (tail *Tail) openReader() {
 }
 
 func (tail *Tail) seekEnd() error {
-	_, err := tail.file.Seek(0, 2)
+	return tail.seekTo(SeekInfo{Offset: 0, Whence: os.SEEK_END})
+}
+
+func (tail *Tail) seekTo(pos SeekInfo) error {
+	_, err := tail.file.Seek(pos.Offset, pos.Whence)
 	if err != nil {
 		return fmt.Errorf("Seek error on %s: %s", tail.Filename, err)
 	}
@@ -356,6 +432,6 @@ func (tail *Tail) sendLine(line string) bool {
 // Cleanup removes inotify watches added by the tail package. This function is
 // meant to be invoked from a process's exit handler. Linux kernel may not
 // automatically remove inotify watches after the process exits.
-func Cleanup() {
-	watch.Cleanup()
+func (tail *Tail) Cleanup() {
+	watch.Cleanup(tail.Filename)
 }
