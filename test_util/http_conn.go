@@ -1,15 +1,16 @@
 package test_util
 
 import (
-	. "github.com/onsi/gomega"
+	"io"
 	"io/ioutil"
-	"net/url"
 	"strings"
 
+	. "github.com/onsi/gomega"
+
 	"bufio"
-	"io"
 	"net"
 	"net/http"
+	"net/url"
 )
 
 type HttpConn struct {
@@ -29,19 +30,13 @@ func NewHttpConn(x net.Conn) *HttpConn {
 
 func (x *HttpConn) ReadRequest() (*http.Request, string) {
 	req, err := http.ReadRequest(x.Reader)
-	Ω(err).NotTo(HaveOccurred())
+	Expect(err).NotTo(HaveOccurred())
+	defer req.Body.Close()
 
 	b, err := ioutil.ReadAll(req.Body)
-	Ω(err).NotTo(HaveOccurred())
+	Expect(err).NotTo(HaveOccurred())
 
 	return req, string(b)
-}
-
-func (x *HttpConn) NewRequest(method, urlStr string, body io.Reader) *http.Request {
-	req, err := http.NewRequest(method, urlStr, body)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred())
-	req.URL = &url.URL{Host: req.URL.Host, Opaque: urlStr}
-	return req
 }
 
 func (x *HttpConn) WriteRequest(req *http.Request) {
@@ -53,6 +48,7 @@ func (x *HttpConn) WriteRequest(req *http.Request) {
 func (x *HttpConn) ReadResponse() (*http.Response, string) {
 	resp, err := http.ReadResponse(x.Reader, &http.Request{})
 	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	defer resp.Body.Close()
 
 	b, err := ioutil.ReadAll(resp.Body)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred())
@@ -77,8 +73,8 @@ func (x *HttpConn) WriteResponse(resp *http.Response) {
 
 func (x *HttpConn) CheckLine(expected string) {
 	l, err := x.Reader.ReadString('\n')
-	Ω(err).NotTo(HaveOccurred())
-	Ω(strings.TrimRight(l, "\r\n")).To(Equal(expected))
+	Expect(err).NotTo(HaveOccurred())
+	Expect(strings.TrimRight(l, "\r\n")).To(Equal(expected))
 }
 
 func (x *HttpConn) CheckLines(expected []string) {
@@ -101,4 +97,13 @@ func (x *HttpConn) WriteLines(lines []string) {
 	}
 
 	x.WriteLine("")
+}
+
+func NewRequest(method, host, rawPath string, body io.Reader) *http.Request {
+	req, err := http.NewRequest(method, "http://"+host+rawPath, body)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+
+	req.URL = &url.URL{Scheme: "http", Host: host, Opaque: rawPath}
+	req.Host = host
+	return req
 }

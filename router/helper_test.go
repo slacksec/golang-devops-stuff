@@ -1,47 +1,33 @@
 package router_test
 
 import (
-	"github.com/cloudfoundry/gorouter/registry"
-	"github.com/cloudfoundry/gorouter/test"
+	"code.cloudfoundry.org/gorouter/registry"
+	"code.cloudfoundry.org/gorouter/test/common"
 
 	"net"
 	"time"
 )
 
-func waitMsgReceived(registry *registry.RouteRegistry, app *test.TestApp, expectedToBeFound bool, timeout time.Duration) bool {
-	interval := time.Millisecond * 50
-	repetitions := int(timeout / interval)
-
-	for j := 0; j < repetitions; j++ {
-		if j > 0 {
-			time.Sleep(interval)
-		}
-
-		received := true
-		for _, url := range app.Urls() {
-			pool := registry.Lookup(url)
-			if expectedToBeFound && pool == nil {
-				received = false
-				break
-			} else if !expectedToBeFound && pool != nil {
-				received = false
-				break
-			}
-		}
-		if received {
-			return true
+func appRegistered(registry *registry.RouteRegistry, app *common.TestApp) bool {
+	for _, url := range app.Urls() {
+		pool := registry.Lookup(url)
+		if pool == nil {
+			return false
 		}
 	}
 
-	return false
+	return true
 }
 
-func waitAppRegistered(registry *registry.RouteRegistry, app *test.TestApp, timeout time.Duration) bool {
-	return waitMsgReceived(registry, app, true, timeout)
-}
+func appUnregistered(registry *registry.RouteRegistry, app *common.TestApp) bool {
+	for _, url := range app.Urls() {
+		pool := registry.Lookup(url)
+		if pool != nil {
+			return false
+		}
+	}
 
-func waitAppUnregistered(registry *registry.RouteRegistry, app *test.TestApp, timeout time.Duration) bool {
-	return waitMsgReceived(registry, app, false, timeout)
+	return true
 }
 
 func timeoutDialler() func(net, addr string) (c net.Conn, err error) {

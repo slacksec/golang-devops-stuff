@@ -7,30 +7,88 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"sync"
+	"syscall"
 	"time"
-	. "github.com/cloudfoundry/gorouter/common/http"
-	steno "github.com/cloudfoundry/gosteno"
-	"github.com/cloudfoundry/yagnats"
+
+	"code.cloudfoundry.org/gorouter/common/health"
+	. "code.cloudfoundry.org/gorouter/common/http"
+	"code.cloudfoundry.org/gorouter/common/schema"
+	"code.cloudfoundry.org/gorouter/common/uuid"
+	"code.cloudfoundry.org/gorouter/logger"
+	"code.cloudfoundry.org/localip"
+	"github.com/nats-io/nats"
+	"github.com/uber-go/zap"
 )
+
+const RefreshInterval time.Duration = time.Second * 1
+
+var log logger.Logger
+
+type ProcessStatus struct {
+	sync.RWMutex
+	rusage      *syscall.Rusage
+	lastCpuTime int64
+	stopSignal  chan bool
+	stopped     bool
+
+	CpuUsage float64
+	MemRss   int64
+}
+
+func NewProcessStatus() *ProcessStatus {
+	p := new(ProcessStatus)
+	p.rusage = new(syscall.Rusage)
+
+	go func() {
+		timer := time.Tick(RefreshInterval)
+		for {
+			select {
+			case <-timer:
+				p.Update()
+			case <-p.stopSignal:
+				return
+			}
+		}
+	}()
+
+	return p
+}
+
+func (p *ProcessStatus) Update() {
+	e := syscall.Getrusage(syscall.RUSAGE_SELF, p.rusage)
+	if e != nil {
+		log.Fatal("failed-to-get-rusage", zap.Error(e))
+	}
+
+	p.Lock()
+	defer p.Unlock()
+	p.MemRss = int64(p.rusage.Maxrss)
+
+	t := p.rusage.Utime.Nano() + p.rusage.Stime.Nano()
+	p.CpuUsage = float64(t-p.lastCpuTime) / float64(RefreshInterval.Nanoseconds())
+	p.lastCpuTime = t
+}
+
+func (p *ProcessStatus) StopUpdate() {
+	p.Lock()
+	defer p.Unlock()
+	if !p.stopped {
+		p.stopped = true
+		p.stopSignal <- true
+		p.stopSignal = nil
+	}
+}
 
 var procStat *ProcessStatus
 
 type VcapComponent struct {
-	// These fields are from individual components
-	Type        string                    `json:"type"`
-	Index       uint                      `json:"index"`
-	Host        string                    `json:"host"`
-	Credentials []string                  `json:"credentials"`
-	Config      interface{}               `json:"-"`
-	Varz        *Varz                     `json:"-"`
-	Healthz     *Healthz                  `json:"-"`
-	InfoRoutes  map[string]json.Marshaler `json:"-"`
-	Logger      *steno.Logger             `json:"-"`
-
-	// These fields are automatically generated
-	UUID      string   `json:"uuid"`
-	StartTime Time     `json:"start"`
-	Uptime    Duration `json:"uptime"`
+	Config     interface{}     `json:"-"`
+	Varz       *health.Varz    `json:"-"`
+	Healthz    *health.Healthz `json:"-"`
+	Health     http.Handler
+	InfoRoutes map[string]json.Marshaler `json:"-"`
+	Logger     logger.Logger             `json:"-"`
 
 	listener net.Listener
 	statusCh chan error
@@ -41,6 +99,7 @@ type RouterStart struct {
 	Id                               string   `json:"id"`
 	Hosts                            []string `json:"hosts"`
 	MinimumRegisterIntervalInSeconds int      `json:"minimumRegisterIntervalInSeconds"`
+	PruneThresholdInSeconds          int      `json:"pruneThresholdInSeconds"`
 }
 
 func (c *VcapComponent) UpdateVarz() {
@@ -51,50 +110,51 @@ func (c *VcapComponent) UpdateVarz() {
 	c.Varz.MemStat = procStat.MemRss
 	c.Varz.Cpu = procStat.CpuUsage
 	procStat.RUnlock()
-	c.Varz.Uptime = c.StartTime.Elapsed()
+	c.Varz.Uptime = c.Varz.StartTime.Elapsed()
 }
 
 func (c *VcapComponent) Start() error {
-	if c.Type == "" {
-		log.Error("Component type is required")
-		return errors.New("type is required")
+	if c.Varz.Type == "" {
+		err := errors.New("type is required")
+		log.Error("Component type is required", zap.Error(err))
+		return err
 	}
 
 	c.quitCh = make(chan struct{}, 1)
-	c.StartTime = Time(time.Now())
-	uuid, err := GenerateUUID()
+	c.Varz.StartTime = schema.Time(time.Now())
+	guid, err := uuid.GenerateUUID()
 	if err != nil {
 		return err
 	}
-	c.UUID = fmt.Sprintf("%d-%s", c.Index, uuid)
+	c.Varz.UUID = fmt.Sprintf("%d-%s", c.Varz.Index, guid)
 
-	if c.Host == "" {
-		host, err := LocalIP()
+	if c.Varz.Host == "" {
+		host, err := localip.LocalIP()
 		if err != nil {
-			log.Error(err.Error())
+			log.Error("error-getting-localIP", zap.Error(err))
 			return err
 		}
 
-		port, err := GrabEphemeralPort()
+		port, err := localip.LocalPort()
 		if err != nil {
-			log.Error(err.Error())
+			log.Error("error-getting-localPort", zap.Error(err))
 			return err
 		}
 
-		c.Host = fmt.Sprintf("%s:%d", host, port)
+		c.Varz.Host = fmt.Sprintf("%s:%d", host, port)
 	}
 
-	if c.Credentials == nil || len(c.Credentials) != 2 {
-		user, err := GenerateUUID()
+	if c.Varz.Credentials == nil || len(c.Varz.Credentials) != 2 {
+		user, err := uuid.GenerateUUID()
 		if err != nil {
 			return err
 		}
-		password, err := GenerateUUID()
+		password, err := uuid.GenerateUUID()
 		if err != nil {
 			return err
 		}
 
-		c.Credentials = []string{user, password}
+		c.Varz.Credentials = []string{user, password}
 	}
 
 	if c.Logger != nil {
@@ -102,7 +162,6 @@ func (c *VcapComponent) Start() error {
 	}
 
 	c.Varz.NumCores = runtime.NumCPU()
-	c.Varz.component = *c
 
 	procStat = NewProcessStatus()
 
@@ -110,27 +169,32 @@ func (c *VcapComponent) Start() error {
 	return nil
 }
 
-func (c *VcapComponent) Register(mbusClient yagnats.NATSClient) error {
-	mbusClient.Subscribe("vcap.component.discover", func(msg *yagnats.Message) {
-		c.Uptime = c.StartTime.Elapsed()
-		b, e := json.Marshal(c)
-		if e != nil {
-			log.Warnf(e.Error())
+func (c *VcapComponent) Register(mbusClient *nats.Conn) error {
+	mbusClient.Subscribe("vcap.component.discover", func(msg *nats.Msg) {
+		if msg.Reply == "" {
+			log.Info("Received message with empty reply", zap.String("nats-msg-subject", msg.Subject))
 			return
 		}
 
-		mbusClient.Publish(msg.ReplyTo, b)
+		c.Varz.Uptime = c.Varz.StartTime.Elapsed()
+		b, e := json.Marshal(c.Varz)
+		if e != nil {
+			log.Error("error-json-marshaling", zap.Error(e))
+			return
+		}
+
+		mbusClient.Publish(msg.Reply, b)
 	})
 
-	b, e := json.Marshal(c)
+	b, e := json.Marshal(c.Varz)
 	if e != nil {
-		log.Error(e.Error())
+		log.Error("error-json-marshaling", zap.Error(e))
 		return e
 	}
 
 	mbusClient.Publish("vcap.component.announce", b)
 
-	log.Infof("Component %s registered successfully", c.Type)
+	log.Info(fmt.Sprintf("Component %s registered successfully", c.Varz.Type))
 	return nil
 }
 
@@ -144,6 +208,10 @@ func (c *VcapComponent) Stop() {
 
 func (c *VcapComponent) ListenAndServe() {
 	hs := http.NewServeMux()
+
+	hs.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		c.Health.ServeHTTP(w, req)
+	})
 
 	hs.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Connection", "close")
@@ -164,29 +232,30 @@ func (c *VcapComponent) ListenAndServe() {
 	})
 
 	for path, marshaler := range c.InfoRoutes {
+		m := marshaler
 		hs.HandleFunc(path, func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Connection", "close")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 
 			enc := json.NewEncoder(w)
-			enc.Encode(marshaler)
+			enc.Encode(m)
 		})
 	}
 
 	f := func(user, password string) bool {
-		return user == c.Credentials[0] && password == c.Credentials[1]
+		return user == c.Varz.Credentials[0] && password == c.Varz.Credentials[1]
 	}
 
 	s := &http.Server{
-		Addr:         c.Host,
-		Handler:      &BasicAuth{hs, f},
+		Addr:         c.Varz.Host,
+		Handler:      &BasicAuth{Handler: hs, Authenticator: f},
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
 	c.statusCh = make(chan error, 1)
-	l, err := net.Listen("tcp", c.Host)
+	l, err := net.Listen("tcp", c.Varz.Host)
 	if err != nil {
 		c.statusCh <- err
 		return
