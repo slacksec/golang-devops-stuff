@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
 	. "gopkg.in/check.v1"
 )
 
@@ -19,7 +20,7 @@ var _ = Suite(&MonitorSuite{})
 func (s *MonitorSuite) SetUpSuite(c *C) {
 	s.zones = make(Zones)
 	s.metrics = NewMetrics()
-	go s.metrics.Updater(false)
+	go s.metrics.Updater()
 
 	*flaghttp = ":8881"
 
@@ -28,7 +29,8 @@ func (s *MonitorSuite) SetUpSuite(c *C) {
 	// TODO: use httptest
 	// https://groups.google.com/forum/?fromgroups=#!topic/golang-nuts/Jk785WB7F8I
 
-	zonesReadDir("dns", s.zones)
+	srv := Server{}
+	srv.zonesReadDir("dns", s.zones)
 	go httpHandler(s.zones)
 	time.Sleep(500 * time.Millisecond)
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -14,28 +16,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abh/dns"
 	"github.com/abh/errorutil"
+	"github.com/miekg/dns"
 )
 
 // Zones maps domain names to zone data
 type Zones map[string]*Zone
 
-func zonesReader(dirName string, zones Zones) {
-	for {
-		zonesReadDir(dirName, zones)
-		time.Sleep(5 * time.Second)
-	}
+type ZoneReadRecord struct {
+	time time.Time
+	hash string
 }
 
-func addHandler(zones Zones, name string, config *Zone) {
-	oldZone := zones[name]
-	config.SetupMetrics(oldZone)
-	zones[name] = config
-	dns.HandleFunc(name, setupServerFunc(config))
-}
+var lastRead = map[string]*ZoneReadRecord{}
 
-func zonesReadDir(dirName string, zones Zones) error {
+func (srv *Server) zonesReadDir(dirName string, zones Zones) error {
 	dir, err := ioutil.ReadDir(dirName)
 	if err != nil {
 		log.Println("Could not read", dirName, ":", err)
@@ -48,7 +43,9 @@ func zonesReadDir(dirName string, zones Zones) error {
 
 	for _, file := range dir {
 		fileName := file.Name()
-		if !strings.HasSuffix(strings.ToLower(fileName), ".json") {
+		if !strings.HasSuffix(strings.ToLower(fileName), ".json") ||
+			strings.HasPrefix(path.Base(fileName), ".") ||
+			file.IsDir() {
 			continue
 		}
 
@@ -56,28 +53,55 @@ func zonesReadDir(dirName string, zones Zones) error {
 
 		seenZones[zoneName] = true
 
-		if zone, ok := zones[zoneName]; !ok || file.ModTime().After(zone.LastRead) {
+		if _, ok := lastRead[zoneName]; !ok || file.ModTime().After(lastRead[zoneName].time) {
+			modTime := file.ModTime()
 			if ok {
-				log.Printf("Reloading %s\n", fileName)
+				logPrintf("Reloading %s\n", fileName)
+				lastRead[zoneName].time = modTime
 			} else {
 				logPrintf("Reading new file %s\n", fileName)
+				lastRead[zoneName] = &ZoneReadRecord{time: modTime}
 			}
 
-			//log.Println("FILE:", i, file, zoneName)
-			config, err := readZoneFile(zoneName, path.Join(dirName, fileName))
-			if config == nil || err != nil {
-				log.Println("Caught an error", err)
-				if config == nil {
-					config = new(Zone)
-				}
-				config.LastRead = file.ModTime()
-				zones[zoneName] = config
-				parseErr = err
+			filename := path.Join(dirName, fileName)
+
+			// Check the sha256 of the file has not changed. It's worth an explanation of
+			// why there isn't a TOCTOU race here. Conceivably after checking whether the
+			// SHA has changed, the contents then change again before we actually load
+			// the JSON. This can occur in two situations:
+			//
+			// 1. The SHA has not changed when we read the file for the SHA, but then
+			//    changes before we process the JSON
+			//
+			// 2. The SHA has changed when we read the file for the SHA, but then changes
+			//    again before we process the JSON
+			//
+			// In circumstance (1) we won't reread the file the first time, but the subsequent
+			// change should alter the mtime again, causing us to reread it. This reflects
+			// the fact there were actually two changes.
+			//
+			// In circumstance (2) we have already reread the file once, and then when the
+			// contents are changed the mtime changes again
+			//
+			// Provided files are replaced atomically, this should be OK. If files are not
+			// replaced atomically we have other problems (e.g. partial reads).
+
+			sha256 := sha256File(filename)
+			if lastRead[zoneName].hash == sha256 {
+				logPrintf("Skipping new file %s as hash is unchanged\n", filename)
 				continue
 			}
-			config.LastRead = file.ModTime()
 
-			addHandler(zones, zoneName, config)
+			config, err := readZoneFile(zoneName, filename)
+			if config == nil || err != nil {
+				parseErr = fmt.Errorf("Error reading zone '%s': %s", zoneName, err)
+				log.Println(parseErr.Error())
+				continue
+			}
+
+			(lastRead[zoneName]).hash = sha256
+
+			srv.addHandler(zones, zoneName, config)
 		}
 	}
 
@@ -89,6 +113,7 @@ func zonesReadDir(dirName string, zones Zones) error {
 			continue
 		}
 		log.Println("Removing zone", zone.Origin)
+		delete(lastRead, zoneName)
 		zone.Close()
 		dns.HandleRemove(zoneName)
 		delete(zones, zoneName)
@@ -97,7 +122,7 @@ func zonesReadDir(dirName string, zones Zones) error {
 	return parseErr
 }
 
-func setupPgeodnsZone(zones Zones) {
+func (srv *Server) setupPgeodnsZone(zones Zones) {
 	zoneName := "pgeodns"
 	Zone := NewZone(zoneName)
 	label := new(Label)
@@ -105,7 +130,15 @@ func setupPgeodnsZone(zones Zones) {
 	label.Weight = make(map[uint16]int)
 	Zone.Labels[""] = label
 	setupSOA(Zone)
-	addHandler(zones, zoneName, Zone)
+	srv.addHandler(zones, zoneName, Zone)
+}
+
+func (srv *Server) setupRootZone() {
+	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeRefused)
+		w.WriteMsg(m)
+	})
 }
 
 func readZoneFile(zoneName, fileName string) (zone *Zone, zerr error) {
@@ -159,7 +192,6 @@ func readZoneFile(zoneName, fileName string) (zone *Zone, zerr error) {
 		//log.Printf("k: %s v: %#v, T: %T\n", k, v, v)
 
 		switch k {
-
 		case "ttl":
 			zone.Options.Ttl = valueToInt(v)
 		case "serial":
@@ -219,7 +251,6 @@ func readZoneFile(zoneName, fileName string) (zone *Zone, zerr error) {
 }
 
 func setupZoneData(data map[string]interface{}, Zone *Zone) {
-
 	recordTypes := map[string]uint16{
 		"a":     dns.TypeA,
 		"aaaa":  dns.TypeAAAA,
@@ -230,10 +261,10 @@ func setupZoneData(data map[string]interface{}, Zone *Zone) {
 		"txt":   dns.TypeTXT,
 		"spf":   dns.TypeSPF,
 		"srv":   dns.TypeSRV,
+		"ptr":   dns.TypePTR,
 	}
 
 	for dk, dv_inter := range data {
-
 		dv := dv_inter.(map[string]interface{})
 
 		//log.Printf("K %s V %s TYPE-V %T\n", dk, dv, dv)
@@ -241,7 +272,6 @@ func setupZoneData(data map[string]interface{}, Zone *Zone) {
 		label := Zone.AddLabel(dk)
 
 		for rType, rdata := range dv {
-
 			switch rType {
 			case "max_hosts":
 				label.MaxHosts = valueToInt(rdata)
@@ -291,16 +321,16 @@ func setupZoneData(data map[string]interface{}, Zone *Zone) {
 			label.Records[dnsType] = make(Records, len(records[rType]))
 
 			for i := 0; i < len(records[rType]); i++ {
-
 				//log.Printf("RT %T %#v\n", records[rType][i], records[rType][i])
 
 				record := new(Record)
 
 				var h dns.RR_Header
-				// log.Println("TTL OPTIONS", Zone.Options.Ttl)
-				h.Ttl = uint32(label.Ttl)
 				h.Class = dns.ClassINET
 				h.Rrtype = dnsType
+
+				// We add the TTL as a last pass because we might not have
+				// processed it yet when we process the record data.
 
 				switch len(label.Label) {
 				case 0:
@@ -310,13 +340,16 @@ func setupZoneData(data map[string]interface{}, Zone *Zone) {
 				}
 
 				switch dnsType {
-				case dns.TypeA, dns.TypeAAAA:
+				case dns.TypeA, dns.TypeAAAA, dns.TypePTR:
 
 					str, weight := getStringWeight(records[rType][i].([]interface{}))
 					ip := str
 					record.Weight = weight
 
 					switch dnsType {
+					case dns.TypePTR:
+						record.RR = &dns.PTR{Hdr: h, Ptr: ip}
+						break
 					case dns.TypeA:
 						if x := net.ParseIP(ip); x != nil {
 							record.RR = &dns.A{Hdr: h, A: x}
@@ -497,16 +530,23 @@ func setupZoneData(data map[string]interface{}, Zone *Zone) {
 	}
 
 	// loop over exisiting labels, create zone records for missing sub-domains
+	// and set TTLs
 	for k := range Zone.Labels {
 		if strings.Contains(k, ".") {
 			subLabels := strings.Split(k, ".")
 			for i := 1; i < len(subLabels); i++ {
-				subSubLabel := strings.Join(subLabels[i:len(subLabels)], ".")
+				subSubLabel := strings.Join(subLabels[i:], ".")
 				if _, ok := Zone.Labels[subSubLabel]; !ok {
 					Zone.AddLabel(subSubLabel)
 				}
 			}
-
+		}
+		if Zone.Labels[k].Ttl > 0 {
+			for _, records := range Zone.Labels[k].Records {
+				for _, r := range records {
+					r.RR.Header().Ttl = uint32(Zone.Labels[k].Ttl)
+				}
+			}
 		}
 	}
 
@@ -516,14 +556,13 @@ func setupZoneData(data map[string]interface{}, Zone *Zone) {
 }
 
 func getStringWeight(rec []interface{}) (string, int) {
-
 	str := rec[0].(string)
 	var weight int
-	var err error
 
 	if len(rec) > 1 {
 		switch rec[1].(type) {
 		case string:
+			var err error
 			weight, err = strconv.Atoi(rec[1].(string))
 			if err != nil {
 				panic("Error converting weight to integer")
@@ -640,4 +679,14 @@ func valueToInt(v interface{}) (rv int) {
 
 func zoneNameFromFile(fileName string) string {
 	return fileName[0:strings.LastIndex(fileName, ".")]
+}
+
+func sha256File(fn string) string {
+	if data, err := ioutil.ReadFile(fn); err != nil {
+		return ""
+	} else {
+		hasher := sha256.New()
+		hasher.Write(data)
+		return hex.EncodeToString(hasher.Sum(nil))
+	}
 }

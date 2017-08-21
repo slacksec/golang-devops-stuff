@@ -1,42 +1,47 @@
 package main
 
 import (
-	"github.com/abh/dns"
 	"math/rand"
+
+	"github.com/miekg/dns"
 )
 
 func (label *Label) Picker(qtype uint16, max int) Records {
 
 	if qtype == dns.TypeANY {
-		result := make([]Record, 0)
+		var result []Record
 		for rtype := range label.Records {
 
-			rtype_records := label.Picker(rtype, max)
+			rtypeRecords := label.Picker(rtype, max)
 
-			tmp_result := make(Records, len(result)+len(rtype_records))
+			tmpResult := make(Records, len(result)+len(rtypeRecords))
 
-			copy(tmp_result, result)
-			copy(tmp_result[len(result):], rtype_records)
-			result = tmp_result
+			copy(tmpResult, result)
+			copy(tmpResult[len(result):], rtypeRecords)
+			result = tmpResult
 		}
 
 		return result
 	}
 
-	if label_rr := label.Records[qtype]; label_rr != nil {
+	if labelRR := label.Records[qtype]; labelRR != nil {
 
 		// not "balanced", just return all
 		if label.Weight[qtype] == 0 {
-			return label_rr
+			return labelRR
 		}
 
-		rr_count := len(label_rr)
-		if max > rr_count {
-			max = rr_count
+		if qtype == dns.TypeCNAME || qtype == dns.TypeMF {
+			max = 1
 		}
 
-		servers := make([]Record, len(label_rr))
-		copy(servers, label_rr)
+		rrCount := len(labelRR)
+		if max > rrCount {
+			max = rrCount
+		}
+
+		servers := make([]Record, len(labelRR))
+		copy(servers, labelRR)
 		result := make([]Record, max)
 		sum := label.Weight[qtype]
 

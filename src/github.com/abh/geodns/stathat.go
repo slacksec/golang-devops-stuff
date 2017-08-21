@@ -6,13 +6,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abh/go-metrics"
+	"github.com/rcrowley/go-metrics"
 	"github.com/stathat/go"
 )
 
 func (zs *Zones) statHatPoster() {
 
-	if len(Config.StatHat.ApiKey) == 0 {
+	if !Config.HasStatHat() {
 		return
 	}
 
@@ -23,10 +23,8 @@ func (zs *Zones) statHatPoster() {
 	lastEdnsCounts := map[string]int64{}
 
 	for name, zone := range *zs {
-		if zone.Logging.StatHat == true {
-			lastCounts[name] = zone.Metrics.Queries.Count()
-			lastEdnsCounts[name] = zone.Metrics.EdnsQueries.Count()
-		}
+		lastCounts[name] = zone.Metrics.Queries.Count()
+		lastEdnsCounts[name] = zone.Metrics.EdnsQueries.Count()
 	}
 
 	for {
@@ -42,17 +40,17 @@ func (zs *Zones) statHatPoster() {
 
 				apiKey := zone.Logging.StatHatAPI
 				if len(apiKey) == 0 {
-					apiKey = Config.StatHat.ApiKey
+					apiKey = Config.StatHatApiKey()
 				}
 				if len(apiKey) == 0 {
 					continue
 				}
-				stathat.PostEZCount("zone "+name+" queries~"+suffix, Config.StatHat.ApiKey, int(newCount))
+				stathat.PostEZCount("zone "+name+" queries~"+suffix, Config.StatHatApiKey(), int(newCount))
 
 				ednsCount := zone.Metrics.EdnsQueries.Count()
 				newEdnsCount := ednsCount - lastEdnsCounts[name]
 				lastEdnsCounts[name] = ednsCount
-				stathat.PostEZCount("zone "+name+" edns queries~"+suffix, Config.StatHat.ApiKey, int(newEdnsCount))
+				stathat.PostEZCount("zone "+name+" edns queries~"+suffix, Config.StatHatApiKey(), int(newEdnsCount))
 
 			}
 		}
@@ -70,7 +68,7 @@ func statHatPoster() {
 	for {
 		time.Sleep(60 * time.Second)
 
-		if !Config.Flags.HasStatHat {
+		if !Config.HasStatHat() {
 			log.Println("No stathat configuration")
 			continue
 		}
@@ -81,8 +79,8 @@ func statHatPoster() {
 		newQueries := current - lastQueryCount
 		lastQueryCount = current
 
-		stathat.PostEZCount("queries~"+suffix, Config.StatHat.ApiKey, int(newQueries))
-		stathat.PostEZValue("goroutines "+serverID, Config.StatHat.ApiKey, float64(runtime.NumGoroutine()))
+		stathat.PostEZCount("queries~"+suffix, Config.StatHatApiKey(), int(newQueries))
+		stathat.PostEZValue("goroutines "+serverID, Config.StatHatApiKey(), float64(runtime.NumGoroutine()))
 
 	}
 }
