@@ -10,8 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abh/dns"
-	"github.com/abh/go-metrics"
+	"github.com/abh/geodns/querylog"
+	"github.com/miekg/dns"
+	"github.com/rcrowley/go-metrics"
 )
 
 func getQuestionName(z *Zone, req *dns.Msg) string {
@@ -20,12 +21,25 @@ func getQuestionName(z *Zone, req *dns.Msg) string {
 	return strings.ToLower(strings.Join(ql, "."))
 }
 
-func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
+func (srv *Server) serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 
+	qname := req.Question[0].Name
 	qtype := req.Question[0].Qtype
 
-	logPrintf("[zone %s] incoming %s %s %d from %s\n", z.Origin, req.Question[0].Name,
-		dns.TypeToString[qtype], req.MsgHdr.Id, w.RemoteAddr())
+	var qle *querylog.Entry
+
+	if srv.queryLogger != nil {
+		qle = &querylog.Entry{
+			Time:   time.Now().UnixNano(),
+			Origin: z.Origin,
+			Name:   qname,
+			Qtype:  qtype,
+		}
+		defer srv.queryLogger.Write(qle)
+	}
+
+	logPrintf("[zone %s] incoming  %s %s (id %d) from %s\n", z.Origin, qname,
+		dns.TypeToString[qtype], req.Id, w.RemoteAddr())
 
 	// Global meter
 	metrics.Get("queries").(metrics.Meter).Mark(1)
@@ -39,9 +53,21 @@ func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 
 	z.Metrics.LabelStats.Add(label)
 
-	realIp, _, _ := net.SplitHostPort(w.RemoteAddr().String())
+	// IP that's talking to us (not EDNS CLIENT SUBNET)
+	var realIP net.IP
 
-	z.Metrics.ClientStats.Add(realIp)
+	if addr, ok := w.RemoteAddr().(*net.UDPAddr); ok {
+		realIP = make(net.IP, len(addr.IP))
+		copy(realIP, addr.IP)
+	} else if addr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		realIP = make(net.IP, len(addr.IP))
+		copy(realIP, addr.IP)
+	}
+	if qle != nil {
+		qle.RemoteAddr = realIP.String()
+	}
+
+	z.Metrics.ClientStats.Add(realIP.String())
 
 	var ip net.IP // EDNS or real IP
 	var edns *dns.EDNS0_SUBNET
@@ -62,6 +88,11 @@ func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 					if e.Address != nil {
 						edns = e
 						ip = e.Address
+
+						if qle != nil {
+							qle.HasECS = true
+							qle.ClientAddr = fmt.Sprintf("%s/%d", ip, e.SourceNetmask)
+						}
 					}
 				}
 			}
@@ -69,12 +100,27 @@ func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 	}
 
 	if len(ip) == 0 { // no edns subnet
-		ip = net.ParseIP(realIp)
+		ip = realIP
+		if qle != nil {
+			qle.ClientAddr = fmt.Sprintf("%s/%d", ip, len(ip)*8)
+		}
 	}
 
 	targets, netmask := z.Options.Targeting.GetTargets(ip)
 
+	if qle != nil {
+		qle.Targets = targets
+	}
+
 	m := new(dns.Msg)
+
+	if qle != nil {
+		defer func() {
+			qle.Rcode = m.Rcode
+			qle.Answers = len(m.Answer)
+		}()
+	}
+
 	m.SetReply(req)
 	if e := m.IsEdns0(); e != nil {
 		m.SetEdns0(4096, e.Do())
@@ -99,9 +145,15 @@ func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 
 	if labels == nil {
 
+		permitDebug := !*flagPrivateDebug || (realIP != nil && realIP.IsLoopback())
+
 		firstLabel := (strings.Split(label, "."))[0]
 
-		if firstLabel == "_status" {
+		if qle != nil {
+			qle.LabelName = firstLabel
+		}
+
+		if permitDebug && firstLabel == "_status" {
 			if qtype == dns.TypeANY || qtype == dns.TypeTXT {
 				m.Answer = statusRR(label + "." + z.Origin + ".")
 			} else {
@@ -134,6 +186,7 @@ func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 			}
 
 			m.Authoritative = true
+
 			w.WriteMsg(m)
 			return
 		}
@@ -151,19 +204,25 @@ func serve(w dns.ResponseWriter, req *dns.Msg, z *Zone) {
 	if servers := labels.Picker(labelQtype, labels.MaxHosts); servers != nil {
 		var rrs []dns.RR
 		for _, record := range servers {
-			rr := record.RR
-			rr.Header().Name = req.Question[0].Name
+			rr := dns.Copy(record.RR)
+			rr.Header().Name = qname
 			rrs = append(rrs, rr)
 		}
 		m.Answer = rrs
 	}
 
 	if len(m.Answer) == 0 {
+		// Return a SOA so the NOERROR answer gets cached
 		m.Ns = append(m.Ns, z.SoaRR())
 	}
 
 	logPrintln(m)
 
+	if qle != nil {
+		qle.LabelName = labels.Label
+		qle.Answers = len(m.Answer)
+		qle.Rcode = m.Rcode
+	}
 	err := w.WriteMsg(m)
 	if err != nil {
 		// if Pack'ing fails the Write fails. Return SERVFAIL.
@@ -192,28 +251,4 @@ func statusRR(label string) []dns.RR {
 	js, err := json.Marshal(status)
 
 	return []dns.RR{&dns.TXT{Hdr: h, Txt: []string{string(js)}}}
-}
-
-func setupServerFunc(Zone *Zone) func(dns.ResponseWriter, *dns.Msg) {
-	return func(w dns.ResponseWriter, r *dns.Msg) {
-		serve(w, r, Zone)
-	}
-}
-
-func listenAndServe(ip string) {
-
-	prots := []string{"udp", "tcp"}
-
-	for _, prot := range prots {
-		go func(p string) {
-			server := &dns.Server{Addr: ip, Net: p}
-
-			log.Printf("Opening on %s %s", ip, p)
-			if err := server.ListenAndServe(); err != nil {
-				log.Fatalf("geodns: failed to setup %s %s: %s", ip, p, err)
-			}
-			log.Fatalf("geodns: ListenAndServe unexpectedly returned")
-		}(prot)
-	}
-
 }

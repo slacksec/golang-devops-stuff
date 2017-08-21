@@ -2,10 +2,10 @@ package main
 
 import (
 	"strings"
-	"time"
+	"sync"
 
-	"github.com/abh/dns"
-	"github.com/abh/go-metrics"
+	"github.com/miekg/dns"
+	"github.com/rcrowley/go-metrics"
 )
 
 type ZoneOptions struct {
@@ -48,6 +48,7 @@ type labels map[string]*Label
 type ZoneMetrics struct {
 	Queries     metrics.Meter
 	EdnsQueries metrics.Meter
+	Registry    metrics.Registry
 	LabelStats  *zoneLabelStats
 	ClientStats *zoneLabelStats
 }
@@ -58,8 +59,9 @@ type Zone struct {
 	LabelCount int
 	Options    ZoneOptions
 	Logging    *ZoneLogging
-	LastRead   time.Time
 	Metrics    ZoneMetrics
+
+	sync.RWMutex
 }
 
 type qTypes []uint16
@@ -73,30 +75,46 @@ func NewZone(name string) *Zone {
 	// defaults
 	zone.Options.Ttl = 120
 	zone.Options.MaxHosts = 2
-	zone.Options.Contact = "support.bitnames.com"
+	zone.Options.Contact = "hostmaster." + name
 	zone.Options.Targeting = TargetGlobal + TargetCountry + TargetContinent
 
 	return zone
 }
 
 func (z *Zone) SetupMetrics(old *Zone) {
+	z.Lock()
+	defer z.Unlock()
+
 	if old != nil {
 		z.Metrics = old.Metrics
-	} else {
+	}
+	if z.Metrics.Registry == nil {
+		z.Metrics.Registry = metrics.NewRegistry()
+	}
+	if z.Metrics.Queries == nil {
 		z.Metrics.Queries = metrics.NewMeter()
+		z.Metrics.Registry.Register("queries", z.Metrics.Queries)
+	}
+	if z.Metrics.EdnsQueries == nil {
 		z.Metrics.EdnsQueries = metrics.NewMeter()
-		metrics.Register(z.Origin+" queries", z.Metrics.Queries)
-		metrics.Register(z.Origin+" EDNS queries", z.Metrics.EdnsQueries)
+		z.Metrics.Registry.Register("queries-edns", z.Metrics.EdnsQueries)
+	}
+	if z.Metrics.LabelStats == nil {
 		z.Metrics.LabelStats = NewZoneLabelStats(10000)
+	}
+	if z.Metrics.ClientStats == nil {
 		z.Metrics.ClientStats = NewZoneLabelStats(10000)
 	}
 }
 
 func (z *Zone) Close() {
-	metrics.Unregister(z.Origin + " queries")
-	metrics.Unregister(z.Origin + " EDNS queries")
-	z.Metrics.LabelStats.Close()
-	z.Metrics.ClientStats.Close()
+	z.Metrics.Registry.UnregisterAll()
+	if z.Metrics.LabelStats != nil {
+		z.Metrics.LabelStats.Close()
+	}
+	if z.Metrics.ClientStats != nil {
+		z.Metrics.ClientStats.Close()
+	}
 }
 
 func (l *Label) firstRR(dnsType uint16) dns.RR {
@@ -126,9 +144,7 @@ func (z *Zone) SoaRR() dns.RR {
 // first available qType at each targeting level. Return a Label
 // and the qtype that was "found"
 func (z *Zone) findLabels(s string, targets []string, qts qTypes) (*Label, uint16) {
-
 	for _, target := range targets {
-
 		var name string
 
 		switch target {
@@ -143,9 +159,8 @@ func (z *Zone) findLabels(s string, targets []string, qts qTypes) (*Label, uint1
 		}
 
 		if label, ok := z.Labels[name]; ok {
-
+			var name string
 			for _, qtype := range qts {
-
 				switch qtype {
 				case dns.TypeANY:
 					// short-circuit mostly to avoid subtle bugs later

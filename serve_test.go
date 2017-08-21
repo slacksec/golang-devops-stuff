@@ -1,11 +1,13 @@
 package main
 
 import (
+	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/abh/dns"
+	"github.com/miekg/dns"
 	. "gopkg.in/check.v1"
 )
 
@@ -22,14 +24,20 @@ func (s *ServeSuite) SetUpSuite(c *C) {
 
 	// setup and register metrics
 	metrics := NewMetrics()
-	go metrics.Updater(false)
+	go metrics.Updater()
+
+	srv := Server{}
 
 	Zones := make(Zones)
-	setupPgeodnsZone(Zones)
-	zonesReadDir("dns", Zones)
+	srv.setupPgeodnsZone(Zones)
+	srv.setupRootZone()
+	srv.zonesReadDir("dns", Zones)
 
-	go listenAndServe(PORT)
+	// listenAndServe returns after listening on udp + tcp, so just
+	// wait for it before continuing
+	srv.listenAndServe(PORT)
 
+	// ensure service has properly started before we query it
 	time.Sleep(200 * time.Millisecond)
 }
 
@@ -62,6 +70,7 @@ func (s *ServeSuite) TestServing(c *C) {
 	r = exchange(c, "bar.test.example.com.", dns.TypeA)
 	ip := r.Answer[0].(*dns.A).A
 	c.Check(ip.String(), Equals, "192.168.1.2")
+	c.Check(int(r.Answer[0].Header().Ttl), Equals, 601)
 
 	r = exchange(c, "test.example.com.", dns.TypeSOA)
 	soa := r.Answer[0].(*dns.SOA)
@@ -76,6 +85,7 @@ func (s *ServeSuite) TestServing(c *C) {
 	// CNAMEs
 	r = exchange(c, "www.test.example.com.", dns.TypeA)
 	c.Check(r.Answer[0].(*dns.CNAME).Target, Equals, "geo.bitnames.com.")
+	c.Check(int(r.Answer[0].Header().Ttl), Equals, 1800)
 
 	//SPF
 	r = exchange(c, "test.example.com.", dns.TypeSPF)
@@ -122,6 +132,14 @@ func (s *ServeSuite) TestServing(c *C) {
 	r = exchange(c, "one.test.example.com.", dns.TypeA)
 	ip = r.Answer[0].(*dns.A).A
 	c.Check(ip.String(), Equals, "192.168.1.6")
+
+	// PTR
+	r = exchange(c, "2.1.168.192.IN-ADDR.ARPA.", dns.TypePTR)
+	c.Check(r.Answer, HasLen, 1)
+	// NOERROR for PTR request
+	c.Check(r.Rcode, Equals, dns.RcodeSuccess)
+	name := r.Answer[0].(*dns.PTR).Ptr
+	c.Check(name, Equals, "bar.example.com.")
 }
 
 func (s *ServeSuite) TestServingMixedCase(c *C) {
@@ -149,13 +167,19 @@ func (s *ServeSuite) TestCname(c *C) {
 
 	for i := 0; i < 10; i++ {
 		r := exchange(c, "www.se.test.example.com.", dns.TypeA)
+		// only return one CNAME even if there are multiple options
+		c.Check(r.Answer, HasLen, 1)
 		target := r.Answer[0].(*dns.CNAME).Target
 		results[target]++
 	}
 
 	// Two possible results from this cname
 	c.Check(results, HasLen, 2)
+}
 
+func (s *ServeSuite) TestUnknownDomain(c *C) {
+	r := exchange(c, "no.such.domain.", dns.TypeAAAA)
+	c.Assert(r.Rcode, Equals, dns.RcodeRefused)
 }
 
 func (s *ServeSuite) TestServingAliases(c *C) {
@@ -192,6 +216,7 @@ func (s *ServeSuite) TestServingEDNS(c *C) {
 	c.Log("Testing www.test.example.com from .dk, should match www.europe (a cname)")
 
 	r = exchangeSubnet(c, "www.test.example.com.", dns.TypeA, "194.239.134.0")
+	// www.test from .dk IP address gets at least one answer
 	c.Check(r.Answer, HasLen, 1)
 	if len(r.Answer) > 0 {
 		// EDNS-SUBNET test (request A, respond CNAME)
@@ -200,9 +225,37 @@ func (s *ServeSuite) TestServingEDNS(c *C) {
 
 }
 
-func (s *ServeSuite) BenchmarkServing(c *C) {
+func (s *ServeSuite) TestServeRace(c *C) {
+	wg := sync.WaitGroup{}
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			s.TestServing(c)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+}
+
+func (s *ServeSuite) BenchmarkServingCountryDebug(c *C) {
 	for i := 0; i < c.N; i++ {
 		exchange(c, "_country.foo.pgeodns.", dns.TypeTXT)
+	}
+}
+
+func (s *ServeSuite) BenchmarkServing(c *C) {
+
+	// a deterministic seed is the default anyway, but let's be explicit we want it here.
+	rnd := rand.NewSource(1)
+
+	testNames := []string{"foo.test.example.com.", "one.test.example.com.",
+		"weight.test.example.com.", "three.two.one.test.example.com.",
+		"bar.test.example.com.", "0-alias.test.example.com.",
+	}
+
+	for i := 0; i < c.N; i++ {
+		name := testNames[rnd.Int63()%int64(len(testNames))]
+		exchange(c, name, dns.TypeA)
 	}
 }
 
@@ -237,9 +290,10 @@ func exchange(c *C, name string, dnstype uint16) *dns.Msg {
 
 func dorequest(c *C, msg *dns.Msg) *dns.Msg {
 	cli := new(dns.Client)
+	// cli.ReadTimeout = 2 * time.Second
 	r, _, err := cli.Exchange(msg, "127.0.0.1"+PORT)
 	if err != nil {
-		c.Log("err", err)
+		c.Logf("request err '%s': %s", msg.String(), err)
 		c.Fail()
 	}
 	return r

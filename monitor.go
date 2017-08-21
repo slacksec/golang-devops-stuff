@@ -1,5 +1,7 @@
 package main
 
+//go:generate esc -o templates.go templates/
+
 import (
 	"encoding/json"
 	"fmt"
@@ -13,19 +15,21 @@ import (
 	"strconv"
 	"time"
 
-	"code.google.com/p/go.net/websocket"
-	"github.com/abh/go-metrics"
+	"github.com/rcrowley/go-metrics"
+	"golang.org/x/net/websocket"
 )
 
 // Initial status message on websocket
 type statusStreamMsgStart struct {
-	Hostname string   `json:"h,omitemty"`
-	Version  string   `json:"v"`
-	ID       string   `json:"id"`
-	IP       string   `json:"ip"`
-	Uptime   int      `json:"up"`
-	Started  int      `json:"started"`
-	Groups   []string `json:"groups"`
+	Hostname  string   `json:"h,omitemty"`
+	Version   string   `json:"v"`
+	GoVersion string   `json:"gov"`
+	ID        string   `json:"id"`
+	IP        string   `json:"ip"`
+	UUID      string   `json:"uuid"`
+	Uptime    int      `json:"up"`
+	Started   int      `json:"started"`
+	Groups    []string `json:"groups"`
 }
 
 // Update message on websocket
@@ -138,6 +142,8 @@ func initialStatus() string {
 	status.Version = VERSION
 	status.ID = serverID
 	status.IP = serverIP
+	status.UUID = serverUUID
+	status.GoVersion = runtime.Version()
 	if len(serverGroups) > 0 {
 		status.Groups = serverGroups
 	}
@@ -153,25 +159,7 @@ func initialStatus() string {
 	return string(message)
 }
 
-func logStatus() {
-	log.Println(initialStatus())
-
-	qCounter := metrics.Get("queries").(metrics.Meter)
-	lastQueryCount := qCounter.Count()
-
-	for {
-		current := qCounter.Count()
-		newQueries := current - lastQueryCount
-		lastQueryCount = current
-
-		log.Println("goroutines", runtime.NumGoroutine(), "queries", newQueries)
-
-		time.Sleep(60 * time.Second)
-	}
-}
-
 func monitor(zones Zones) {
-	go logStatus()
 
 	if len(*flaghttp) == 0 {
 		return
@@ -253,7 +241,7 @@ type histogramData struct {
 	StdDev float64
 }
 
-func setupHistogramData(met *metrics.StandardHistogram, dat *histogramData) {
+func setupHistogramData(met metrics.Histogram, dat *histogramData) {
 	dat.Max = met.Max()
 	dat.Min = met.Min()
 	dat.Mean = met.Mean()
@@ -264,36 +252,78 @@ func setupHistogramData(met *metrics.StandardHistogram, dat *histogramData) {
 	dat.Pct999 = percentiles[2]
 }
 
-func StatusServer(zones Zones) func(http.ResponseWriter, *http.Request) {
+func topParam(req *http.Request, def int) int {
+	req.ParseForm()
+
+	topOption := def
+	topParam := req.Form["top"]
+
+	if len(topParam) > 0 {
+		var err error
+		topOption, err = strconv.Atoi(topParam[0])
+		if err != nil {
+			topOption = def
+		}
+	}
+
+	return topOption
+}
+
+func StatusJSONHandler(zones Zones) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+
+		zonemetrics := make(map[string]metrics.Registry)
+
+		for name, zone := range zones {
+			zone.Lock()
+			zonemetrics[name] = zone.Metrics.Registry
+			zone.Unlock()
+		}
+
+		type statusData struct {
+			Version   string
+			GoVersion string
+			Uptime    int64
+			Platform  string
+			Zones     map[string]metrics.Registry
+			Global    metrics.Registry
+			ID        string
+			IP        string
+			UUID      string
+			Groups    []string
+		}
+
+		uptime := int64(time.Since(timeStarted).Seconds())
+
+		status := statusData{
+			Version:   VERSION,
+			GoVersion: runtime.Version(),
+			Uptime:    uptime,
+			Platform:  runtime.GOARCH + "-" + runtime.GOOS,
+			Zones:     zonemetrics,
+			Global:    metrics.DefaultRegistry,
+			ID:        serverID,
+			IP:        serverIP,
+			UUID:      serverUUID,
+			Groups:    serverGroups,
+		}
+
+		b, err := json.Marshal(status)
+		if err != nil {
+			http.Error(w, "Error encoding JSON", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
+		return
+	}
+}
+
+func StatusHandler(zones Zones) func(http.ResponseWriter, *http.Request) {
 
 	return func(w http.ResponseWriter, req *http.Request) {
 
-		req.ParseForm()
-
-		topOption := 10
-		topParam := req.Form["top"]
-
-		if len(topParam) > 0 {
-			var err error
-			topOption, err = strconv.Atoi(topParam[0])
-			if err != nil {
-				topOption = 10
-			}
-		}
-
-		statusTemplate, err := templates_status_html()
-		if err != nil {
-			log.Println("Could not read template", err)
-			w.WriteHeader(500)
-			return
-		}
-		tmpl, err := template.New("status_html").Parse(string(statusTemplate))
-
-		if err != nil {
-			str := fmt.Sprintf("Could not parse template: %s", err)
-			io.WriteString(w, str)
-			return
-		}
+		topOption := topParam(req, 10)
 
 		rates := make(Rates, 0)
 
@@ -314,7 +344,7 @@ func StatusServer(zones Zones) func(http.ResponseWriter, *http.Request) {
 			Uptime   DayDuration
 			Platform string
 			Global   struct {
-				Queries         *metrics.StandardMeter
+				Queries         metrics.Meter
 				Histogram       histogramData
 				HistogramRecent histogramData
 			}
@@ -331,9 +361,23 @@ func StatusServer(zones Zones) func(http.ResponseWriter, *http.Request) {
 			TopOption: topOption,
 		}
 
-		status.Global.Queries = metrics.Get("queries").(*metrics.StandardMeter)
+		status.Global.Queries = metrics.Get("queries").(*metrics.StandardMeter).Snapshot()
 
-		setupHistogramData(metrics.Get("queries-histogram").(*metrics.StandardHistogram), &status.Global.Histogram)
+		setupHistogramData(metrics.Get("queries-histogram").(*metrics.StandardHistogram).Snapshot(), &status.Global.Histogram)
+
+		statusTemplate, err := FSString(development, "/templates/status.html")
+		if err != nil {
+			log.Println("Could not read template:", err)
+			w.WriteHeader(500)
+			return
+		}
+		tmpl, err := template.New("status_html").Parse(statusTemplate)
+
+		if err != nil {
+			str := fmt.Sprintf("Could not parse template: %s", err)
+			io.WriteString(w, str)
+			return
+		}
 
 		err = tmpl.Execute(w, status)
 		if err != nil {
@@ -342,12 +386,49 @@ func StatusServer(zones Zones) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
+type basicauth struct {
+	h http.Handler
+}
+
+func (b *basicauth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	// don't request passwords for the websocket interface (for now)
+	// because 'wscat' doesn't support that.
+	if r.RequestURI == "/monitor" {
+		b.h.ServeHTTP(w, r)
+		return
+	}
+
+	cfgMutex.RLock()
+	user := Config.HTTP.User
+	password := Config.HTTP.Password
+	cfgMutex.RUnlock()
+
+	if len(user) == 0 {
+		b.h.ServeHTTP(w, r)
+		return
+	}
+
+	ruser, rpass, ok := r.BasicAuth()
+	if ok {
+		if ruser == user && rpass == password {
+			b.h.ServeHTTP(w, r)
+			return
+		}
+	}
+
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm=%q`, "GeoDNS Status"))
+	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	return
+}
+
 func httpHandler(zones Zones) {
 	http.Handle("/monitor", websocket.Handler(wsHandler))
-	http.HandleFunc("/status", StatusServer(zones))
+	http.HandleFunc("/status", StatusHandler(zones))
+	http.HandleFunc("/status.json", StatusJSONHandler(zones))
 	http.HandleFunc("/", MainServer)
 
 	log.Println("Starting HTTP interface on", *flaghttp)
 
-	log.Fatal(http.ListenAndServe(*flaghttp, nil))
+	log.Fatal(http.ListenAndServe(*flaghttp, &basicauth{h: http.DefaultServeMux}))
 }

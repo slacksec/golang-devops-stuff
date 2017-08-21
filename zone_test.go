@@ -1,12 +1,15 @@
 package main
 
 import (
-	"github.com/abh/dns"
+	"github.com/miekg/dns"
 	. "gopkg.in/check.v1"
 )
 
 func (s *ConfigSuite) TestExampleComZone(c *C) {
-	ex := s.zones["test.example.com"]
+	ex, ok := s.zones["test.example.com"]
+
+	c.Check(ok, Equals, true)
+	c.Check(ex, NotNil)
 
 	// test.example.com was loaded
 	c.Assert(ex.Labels, NotNil)

@@ -1,0 +1,68 @@
+{
+	"ImportPath": "github.com/abh/geodns",
+	"GoVersion": "go1.7",
+	"GodepVersion": "v74",
+	"Deps": [
+		{
+			"ImportPath": "github.com/abh/errorutil",
+			"Rev": "f9bd360d00b902548fbb80837aef90dca2c8285e"
+		},
+		{
+			"ImportPath": "github.com/abh/geoip",
+			"Rev": "e5f8ea00f476d60a1e539d74211ce24881347d9e"
+		},
+		{
+			"ImportPath": "github.com/miekg/dns",
+			"Rev": "b9171237b0642de1d8e8004f16869970e065f46b"
+		},
+		{
+			"ImportPath": "github.com/pborman/uuid",
+			"Rev": "cccd189d45f7ac3368a0d127efb7f4d08ae0b655"
+		},
+		{
+			"ImportPath": "github.com/rcrowley/go-metrics",
+			"Rev": "eeba7bd0dd01ace6e690fa833b3f22aaec29af43"
+		},
+		{
+			"ImportPath": "github.com/stathat/go",
+			"Rev": "01d012b9ee2ecc107cb28b6dd32d9019ed5c1d77"
+		},
+		{
+			"ImportPath": "golang.org/x/net/websocket",
+			"Rev": "db8e4de5b2d6653f66aea53094624468caad15d2"
+		},
+		{
+			"ImportPath": "gopkg.in/check.v1",
+			"Rev": "11d3bc7aa68e238947792f30573146a3231fc0f1"
+		},
+		{
+			"ImportPath": "gopkg.in/fsnotify.v1",
+			"Comment": "v1.2.0",
+			"Rev": "96c060f6a6b7e0d6f75fddd10efeaca3e5d1bcb0"
+		},
+		{
+			"ImportPath": "gopkg.in/gcfg.v1",
+			"Rev": "083575c3955c85df16fe9590cceab64d03f5eb6e"
+		},
+		{
+			"ImportPath": "gopkg.in/gcfg.v1/scanner",
+			"Comment": "v1.0.0",
+			"Rev": "083575c3955c85df16fe9590cceab64d03f5eb6e"
+		},
+		{
+			"ImportPath": "gopkg.in/gcfg.v1/token",
+			"Comment": "v1.0.0",
+			"Rev": "083575c3955c85df16fe9590cceab64d03f5eb6e"
+		},
+		{
+			"ImportPath": "gopkg.in/gcfg.v1/types",
+			"Comment": "v1.0.0",
+			"Rev": "083575c3955c85df16fe9590cceab64d03f5eb6e"
+		},
+		{
+			"ImportPath": "gopkg.in/natefinch/lumberjack.v2",
+			"Comment": "v1.0-21-g514cbda",
+			"Rev": "514cbda263a734ae8caac038dadf05f8f3f9f738"
+		}
+	]
+}

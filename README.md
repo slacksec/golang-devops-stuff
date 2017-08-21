@@ -7,7 +7,7 @@ similar services. It supersedes the [pgeodns](http://github.com/abh/pgeodns) ser
 ## Installation
 
 If you already have go installed, just run `go get` to install the Go
-dependencies. GeoDNS requires Go 1.2 or later.
+dependencies. GeoDNS requires Go 1.4 or later.
 
 You will also need the GeoIP C library, on RedHat derived systems
 that's `yum install geoip-devel`.
@@ -48,6 +48,14 @@ After building the server you can run it with:
 To test the responses run
 
 `dig -t a test.example.com @127.1 -p 5053`
+
+or
+
+`dig -t ptr 2.1.168.192.IN-ADDR.ARPA. @127.1 -p 5053`
+
+or more simply put
+
+`dig -x 192.168.1.2 @127.1 -p 5053`
 
 The binary can be moved to /usr/local/bin, /opt/geodns/ or wherever you find appropriate.
 
@@ -112,6 +120,8 @@ GeoDNS can post runtime data to [StatHat](http://www.stathat.com/).
 
 ## Country and continent lookups
 
+See zone targeting options below.
+
 ## Weighted records
 
 Most records can have a 'weight' assigned. If any records of a particular type
@@ -131,10 +141,22 @@ As an example, if you configure
 
 with `max_hosts` 2 then .4 will be returned about 4 times more often than .1.
 
-## Configuration format
+## Configuration file
 
-In the configuration file the whole zone is a big hash (associative array). At the
-top level you can (optionally) set some options with the keys serial, ttl and max_hosts.
+The geodns.conf file allows you to specify a specific directory for the GeoIP
+data files and other options. See the `geodns.conf.sample` file for example
+configuration.
+
+The global configuration file is not reloaded at runtime.
+
+Most of the configuration is "per zone" and done in the zone .json files.
+The zone configuration files are automatically reloaded when they change.
+
+## Zone format
+
+In the zone configuration file the whole zone is a big hash (associative array).
+At the top level you can (optionally) set some options with the keys serial,
+ttl and max_hosts.
 
 The actual zone data (dns records) is in a hash under the key "data". The keys
 in the hash are hostnames and the value for each hostname is yet another hash
@@ -161,6 +183,37 @@ A record for users in Europe than anywhere else, use:
 The configuration files are automatically reloaded when they're updated. If a file
 can't be read (invalid JSON, for example) the previous configuration for that zone
 will be kept.
+
+## Zone options
+
+* serial
+
+GeoDNS doesn't support zone transfers (AXFR), so the serial number is only used
+for debugging and monitoring. The default is the 'last modified' timestamp of
+the zone file.
+
+* ttl
+
+Set the default TTL for the zone (default 120).
+
+* targeting
+
+* max_hosts
+
+
+
+* contact
+
+Set the soa 'contact' field (default is "hostmaster.$domain").
+
+## Zone targeting options
+
+@
+
+country
+continent
+
+region and regiongroup
 
 ## Supported record types
 
@@ -264,5 +317,5 @@ Much like MX records, SRV records can have multiple targets, eg:
 
 ## License and Copyright
 
-This software is Copyright 2012-2014 Ask Bjørn Hansen. For licensing information
+This software is Copyright 2012-2015 Ask Bjørn Hansen. For licensing information
 please see the file called LICENSE.

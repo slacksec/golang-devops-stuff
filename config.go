@@ -1,12 +1,14 @@
 package main
 
 import (
-	"code.google.com/p/gcfg"
 	"fmt"
-	"github.com/howeyc/fsnotify"
 	"log"
 	"os"
+	"sync"
 	"time"
+
+	"gopkg.in/fsnotify.v1"
+	"gopkg.in/gcfg.v1"
 )
 
 type AppConfig struct {
@@ -19,13 +21,39 @@ type AppConfig struct {
 	GeoIP struct {
 		Directory string
 	}
+	HTTP struct {
+		User     string
+		Password string
+	}
+	QueryLog struct {
+		Path    string
+		MaxSize int
+		Keep    int
+	}
 }
 
 var Config = new(AppConfig)
+var cfgMutex sync.RWMutex
+
+func (conf *AppConfig) HasStatHat() bool {
+	cfgMutex.RLock()
+	defer cfgMutex.RUnlock()
+	return conf.Flags.HasStatHat
+}
+
+func (conf *AppConfig) StatHatApiKey() string {
+	cfgMutex.RLock()
+	defer cfgMutex.RUnlock()
+	return conf.StatHat.ApiKey
+}
+
+func (conf *AppConfig) GeoIPDirectory() string {
+	cfgMutex.RLock()
+	defer cfgMutex.RUnlock()
+	return conf.GeoIP.Directory
+}
 
 func configWatcher(fileName string) {
-
-	configReader(fileName)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -33,21 +61,26 @@ func configWatcher(fileName string) {
 		return
 	}
 
-	if err := watcher.Watch(*flagconfig); err != nil {
+	if err := watcher.Add(*flagconfig); err != nil {
 		fmt.Println(err)
 		return
 	}
 
 	for {
 		select {
-		case ev := <-watcher.Event:
+		case ev := <-watcher.Events:
 			if ev.Name == fileName {
-				if ev.IsCreate() || ev.IsModify() || ev.IsRename() {
+				// Write = when the file is updated directly
+				// Rename = when it's updated atomicly
+				// Chmod = for `touch`
+				if ev.Op&fsnotify.Write == fsnotify.Write ||
+					ev.Op&fsnotify.Rename == fsnotify.Rename ||
+					ev.Op&fsnotify.Chmod == fsnotify.Chmod {
 					time.Sleep(200 * time.Millisecond)
 					configReader(fileName)
 				}
 			}
-		case err := <-watcher.Error:
+		case err := <-watcher.Errors:
 			log.Println("fsnotify error:", err)
 		}
 	}
@@ -85,7 +118,9 @@ func configReader(fileName string) error {
 	// log.Println("STATHAT APIKEY:", cfg.StatHat.ApiKey)
 	// log.Println("STATHAT FLAG  :", cfg.Flags.HasStatHat)
 
-	Config = cfg
+	cfgMutex.Lock()
+	*Config = *cfg // shallow copy to prevent race conditions in referring to Config.foo()
+	cfgMutex.Unlock()
 
 	return nil
 }

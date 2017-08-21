@@ -1,7 +1,7 @@
 package main
 
 /*
-   Copyright 2012-2014 Ask Bjørn Hansen
+   Copyright 2012-2015 Ask Bjørn Hansen
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -28,28 +28,41 @@ import (
 	"runtime/pprof"
 	"strings"
 	"time"
+
+	"github.com/abh/geodns/querylog"
+	"github.com/pborman/uuid"
 )
 
 // VERSION is the current version of GeoDNS
-var VERSION string = "2.4.4"
+var VERSION string = "2.7.0"
 var buildTime string
 var gitVersion string
 
-var serverID string
-var serverIP string
-var serverGroups []string
+// Set development with the 'devel' build flag to load
+// templates from disk instead of from the binary.
+var development bool
+
+var (
+	serverID     string
+	serverIP     string
+	serverGroups []string
+	serverUUID   = uuid.New()
+)
 
 var timeStarted = time.Now()
 
 var (
-	flagconfig      = flag.String("config", "./dns/", "directory of zone files")
-	flagcheckconfig = flag.Bool("checkconfig", false, "check configuration and exit")
-	flagidentifier  = flag.String("identifier", "", "identifier (hostname, pop name or similar)")
-	flaginter       = flag.String("interface", "*", "set the listener address")
-	flagport        = flag.String("port", "53", "default port number")
-	flaghttp        = flag.String("http", ":8053", "http listen address (:8053)")
-	flaglog         = flag.Bool("log", false, "be more verbose")
-	flagcpus        = flag.Int("cpus", 1, "Set the maximum number of CPUs to use")
+	flagconfig       = flag.String("config", "./dns/", "directory of zone files")
+	flagconfigfile   = flag.String("configfile", "geodns.conf", "filename of config file (in 'config' directory)")
+	flagcheckconfig  = flag.Bool("checkconfig", false, "check configuration and exit")
+	flagidentifier   = flag.String("identifier", "", "identifier (hostname, pop name or similar)")
+	flaginter        = flag.String("interface", "*", "set the listener address")
+	flagport         = flag.String("port", "53", "default port number")
+	flaghttp         = flag.String("http", ":8053", "http listen address (:8053)")
+	flaglog          = flag.Bool("log", false, "be more verbose")
+	flagcpus         = flag.Int("cpus", 1, "Set the maximum number of CPUs to use")
+	flagLogFile      = flag.String("logfile", "", "log to file")
+	flagPrivateDebug = flag.Bool("privatedebug", false, "Make debugging queries accepted only on loopback")
 
 	flagShowVersion = flag.Bool("version", false, "Show dnsconfig version")
 
@@ -74,8 +87,19 @@ func main() {
 	}
 
 	if *flagShowVersion {
-		fmt.Println("geodns", VERSION, buildTime)
+		extra := []string{}
+		if len(buildTime) > 0 {
+			extra = append(extra, buildTime)
+		}
+		extra = append(extra, runtime.Version())
+		fmt.Printf("geodns %s (%s)\n", VERSION, strings.Join(extra, ", "))
 		os.Exit(0)
+	}
+
+	srv := Server{}
+
+	if len(*flagLogFile) > 0 {
+		logToFileOpen(*flagLogFile)
 	}
 
 	if len(*flagidentifier) > 0 {
@@ -86,7 +110,13 @@ func main() {
 		}
 	}
 
-	configFileName := filepath.Clean(*flagconfig + "/geodns.conf")
+	var configFileName string
+
+	if filepath.IsAbs(*flagconfigfile) {
+		configFileName = *flagconfigfile
+	} else {
+		configFileName = filepath.Clean(filepath.Join(*flagconfig, *flagconfigfile))
+	}
 
 	if *flagcheckconfig {
 		dirName := *flagconfig
@@ -98,8 +128,8 @@ func main() {
 		}
 
 		Zones := make(Zones)
-		setupPgeodnsZone(Zones)
-		err = zonesReadDir(dirName, Zones)
+		srv.setupPgeodnsZone(Zones)
+		err = srv.zonesReadDir(dirName, Zones)
 		if err != nil {
 			log.Println("Errors reading zones", err)
 			os.Exit(2)
@@ -113,7 +143,7 @@ func main() {
 		runtime.GOMAXPROCS(*flagcpus)
 	}
 
-	log.Printf("Starting geodns %s\n", VERSION)
+	log.Printf("Starting geodns %s (%s)\n", VERSION, runtime.Version())
 
 	if *cpuprofile != "" {
 		prof, err := os.Create(*cpuprofile)
@@ -132,12 +162,22 @@ func main() {
 		}()
 	}
 
+	// load geodns.conf config
+	configReader(configFileName)
+
+	// load (and re-load) zone data
 	go configWatcher(configFileName)
 
 	metrics := NewMetrics()
-	go metrics.Updater(true)
+	go metrics.Updater()
 
-	go statHatPoster()
+	if qlc := Config.QueryLog; len(qlc.Path) > 0 {
+		ql, err := querylog.NewFileLogger(qlc.Path, qlc.MaxSize, qlc.Keep)
+		if err != nil {
+			log.Fatalf("Could not start file query logger: %s", err)
+		}
+		srv.SetQueryLogger(ql)
+	}
 
 	if *flaginter == "*" {
 		addrs, _ := net.InterfaceAddrs()
@@ -157,18 +197,21 @@ func main() {
 
 	inter := getInterfaces()
 
+	go statHatPoster()
+
 	Zones := make(Zones)
 
 	go monitor(Zones)
 	go Zones.statHatPoster()
 
-	setupPgeodnsZone(Zones)
+	srv.setupRootZone()
+	srv.setupPgeodnsZone(Zones)
 
 	dirName := *flagconfig
-	go zonesReader(dirName, Zones)
+	go srv.zonesReader(dirName, Zones)
 
 	for _, host := range inter {
-		go listenAndServe(host)
+		go srv.listenAndServe(host)
 	}
 
 	terminate := make(chan os.Signal)
@@ -185,5 +228,5 @@ func main() {
 		pprof.WriteHeapProfile(f)
 		f.Close()
 	}
-
+	logToFileClose()
 }
