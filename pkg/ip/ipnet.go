@@ -1,3 +1,17 @@
+// Copyright 2015 flannel authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package ip
 
 import (
@@ -10,17 +24,10 @@ import (
 type IP4 uint32
 
 func FromBytes(ip []byte) IP4 {
-	if NativelyLittle() {
-		return IP4(uint32(ip[3]) |
-			(uint32(ip[2]) << 8) |
-			(uint32(ip[1]) << 16) |
-			(uint32(ip[0]) << 24))
-	} else {
-		return IP4(uint32(ip[0]) |
-			(uint32(ip[1]) << 8) |
-			(uint32(ip[2]) << 16) |
-			(uint32(ip[3]) << 24))
-	}
+	return IP4(uint32(ip[3]) |
+		(uint32(ip[2]) << 8) |
+		(uint32(ip[1]) << 16) |
+		(uint32(ip[0]) << 24))
 }
 
 func FromIP(ip net.IP) IP4 {
@@ -35,12 +42,16 @@ func ParseIP4(s string) (IP4, error) {
 	return FromIP(ip), nil
 }
 
-func (ip IP4) Octets() (a, b, c, d byte) {
-	if NativelyLittle() {
-		a, b, c, d = byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip)
-	} else {
-		a, b, c, d = byte(ip), byte(ip>>8), byte(ip>>16), byte(ip>>24)
+func MustParseIP4(s string) IP4 {
+	ip, err := ParseIP4(s)
+	if err != nil {
+		panic(err)
 	}
+	return ip
+}
+
+func (ip IP4) Octets() (a, b, c, d byte) {
+	a, b, c, d = byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip)
 	return
 }
 
@@ -148,6 +159,10 @@ func (n IP4Net) Contains(ip IP4) bool {
 	return (uint32(n.IP) & n.Mask()) == (uint32(ip) & n.Mask())
 }
 
+func (n IP4Net) Empty() bool {
+	return n.IP == IP4(0) && n.PrefixLen == uint(0)
+}
+
 // json.Marshaler impl
 func (n IP4Net) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf(`"%s"`, n)), nil
@@ -157,7 +172,6 @@ func (n IP4Net) MarshalJSON() ([]byte, error) {
 func (n *IP4Net) UnmarshalJSON(j []byte) error {
 	j = bytes.Trim(j, "\"")
 	if _, val, err := net.ParseCIDR(string(j)); err != nil {
-		fmt.Println(err)
 		return err
 	} else {
 		*n = FromIPNet(val)
