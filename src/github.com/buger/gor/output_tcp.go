@@ -1,69 +1,105 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"strconv"
-	"strings"
+	"time"
 )
 
+// TCPOutput used for sending raw tcp payloads
+// Currently used for internal communication between listener and replay server
+// Can be used for transfering binary payloads like protocol buffers
 type TCPOutput struct {
-	address string
-	limit   int
-	buf     chan []byte
+	address  string
+	limit    int
+	buf      chan []byte
 	bufStats *GorStat
+	config   *TCPOutputConfig
 }
 
-func NewTCPOutput(options string) io.Writer {
+type TCPOutputConfig struct {
+	secure bool
+}
+
+// NewTCPOutput constructor for TCPOutput
+// Initialize 10 workers which hold keep-alive connection
+func NewTCPOutput(address string, config *TCPOutputConfig) io.Writer {
 	o := new(TCPOutput)
 
-	optionsArr := strings.Split(options, "|")
-	o.address = optionsArr[0]
+	o.address = address
+	o.config = config
 
 	o.buf = make(chan []byte, 100)
-	o.bufStats = NewGorStat("output_tcp")
-
-	if len(optionsArr) > 1 {
-		o.limit, _ = strconv.Atoi(optionsArr[1])
+	if Settings.outputTCPStats {
+		o.bufStats = NewGorStat("output_tcp")
 	}
 
 	for i := 0; i < 10; i++ {
 		go o.worker()
 	}
 
-	if o.limit > 0 {
-		return NewLimiter(o, o.limit)
-	} else {
-		return o
-	}
+	return o
 }
 
 func (o *TCPOutput) worker() {
-	conn, _ := o.connect(o.address)
+	retries := 1
+	conn, err := o.connect(o.address)
+	for {
+		if err == nil {
+			break
+		}
+
+		log.Println("Can't connect to aggregator instance, reconnecting in 1 second. Retries:", retries)
+		time.Sleep(1 * time.Second)
+
+		conn, err = o.connect(o.address)
+		retries++
+	}
+
+	if retries > 0 {
+		log.Println("Connected to aggregator instance after ", retries, " retries")
+	}
+
 	defer conn.Close()
 
 	for {
 		conn.Write(<-o.buf)
+		_, err := conn.Write([]byte(payloadSeparator))
+
+		if err != nil {
+			log.Println("Lost connection with aggregator instance, reconnecting")
+			go o.worker()
+			break
+		}
 	}
 }
 
 func (o *TCPOutput) Write(data []byte) (n int, err error) {
-	new_buf := make([]byte, len(data) + 2)
-	data = append(data,[]byte("¶")...)
-	copy(new_buf, data)
-	o.buf <- new_buf
-	o.bufStats.Write(len(o.buf))
+	if !isOriginPayload(data) {
+		return len(data), nil
+	}
+
+	// We have to copy, because sending data in multiple threads
+	newBuf := make([]byte, len(data))
+	copy(newBuf, data)
+
+	o.buf <- newBuf
+
+	if Settings.outputTCPStats {
+		o.bufStats.Write(len(o.buf))
+	}
 
 	return len(data), nil
 }
 
 func (o *TCPOutput) connect(address string) (conn net.Conn, err error) {
-	conn, err = net.Dial("tcp", address)
-
-	if err != nil {
-		log.Println("Connection error ", err, o.address)
+	if o.config.secure {
+		conn, err = tls.Dial("tcp", address, &tls.Config{})
+	} else {
+		conn, err = net.Dial("tcp", address)
 	}
 
 	return

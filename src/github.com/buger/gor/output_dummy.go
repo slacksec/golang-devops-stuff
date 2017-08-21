@@ -4,17 +4,19 @@ import (
 	"fmt"
 )
 
+// DummyOutput used for debugging, prints all incoming requests
 type DummyOutput struct {
 }
 
-func NewDummyOutput(options string) (di *DummyOutput) {
+// NewDummyOutput constructor for DummyOutput
+func NewDummyOutput() (di *DummyOutput) {
 	di = new(DummyOutput)
 
 	return
 }
 
 func (i *DummyOutput) Write(data []byte) (int, error) {
-	fmt.Println("Writing message: ", data)
+	fmt.Println(string(data))
 
 	return len(data), nil
 }

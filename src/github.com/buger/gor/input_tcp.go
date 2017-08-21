@@ -2,24 +2,35 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 )
 
-// Can be tested using nc tool:
-//    echo "asdad" | nc 127.0.0.1 27017
-//
+// TCPInput used for internal communication
 type TCPInput struct {
 	data     chan []byte
-	address  string
 	listener net.Listener
+	address  string
+	config   *TCPInputConfig
 }
 
-func NewTCPInput(address string) (i *TCPInput) {
+type TCPInputConfig struct {
+	secure          bool
+	certificatePath string
+	keyPath         string
+}
+
+// NewTCPInput constructor for TCPInput, accepts address with port
+func NewTCPInput(address string, config *TCPInputConfig) (i *TCPInput) {
 	i = new(TCPInput)
-	i.data = make(chan []byte)
+	i.data = make(chan []byte, 1000)
 	i.address = address
+	i.config = config
 
 	i.listen(address)
 
@@ -34,16 +45,30 @@ func (i *TCPInput) Read(data []byte) (int, error) {
 }
 
 func (i *TCPInput) listen(address string) {
-	listener, err := net.Listen("tcp", address)
-	i.listener = listener
+	if i.config.secure {
+		cer, err := tls.LoadX509KeyPair(i.config.certificatePath, i.config.keyPath)
+		if err != nil {
+			log.Fatal("Error while loading --input-file certificate:", err)
+		}
 
-	if err != nil {
-		log.Fatal("Can't start:", err)
+		config := &tls.Config{Certificates: []tls.Certificate{cer}}
+		listener, err := tls.Listen("tcp", address, config)
+		if err != nil {
+			log.Fatal("Can't start --input-tcp with secure connection:", err)
+		}
+		i.listener = listener
+	} else {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			log.Fatal("Can't start:", err)
+		}
+
+		i.listener = listener
 	}
 
 	go func() {
 		for {
-			conn, err := listener.Accept()
+			conn, err := i.listener.Accept()
 
 			if err != nil {
 				log.Println("Error while Accept()", err)
@@ -58,23 +83,31 @@ func (i *TCPInput) listen(address string) {
 func (i *TCPInput) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	payloadSeparatorAsBytes := []byte(payloadSeparator)
 	reader := bufio.NewReader(conn)
+	var buffer bytes.Buffer
 
 	for {
-		buf,err := reader.ReadBytes('¶')
-		buf_len := len(buf)
-		if buf_len > 0 {
-			new_buf_len := len(buf) - 2
-			if new_buf_len > 0 {
-				new_buf := make([]byte, new_buf_len)
-				copy(new_buf, buf[:new_buf_len])
-				i.data <- new_buf
-				if err != nil {
-					if err != io.EOF {
-						log.Printf("error: %s\n", err)
-					}
-				}
+		line, err := reader.ReadBytes('\n')
+
+		if err != nil {
+			if err != io.EOF {
+				fmt.Fprintln(os.Stderr, "Unexpected error in input tcp connection:", err)
 			}
+			break
+
+		}
+
+		if bytes.Equal(payloadSeparatorAsBytes[1:], line) {
+			asBytes := buffer.Bytes()
+			buffer.Reset()
+
+			newBuf := make([]byte, len(asBytes)-1)
+			copy(newBuf, asBytes)
+
+			i.data <- newBuf
+		} else {
+			buffer.Write(line)
 		}
 	}
 }

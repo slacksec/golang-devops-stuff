@@ -1,53 +1,112 @@
 package main
 
 import (
-	raw "github.com/buger/gor/raw_socket_listener"
+	"github.com/buger/goreplay/proto"
+	raw "github.com/buger/goreplay/raw_socket_listener"
 	"log"
 	"net"
-	"strings"
+	"time"
 )
 
+// RAWInput used for intercepting traffic for given address
 type RAWInput struct {
-	data    chan []byte
-	address string
+	data          chan *raw.TCPMessage
+	address       string
+	expire        time.Duration
+	quit          chan bool
+	engine        int
+	realIPHeader  []byte
+	trackResponse bool
+	listener      *raw.Listener
+	bpfFilter     string
 }
 
-func NewRAWInput(address string) (i *RAWInput) {
-	i = new(RAWInput)
-	i.data = make(chan []byte)
-	i.address = address
+// Available engines for intercepting traffic
+const (
+	EngineRawSocket = 1 << iota
+	EnginePcap
+	EnginePcapFile
+)
 
-	go i.listen(address)
+// NewRAWInput constructor for RAWInput. Accepts address with port as argument.
+func NewRAWInput(address string, engine int, trackResponse bool, expire time.Duration, realIPHeader string, bpfFilter string) (i *RAWInput) {
+	i = new(RAWInput)
+	i.data = make(chan *raw.TCPMessage)
+	i.address = address
+	i.expire = expire
+	i.engine = engine
+	i.realIPHeader = []byte(realIPHeader)
+	i.quit = make(chan bool)
+	i.trackResponse = trackResponse
+
+	i.listen(address)
+	i.listener.IsReady()
 
 	return
 }
 
 func (i *RAWInput) Read(data []byte) (int, error) {
-	buf := <-i.data
-	copy(data, buf)
+	msg := <-i.data
+	buf := msg.Bytes()
 
-	return len(buf), nil
+	var header []byte
+
+	if msg.IsIncoming {
+		header = payloadHeader(RequestPayload, msg.UUID(), msg.Start.UnixNano(), -1)
+		if len(i.realIPHeader) > 0 {
+			buf = proto.SetHeader(buf, i.realIPHeader, []byte(msg.IP().String()))
+		}
+	} else {
+		header = payloadHeader(ResponsePayload, msg.UUID(), msg.AssocMessage.Start.UnixNano(), msg.End.UnixNano()-msg.AssocMessage.Start.UnixNano())
+	}
+
+	copy(data[0:len(header)], header)
+	copy(data[len(header):], buf)
+
+	return len(buf) + len(header), nil
 }
 
 func (i *RAWInput) listen(address string) {
-	address = strings.Replace(address, "[::]", "127.0.0.1", -1)
+	Debug("Listening for traffic on: " + address)
 
 	host, port, err := net.SplitHostPort(address)
+
+	if i.engine == EnginePcapFile {
+		host = address
+		port = "1"
+		err = nil
+	}
 
 	if err != nil {
 		log.Fatal("input-raw: error while parsing address", err)
 	}
 
-	listener := raw.NewListener(host, port)
+	i.listener = raw.NewListener(host, port, i.engine, i.trackResponse, i.expire, i.bpfFilter)
 
-	for {
-		// Receiving TCPMessage object
-		m := listener.Receive()
+	ch := i.listener.Receiver()
 
-		i.data <- m.Bytes()
-	}
+	go func() {
+		for {
+			select {
+			case <-i.quit:
+				return
+			default:
+			}
+
+			// Receiving TCPMessage object
+			m := <-ch
+
+			i.data <- m
+		}
+	}()
 }
 
 func (i *RAWInput) String() string {
-	return "RAW Socket input: " + i.address
+	return "Intercepting traffic from: " + i.address
+}
+
+func (i *RAWInput) Close() error {
+	i.listener.Close()
+	close(i.quit)
+	return nil
 }

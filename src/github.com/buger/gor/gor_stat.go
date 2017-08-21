@@ -1,9 +1,10 @@
 package main
 
 import (
-	"time"
 	"log"
+	"runtime"
 	"strconv"
+	"time"
 )
 
 const (
@@ -11,11 +12,11 @@ const (
 )
 
 type GorStat struct {
-	statName	string
-	latest		int
-	mean	 	int
-	max			int
-	count		int
+	statName string
+	latest   int
+	mean     int
+	max      int
+	count    int
 }
 
 func NewGorStat(statName string) (s *GorStat) {
@@ -27,7 +28,7 @@ func NewGorStat(statName string) (s *GorStat) {
 	s.count = 0
 
 	if Settings.stats {
-		log.Println(s.statName + ":latest,mean,max,count,count/second")
+		log.Println(s.statName + ":latest,mean,max,count,count/second,gcount")
 		go s.reportStats()
 	}
 	return
@@ -54,14 +55,13 @@ func (s *GorStat) Reset() {
 }
 
 func (s *GorStat) String() string {
-	return s.statName + ":" + strconv.Itoa(s.latest) + "," + strconv.Itoa(s.mean) + "," + strconv.Itoa(s.max) + "," + strconv.Itoa(s.count) + "," + strconv.Itoa(s.count / rate)
+	return s.statName + ":" + strconv.Itoa(s.latest) + "," + strconv.Itoa(s.mean) + "," + strconv.Itoa(s.max) + "," + strconv.Itoa(s.count) + "," + strconv.Itoa(s.count/rate) + "," + strconv.Itoa(runtime.NumGoroutine())
 }
 
 func (s *GorStat) reportStats() {
 	for {
-			log.Println(s)
-			s.Reset()
-			time.Sleep(rate * time.Second)
+		log.Println(s)
+		s.Reset()
+		time.Sleep(rate * time.Second)
 	}
 }
-
