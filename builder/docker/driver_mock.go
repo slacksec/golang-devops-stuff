@@ -2,10 +2,17 @@ package docker
 
 import (
 	"io"
+
+	"github.com/hashicorp/go-version"
 )
 
 // MockDriver is a driver implementation that can be used for tests.
 type MockDriver struct {
+	CommitCalled      bool
+	CommitContainerId string
+	CommitImageId     string
+	CommitErr         error
+
 	DeleteImageCalled bool
 	DeleteImageId     string
 	DeleteImageErr    error
@@ -16,9 +23,36 @@ type MockDriver struct {
 	ImportId     string
 	ImportErr    error
 
+	IPAddressCalled bool
+	IPAddressID     string
+	IPAddressResult string
+	IPAddressErr    error
+
+	LoginCalled   bool
+	LoginEmail    string
+	LoginUsername string
+	LoginPassword string
+	LoginRepo     string
+	LoginErr      error
+
+	LogoutCalled bool
+	LogoutRepo   string
+	LogoutErr    error
+
 	PushCalled bool
 	PushName   string
 	PushErr    error
+
+	SaveImageCalled bool
+	SaveImageId     string
+	SaveImageReader io.Reader
+	SaveImageError  error
+
+	TagImageCalled  bool
+	TagImageImageId string
+	TagImageRepo    string
+	TagImageForce   bool
+	TagImageErr     error
 
 	ExportReader io.Reader
 	ExportError  error
@@ -37,6 +71,15 @@ type MockDriver struct {
 	StopCalled   bool
 	StopID       string
 	VerifyCalled bool
+
+	VersionCalled  bool
+	VersionVersion string
+}
+
+func (d *MockDriver) Commit(id string, author string, changes []string, message string) (string, error) {
+	d.CommitCalled = true
+	d.CommitContainerId = id
+	return d.CommitImageId, d.CommitErr
 }
 
 func (d *MockDriver) DeleteImage(id string) error {
@@ -66,6 +109,27 @@ func (d *MockDriver) Import(path, repo string) (string, error) {
 	return d.ImportId, d.ImportErr
 }
 
+func (d *MockDriver) IPAddress(id string) (string, error) {
+	d.IPAddressCalled = true
+	d.IPAddressID = id
+	return d.IPAddressResult, d.IPAddressErr
+}
+
+func (d *MockDriver) Login(r, e, u, p string) error {
+	d.LoginCalled = true
+	d.LoginRepo = r
+	d.LoginEmail = e
+	d.LoginUsername = u
+	d.LoginPassword = p
+	return d.LoginErr
+}
+
+func (d *MockDriver) Logout(r string) error {
+	d.LogoutCalled = true
+	d.LogoutRepo = r
+	return d.LogoutErr
+}
+
 func (d *MockDriver) Pull(image string) error {
 	d.PullCalled = true
 	d.PullImage = image
@@ -76,6 +140,20 @@ func (d *MockDriver) Push(name string) error {
 	d.PushCalled = true
 	d.PushName = name
 	return d.PushErr
+}
+
+func (d *MockDriver) SaveImage(id string, dst io.Writer) error {
+	d.SaveImageCalled = true
+	d.SaveImageId = id
+
+	if d.SaveImageReader != nil {
+		_, err := io.Copy(dst, d.SaveImageReader)
+		if err != nil {
+			return err
+		}
+	}
+
+	return d.SaveImageError
 }
 
 func (d *MockDriver) StartContainer(config *ContainerConfig) (string, error) {
@@ -90,7 +168,20 @@ func (d *MockDriver) StopContainer(id string) error {
 	return d.StopError
 }
 
+func (d *MockDriver) TagImage(id string, repo string, force bool) error {
+	d.TagImageCalled = true
+	d.TagImageImageId = id
+	d.TagImageRepo = repo
+	d.TagImageForce = force
+	return d.TagImageErr
+}
+
 func (d *MockDriver) Verify() error {
 	d.VerifyCalled = true
 	return d.VerifyError
+}
+
+func (d *MockDriver) Version() (*version.Version, error) {
+	d.VersionCalled = true
+	return version.NewVersion(d.VersionVersion)
 }

@@ -2,17 +2,21 @@ package common
 
 import (
 	"fmt"
-	"github.com/mitchellh/goamz/ec2"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/packer"
 	"log"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/private/waiter"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
 type StepSecurityGroup struct {
+	CommConfig       *communicator.Config
 	SecurityGroupIds []string
-	SSHPort          int
 	VpcId            string
 
 	createdGroupId string
@@ -23,49 +27,68 @@ func (s *StepSecurityGroup) Run(state multistep.StateBag) multistep.StepAction {
 	ui := state.Get("ui").(packer.Ui)
 
 	if len(s.SecurityGroupIds) > 0 {
+		_, err := ec2conn.DescribeSecurityGroups(
+			&ec2.DescribeSecurityGroupsInput{
+				GroupIds: aws.StringSlice(s.SecurityGroupIds),
+			},
+		)
+		if err != nil {
+			err := fmt.Errorf("Couldn't find specified security group: %s", err)
+			log.Printf("[DEBUG] %s", err.Error())
+			state.Put("error", err)
+			return multistep.ActionHalt
+		}
 		log.Printf("Using specified security groups: %v", s.SecurityGroupIds)
 		state.Put("securityGroupIds", s.SecurityGroupIds)
 		return multistep.ActionContinue
 	}
 
-	if s.SSHPort == 0 {
-		panic("SSHPort must be set to a non-zero value.")
+	port := s.CommConfig.Port()
+	if port == 0 {
+		if s.CommConfig.Type != "none" {
+			panic("port must be set to a non-zero value.")
+		}
 	}
 
 	// Create the group
-	ui.Say("Creating temporary security group for this instance...")
-	groupName := fmt.Sprintf("packer %s", uuid.TimeOrderedUUID())
-	log.Printf("Temporary group name: %s", groupName)
-	group := ec2.SecurityGroup{
-		Name:        groupName,
-		Description: "Temporary group for Packer",
-		VpcId:       s.VpcId,
+	groupName := fmt.Sprintf("packer_%s", uuid.TimeOrderedUUID())
+	ui.Say(fmt.Sprintf("Creating temporary security group for this instance: %s", groupName))
+	group := &ec2.CreateSecurityGroupInput{
+		GroupName:   &groupName,
+		Description: aws.String("Temporary group for Packer"),
 	}
+
+	if s.VpcId != "" {
+		group.VpcId = &s.VpcId
+	}
+
 	groupResp, err := ec2conn.CreateSecurityGroup(group)
 	if err != nil {
 		ui.Error(err.Error())
+		state.Put("error", err)
 		return multistep.ActionHalt
 	}
 
 	// Set the group ID so we can delete it later
-	s.createdGroupId = groupResp.Id
+	s.createdGroupId = *groupResp.GroupId
 
-	// Authorize the SSH access
-	perms := []ec2.IPPerm{
-		ec2.IPPerm{
-			Protocol:  "tcp",
-			FromPort:  s.SSHPort,
-			ToPort:    s.SSHPort,
-			SourceIPs: []string{"0.0.0.0/0"},
-		},
+	// Authorize the SSH access for the security group
+	req := &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId:    groupResp.GroupId,
+		IpProtocol: aws.String("tcp"),
+		FromPort:   aws.Int64(int64(port)),
+		ToPort:     aws.Int64(int64(port)),
+		CidrIp:     aws.String("0.0.0.0/0"),
 	}
 
 	// We loop and retry this a few times because sometimes the security
-	// group isn't available immediately because AWS resources are eventaully
+	// group isn't available immediately because AWS resources are eventually
 	// consistent.
-	ui.Say("Authorizing SSH access on the temporary security group...")
+	ui.Say(fmt.Sprintf(
+		"Authorizing access to port %d on the temporary security group...",
+		port))
 	for i := 0; i < 5; i++ {
-		_, err = ec2conn.AuthorizeSecurityGroup(groupResp.SecurityGroup, perms)
+		_, err = ec2conn.AuthorizeSecurityGroupIngress(req)
 		if err == nil {
 			break
 		}
@@ -78,6 +101,21 @@ func (s *StepSecurityGroup) Run(state multistep.StateBag) multistep.StepAction {
 		err := fmt.Errorf("Error creating temporary security group: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
+		return multistep.ActionHalt
+	}
+
+	log.Printf("[DEBUG] Waiting for temporary security group: %s", s.createdGroupId)
+	err = waitUntilSecurityGroupExists(ec2conn,
+		&ec2.DescribeSecurityGroupsInput{
+			GroupIds: []*string{aws.String(s.createdGroupId)},
+		},
+	)
+	if err == nil {
+		log.Printf("[DEBUG] Found security group %s", s.createdGroupId)
+	} else {
+		err := fmt.Errorf("Timed out waiting for security group %s: %s", s.createdGroupId, err)
+		log.Printf("[DEBUG] %s", err.Error())
+		state.Put("error", err)
 		return multistep.ActionHalt
 	}
 
@@ -99,7 +137,7 @@ func (s *StepSecurityGroup) Cleanup(state multistep.StateBag) {
 
 	var err error
 	for i := 0; i < 5; i++ {
-		_, err = ec2conn.DeleteSecurityGroup(ec2.SecurityGroup{Id: s.createdGroupId})
+		_, err = ec2conn.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{GroupId: &s.createdGroupId})
 		if err == nil {
 			break
 		}
@@ -112,4 +150,39 @@ func (s *StepSecurityGroup) Cleanup(state multistep.StateBag) {
 		ui.Error(fmt.Sprintf(
 			"Error cleaning up security group. Please delete the group manually: %s", s.createdGroupId))
 	}
+}
+
+func waitUntilSecurityGroupExists(c *ec2.EC2, input *ec2.DescribeSecurityGroupsInput) error {
+	waiterCfg := waiter.Config{
+		Operation:   "DescribeSecurityGroups",
+		Delay:       15,
+		MaxAttempts: 40,
+		Acceptors: []waiter.WaitAcceptor{
+			{
+				State:    "success",
+				Matcher:  "path",
+				Argument: "length(SecurityGroups[]) > `0`",
+				Expected: true,
+			},
+			{
+				State:    "retry",
+				Matcher:  "error",
+				Argument: "",
+				Expected: "InvalidGroup.NotFound",
+			},
+			{
+				State:    "retry",
+				Matcher:  "error",
+				Argument: "",
+				Expected: "InvalidSecurityGroupID.NotFound",
+			},
+		},
+	}
+
+	w := waiter.Waiter{
+		Client: c,
+		Input:  input,
+		Config: waiterCfg,
+	}
+	return w.Wait()
 }

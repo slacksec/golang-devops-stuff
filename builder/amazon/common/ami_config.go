@@ -3,66 +3,42 @@ package common
 import (
 	"fmt"
 
-	"github.com/mitchellh/goamz/aws"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // AMIConfig is for common configuration related to creating AMIs.
 type AMIConfig struct {
-	AMIName               string            `mapstructure:"ami_name"`
-	AMIDescription        string            `mapstructure:"ami_description"`
-	AMIVirtType           string            `mapstructure:"ami_virtualization_type"`
-	AMIUsers              []string          `mapstructure:"ami_users"`
-	AMIGroups             []string          `mapstructure:"ami_groups"`
-	AMIProductCodes       []string          `mapstructure:"ami_product_codes"`
-	AMIRegions            []string          `mapstructure:"ami_regions"`
-	AMITags               map[string]string `mapstructure:"tags"`
-	AMIEnhancedNetworking bool              `mapstructure:"enhanced_networking"`
+	AMIName                 string            `mapstructure:"ami_name"`
+	AMIDescription          string            `mapstructure:"ami_description"`
+	AMIVirtType             string            `mapstructure:"ami_virtualization_type"`
+	AMIUsers                []string          `mapstructure:"ami_users"`
+	AMIGroups               []string          `mapstructure:"ami_groups"`
+	AMIProductCodes         []string          `mapstructure:"ami_product_codes"`
+	AMIRegions              []string          `mapstructure:"ami_regions"`
+	AMISkipRegionValidation bool              `mapstructure:"skip_region_validation"`
+	AMITags                 map[string]string `mapstructure:"tags"`
+	AMIEnhancedNetworking   bool              `mapstructure:"enhanced_networking"`
+	AMIForceDeregister      bool              `mapstructure:"force_deregister"`
+	AMIForceDeleteSnapshot  bool              `mapstructure:"force_delete_snapshot"`
+	AMIEncryptBootVolume    bool              `mapstructure:"encrypt_boot"`
+	AMIKmsKeyId             string            `mapstructure:"kms_key_id"`
+	AMIRegionKMSKeyIDs      map[string]string `mapstructure:"region_kms_key_ids"`
+	SnapshotTags            map[string]string `mapstructure:"snapshot_tags"`
+	SnapshotUsers           []string          `mapstructure:"snapshot_users"`
+	SnapshotGroups          []string          `mapstructure:"snapshot_groups"`
 }
 
-func (c *AMIConfig) Prepare(t *packer.ConfigTemplate) []error {
-	if t == nil {
-		var err error
-		t, err = packer.NewConfigTemplate()
-		if err != nil {
-			return []error{err}
+func stringInSlice(s []string, searchstr string) bool {
+	for _, item := range s {
+		if item == searchstr {
+			return true
 		}
 	}
+	return false
+}
 
-	templates := map[string]*string{
-		"ami_name":                &c.AMIName,
-		"ami_description":         &c.AMIDescription,
-		"ami_virtualization_type": &c.AMIVirtType,
-	}
-
-	errs := make([]error, 0)
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = t.Process(*ptr, nil)
-		if err != nil {
-			errs = append(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
-	sliceTemplates := map[string][]string{
-		"ami_users":         c.AMIUsers,
-		"ami_groups":        c.AMIGroups,
-		"ami_product_codes": c.AMIProductCodes,
-		"ami_regions":       c.AMIRegions,
-	}
-
-	for n, slice := range sliceTemplates {
-		for i, elem := range slice {
-			var err error
-			slice[i], err = t.Process(elem, nil)
-			if err != nil {
-				errs = append(
-					errs, fmt.Errorf("Error processing %s[%d]: %s", n, i, err))
-			}
-		}
-	}
-
+func (c *AMIConfig) Prepare(ctx *interpolate.Context) []error {
+	var errs []error
 	if c.AMIName == "" {
 		errs = append(errs, fmt.Errorf("ami_name must be specified"))
 	}
@@ -80,10 +56,20 @@ func (c *AMIConfig) Prepare(t *packer.ConfigTemplate) []error {
 			// Mark that we saw the region
 			regionSet[region] = struct{}{}
 
-			// Verify the region is real
-			if _, ok := aws.Regions[region]; !ok {
-				errs = append(errs, fmt.Errorf("Unknown region: %s", region))
-				continue
+			if !c.AMISkipRegionValidation {
+				// Verify the region is real
+				if valid := ValidateRegion(region); !valid {
+					errs = append(errs, fmt.Errorf("Unknown region: %s", region))
+					continue
+				}
+			}
+
+			// Make sure that if we have region_kms_key_ids defined,
+			// the regions in ami_regions are also in region_kms_key_ids
+			if len(c.AMIRegionKMSKeyIDs) > 0 {
+				if _, ok := c.AMIRegionKMSKeyIDs[region]; !ok {
+					errs = append(errs, fmt.Errorf("Region %s is in ami_regions but not in region_kms_key_ids", region))
+				}
 			}
 
 			regions = append(regions, region)
@@ -91,27 +77,44 @@ func (c *AMIConfig) Prepare(t *packer.ConfigTemplate) []error {
 
 		c.AMIRegions = regions
 	}
-
-	newTags := make(map[string]string)
-	for k, v := range c.AMITags {
-		k, err := t.Process(k, nil)
-		if err != nil {
-			errs = append(errs,
-				fmt.Errorf("Error processing tag key %s: %s", k, err))
-			continue
+	// Make sure that if we have region_kms_key_ids defined,
+	//  the regions in region_kms_key_ids are also in ami_regions
+	if len(c.AMIRegionKMSKeyIDs) > 0 {
+		for kmsKeyRegion := range c.AMIRegionKMSKeyIDs {
+			if !stringInSlice(c.AMIRegions, kmsKeyRegion) {
+				errs = append(errs, fmt.Errorf("Region %s is in region_kms_key_ids but not in ami_regions", kmsKeyRegion))
+			}
 		}
-
-		v, err := t.Process(v, nil)
-		if err != nil {
-			errs = append(errs,
-				fmt.Errorf("Error processing tag value '%s': %s", v, err))
-			continue
-		}
-
-		newTags[k] = v
 	}
 
-	c.AMITags = newTags
+	if len(c.AMIUsers) > 0 && c.AMIEncryptBootVolume {
+		errs = append(errs, fmt.Errorf("Cannot share AMI with encrypted boot volume"))
+	}
+
+	if len(c.SnapshotUsers) > 0 {
+		if len(c.AMIKmsKeyId) == 0 && c.AMIEncryptBootVolume {
+			errs = append(errs, fmt.Errorf("Cannot share snapshot encrypted with default KMS key"))
+		}
+		if len(c.AMIRegionKMSKeyIDs) > 0 {
+			for _, kmsKey := range c.AMIRegionKMSKeyIDs {
+				if len(kmsKey) == 0 {
+					errs = append(errs, fmt.Errorf("Cannot share snapshot encrypted with default KMS key"))
+				}
+			}
+		}
+	}
+
+	if len(c.AMIName) < 3 || len(c.AMIName) > 128 {
+		errs = append(errs, fmt.Errorf("ami_name must be between 3 and 128 characters long"))
+	}
+
+	if c.AMIName != templateCleanAMIName(c.AMIName) {
+		errs = append(errs, fmt.Errorf("AMIName should only contain "+
+			"alphanumeric characters, parentheses (()), square brackets ([]), spaces "+
+			"( ), periods (.), slashes (/), dashes (-), single quotes ('), at-signs "+
+			"(@), or underscores(_). You can use the `clean_ami_name` template "+
+			"filter to automatically clean your ami name."))
+	}
 
 	if len(errs) > 0 {
 		return errs

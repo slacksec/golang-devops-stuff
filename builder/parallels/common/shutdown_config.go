@@ -2,10 +2,12 @@ package common
 
 import (
 	"fmt"
-	"github.com/mitchellh/packer/packer"
 	"time"
+
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
+// ShutdownConfig contains the configuration for VM shutdown.
 type ShutdownConfig struct {
 	ShutdownCommand    string `mapstructure:"shutdown_command"`
 	RawShutdownTimeout string `mapstructure:"shutdown_timeout"`
@@ -13,25 +15,13 @@ type ShutdownConfig struct {
 	ShutdownTimeout time.Duration ``
 }
 
-func (c *ShutdownConfig) Prepare(t *packer.ConfigTemplate) []error {
+// Prepare sets default values to the VM shutdown configuration.
+func (c *ShutdownConfig) Prepare(ctx *interpolate.Context) []error {
 	if c.RawShutdownTimeout == "" {
 		c.RawShutdownTimeout = "5m"
 	}
 
-	templates := map[string]*string{
-		"shutdown_command": &c.ShutdownCommand,
-		"shutdown_timeout": &c.RawShutdownTimeout,
-	}
-
-	errs := make([]error, 0)
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = t.Process(*ptr, nil)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
+	var errs []error
 	var err error
 	c.ShutdownTimeout, err = time.ParseDuration(c.RawShutdownTimeout)
 	if err != nil {

@@ -1,93 +1,101 @@
-require "net/http"
+set :base_url, "https://www.packer.io/"
 
-raise "PACKER_VERSION must be set." if !ENV["PACKER_VERSION"]
-
-#-------------------------------------------------------------------------
-# Download the list of Packer downloads
-#-------------------------------------------------------------------------
-
-$packer_files = {}
-$packer_os = []
-
-if !ENV["PACKER_DISABLE_DOWNLOAD_FETCH"]
-  raise "BINTRAY_API_KEY must be set." if !ENV["BINTRAY_API_KEY"]
-  http = Net::HTTP.new("dl.bintray.com", 80)
-  req = Net::HTTP::Get.new("/mitchellh/packer/")
-  req.basic_auth "mitchellh", ENV["BINTRAY_API_KEY"]
-  response = http.request(req)
-
-  response.body.split("\n").each do |line|
-    next if line !~ /\/mitchellh\/packer\/(#{Regexp.quote(ENV["PACKER_VERSION"])}.+?)'/
-    filename = $1.to_s
-    os = filename.split("_")[1]
-    next if os == "SHA256SUMS"
-
-    $packer_files[os] ||= []
-    $packer_files[os] << filename
-  end
-
-  $packer_os = ["darwin", "linux", "windows"] & $packer_files.keys
-  $packer_os += $packer_files.keys
-  $packer_os.uniq!
-
-  $packer_files.each do |key, value|
-    value.sort!
-  end
+activate :hashicorp do |h|
+  h.name         = "packer"
+  h.version      = "1.0.4"
+  h.github_slug  = "hashicorp/packer"
+  h.website_root = "website"
 end
 
-#-------------------------------------------------------------------------
-# Configure Middleman
-#-------------------------------------------------------------------------
-
-set :css_dir, 'stylesheets'
-set :js_dir, 'javascripts'
-set :images_dir, 'images'
-
-# Use the RedCarpet Markdown engine
-set :markdown_engine, :redcarpet
-set :markdown,
-    :fenced_code_blocks => true,
-    :with_toc_data => true
-
-# Build-specific configuration
-configure :build do
-  activate :asset_hash
-  activate :minify_css
-  activate :minify_html
-  activate :minify_javascript
-end
-
-#-------------------------------------------------------------------------
-# Helpers
-#-------------------------------------------------------------------------
 helpers do
-  def download_arch(file)
-    parts = file.split("_")
-    return "" if parts.length != 3
-    parts[2].split(".")[0]
+  # Returns the FQDN of the image URL.
+  #
+  # @param [String] path
+  #
+  # @return [String]
+  def image_url(path)
+    File.join(base_url, image_path(path))
   end
 
-  def download_os_human(os)
-    if os == "darwin"
-      return "Mac OS X"
-    elsif os == "freebsd"
-      return "FreeBSD"
-    elsif os == "openbsd"
-      return "OpenBSD"
-    elsif os == "Linux"
-      return "Linux"
-    elsif os == "windows"
-      return "Windows"
+  # Get the title for the page.
+  #
+  # @param [Middleman::Page] page
+  #
+  # @return [String]
+  def title_for(page)
+    if page && page.data.page_title
+      return "#{page.data.page_title} - Packer by HashiCorp"
+    end
+
+     "Packer by HashiCorp"
+   end
+
+  # Get the description for the page
+  #
+  # @param [Middleman::Page] page
+  #
+  # @return [String]
+  def description_for(page)
+    description = (page.data.description || "")
+      .gsub('"', '')
+      .gsub(/\n+/, ' ')
+      .squeeze(' ')
+
+    return escape_html(description)
+  end
+
+  # This helps by setting the "active" class for sidebar nav elements
+  # if the YAML frontmatter matches the expected value.
+  def sidebar_current(expected)
+    current = current_page.data.sidebar_current || ""
+    if current.start_with?(expected)
+      return " class=\"active\""
     else
-      return os
+      return ""
     end
   end
 
-  def download_url(file)
-    "https://dl.bintray.com/mitchellh/packer/#{file}"
+  # Returns the id for this page.
+  # @return [String]
+  def body_id_for(page)
+    if !(name = page.data.sidebar_current).blank?
+      return "page-#{name.strip}"
+    end
+    if page.url == "/" || page.url == "/index.html"
+      return "page-home"
+    end
+    if !(title = page.data.page_title).blank?
+      return title
+        .downcase
+        .gsub('"', '')
+        .gsub(/[^\w]+/, '-')
+        .gsub(/_+/, '-')
+        .squeeze('-')
+        .squeeze(' ')
+    end
+    return ""
   end
 
-  def latest_version
-    ENV["PACKER_VERSION"]
+  # Returns the list of classes for this page.
+  # @return [String]
+  def body_classes_for(page)
+    classes = []
+
+    if !(layout = page.data.layout).blank?
+      classes << "layout-#{page.data.layout}"
+    end
+
+    if !(title = page.data.page_title).blank?
+      title = title
+        .downcase
+        .gsub('"', '')
+        .gsub(/[^\w]+/, '-')
+        .gsub(/_+/, '-')
+        .squeeze('-')
+        .squeeze(' ')
+      classes << "page-#{title}"
+    end
+
+    return classes.join(" ")
   end
 end

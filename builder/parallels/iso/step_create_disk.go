@@ -2,10 +2,11 @@ package iso
 
 import (
 	"fmt"
-	"github.com/mitchellh/multistep"
-	parallelscommon "github.com/mitchellh/packer/builder/parallels/common"
-	"github.com/mitchellh/packer/packer"
 	"strconv"
+
+	parallelscommon "github.com/hashicorp/packer/builder/parallels/common"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
 // This step creates the virtual disk that will be used as the
@@ -13,14 +14,15 @@ import (
 type stepCreateDisk struct{}
 
 func (s *stepCreateDisk) Run(state multistep.StateBag) multistep.StepAction {
-	config := state.Get("config").(*config)
+	config := state.Get("config").(*Config)
 	driver := state.Get("driver").(parallelscommon.Driver)
 	ui := state.Get("ui").(packer.Ui)
 	vmName := state.Get("vmName").(string)
 
 	command := []string{
 		"set", vmName,
-		"--device-set", "hdd0",
+		"--device-add", "hdd",
+		"--type", config.DiskType,
 		"--size", strconv.FormatUint(uint64(config.DiskSize), 10),
 		"--iface", config.HardDriveInterface,
 	}

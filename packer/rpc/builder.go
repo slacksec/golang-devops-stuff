@@ -1,7 +1,7 @@
 package rpc
 
 import (
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 	"log"
 	"net/rpc"
 )
@@ -10,14 +10,14 @@ import (
 // over an RPC connection.
 type builder struct {
 	client *rpc.Client
-	mux    *MuxConn
+	mux    *muxBroker
 }
 
 // BuilderServer wraps a packer.Builder implementation and makes it exportable
 // as part of a Golang RPC server.
 type BuilderServer struct {
 	builder packer.Builder
-	mux     *MuxConn
+	mux     *muxBroker
 }
 
 type BuilderPrepareArgs struct {

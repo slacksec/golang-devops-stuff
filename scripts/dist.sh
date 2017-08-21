@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 # Get the parent directory of where this script is.
@@ -9,59 +9,46 @@ DIR="$( cd -P "$( dirname "$SOURCE" )/.." && pwd )"
 # Change into that dir because we expect that
 cd $DIR
 
-# Determine the version that we're building based on the contents
-# of packer/version.go.
-VERSION=$(grep "const Version " packer/version.go | sed -E 's/.*"(.+)"$/\1/')
-VERSIONDIR="${VERSION}"
-PREVERSION=$(grep "const VersionPrerelease " packer/version.go | sed -E 's/.*"(.*)"$/\1/')
-if [ ! -z $PREVERSION ]; then
-    PREVERSION="${PREVERSION}.$(date -u +%s)"
-    VERSIONDIR="${VERSIONDIR}-${PREVERSION}"
+# Get the version from the command line
+VERSION=$1
+if [ -z $VERSION ]; then
+    echo "Please specify version"
+    exit 1
 fi
 
-# This function waits for all background tasks to complete
-waitAll() {
-    RESULT=0
-    for job in `jobs -p`; do
-        wait $job
-        if [ $? -ne 0 ]; then
-            RESULT=1
-        fi
-    done
+# Tag, unless told not to
+if [ -z $NOTAG ]; then
+  echo "==> Tagging..."
+  git commit --allow-empty -a --gpg-sign=348FFC4C -m "Cut version $VERSION"
+  git tag -a -m "Version $VERSION" -s -u 348FFC4C "v${VERSION}" $RELBRANCH
+fi
 
-    if [ $RESULT -ne 0 ]; then
-        exit $RESULT
-    fi
-}
-
-# Compile the main project
-./scripts/compile.sh
-
-# Make sure that if we're killed, we kill all our subprocseses
-trap "kill 0" SIGINT SIGTERM EXIT
-
-# Zip all the packages
+# Zip all the files
+rm -rf ./pkg/dist
 mkdir -p ./pkg/dist
 for PLATFORM in $(find ./pkg -mindepth 1 -maxdepth 1 -type d); do
-    PLATFORM_NAME=$(basename ${PLATFORM})
-    ARCHIVE_NAME="${VERSIONDIR}_${PLATFORM_NAME}"
+  OSARCH=$(basename ${PLATFORM})
 
-    if [ $PLATFORM_NAME = "dist" ]; then
-        continue
-    fi
+  if [ $OSARCH = "dist" ]; then
+    continue
+  fi
 
-    (
-    pushd ${PLATFORM}
-    zip ${DIR}/pkg/dist/${ARCHIVE_NAME}.zip ./*
-    popd
-    ) &
+  echo "--> ${OSARCH}"
+  pushd $PLATFORM >/dev/null 2>&1
+  zip ../dist/packer_${VERSION}_${OSARCH}.zip ./*
+  popd >/dev/null 2>&1
 done
 
-waitAll
+if [ -z $NOSIGN ]; then
+  echo "==> Signing..."
+  pushd ./pkg/dist
+  rm -f ./packer_${VERSION}_SHA256SUMS*
+  shasum -a256 * > ./packer_${VERSION}_SHA256SUMS
+  gpg --default-key 348FFC4C --detach-sig ./packer_${VERSION}_SHA256SUMS
+  popd
+fi
 
-# Make the checksums
-pushd ./pkg/dist
-shasum -a256 * > ./${VERSIONDIR}_SHA256SUMS
-popd
+hc-releases upload $DIR/pkg/dist/
+hc-releases publish
 
 exit 0

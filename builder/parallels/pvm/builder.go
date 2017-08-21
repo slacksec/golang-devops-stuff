@@ -3,11 +3,13 @@ package pvm
 import (
 	"errors"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	parallelscommon "github.com/mitchellh/packer/builder/parallels/common"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
 	"log"
+
+	parallelscommon "github.com/hashicorp/packer/builder/parallels/common"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
 // Builder implements packer.Builder and builds the actual Parallels
@@ -34,12 +36,13 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	// Create the driver that we'll use to communicate with Parallels
 	driver, err := parallelscommon.NewDriver()
 	if err != nil {
-		return nil, fmt.Errorf("Failed creating Paralles driver: %s", err)
+		return nil, fmt.Errorf("Failed creating Parallels driver: %s", err)
 	}
 
 	// Set up the state.
 	state := new(multistep.BasicStateBag)
 	state.Put("config", b.config)
+	state.Put("debug", b.config.PackerDebug)
 	state.Put("driver", driver)
 	state.Put("hook", hook)
 	state.Put("ui", ui)
@@ -47,67 +50,66 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 
 	// Build the steps.
 	steps := []multistep.Step{
+		&parallelscommon.StepPrepareParallelsTools{
+			ParallelsToolsMode:   b.config.ParallelsToolsMode,
+			ParallelsToolsFlavor: b.config.ParallelsToolsFlavor,
+		},
 		&parallelscommon.StepOutputDir{
 			Force: b.config.PackerForce,
 			Path:  b.config.OutputDir,
 		},
 		&common.StepCreateFloppy{
-			Files: b.config.FloppyFiles,
+			Files:       b.config.FloppyConfig.FloppyFiles,
+			Directories: b.config.FloppyConfig.FloppyDirectories,
 		},
 		&StepImport{
 			Name:       b.config.VMName,
 			SourcePath: b.config.SourcePath,
 		},
 		&parallelscommon.StepAttachParallelsTools{
-			ParallelsToolsHostPath: b.config.ParallelsToolsHostPath,
-			ParallelsToolsMode:     b.config.ParallelsToolsMode,
+			ParallelsToolsMode: b.config.ParallelsToolsMode,
 		},
 		new(parallelscommon.StepAttachFloppy),
 		&parallelscommon.StepPrlctl{
 			Commands: b.config.Prlctl,
-			Tpl:      b.config.tpl,
+			Ctx:      b.config.ctx,
 		},
 		&parallelscommon.StepRun{
 			BootWait: b.config.BootWait,
-			Headless: b.config.Headless,
 		},
 		&parallelscommon.StepTypeBootCommand{
 			BootCommand:    b.config.BootCommand,
 			HostInterfaces: []string{},
 			VMName:         b.config.VMName,
-			Tpl:            b.config.tpl,
+			Ctx:            b.config.ctx,
 		},
-		&common.StepConnectSSH{
-			SSHAddress:     parallelscommon.SSHAddress,
-			SSHConfig:      parallelscommon.SSHConfigFunc(b.config.SSHConfig),
-			SSHWaitTimeout: b.config.SSHWaitTimeout,
+		&communicator.StepConnect{
+			Config:    &b.config.SSHConfig.Comm,
+			Host:      parallelscommon.CommHost,
+			SSHConfig: parallelscommon.SSHConfigFunc(b.config.SSHConfig),
 		},
 		&parallelscommon.StepUploadVersion{
 			Path: b.config.PrlctlVersionFile,
 		},
 		&parallelscommon.StepUploadParallelsTools{
+			ParallelsToolsFlavor:    b.config.ParallelsToolsFlavor,
 			ParallelsToolsGuestPath: b.config.ParallelsToolsGuestPath,
-			ParallelsToolsHostPath:  b.config.ParallelsToolsHostPath,
 			ParallelsToolsMode:      b.config.ParallelsToolsMode,
-			Tpl:                     b.config.tpl,
+			Ctx:                     b.config.ctx,
 		},
 		new(common.StepProvision),
 		&parallelscommon.StepShutdown{
 			Command: b.config.ShutdownCommand,
 			Timeout: b.config.ShutdownTimeout,
 		},
-		new(parallelscommon.StepRemoveDevices),
+		&parallelscommon.StepPrlctl{
+			Commands: b.config.PrlctlPost,
+			Ctx:      b.config.ctx,
+		},
 	}
 
 	// Run the steps.
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
+	b.runner = common.NewRunnerWithPauseFn(steps, b.config.PackerConfig, ui, state)
 	b.runner.Run(state)
 
 	// Report any errors.

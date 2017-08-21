@@ -1,13 +1,18 @@
 package docker
 
 import (
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
 	"log"
+
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
-const BuilderId = "packer.docker"
+const (
+	BuilderId       = "packer.docker"
+	BuilderIdImport = "packer.post-processor.docker-import"
+)
 
 type Builder struct {
 	config *Config
@@ -25,17 +30,42 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 }
 
 func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
-	driver := &DockerDriver{Tpl: b.config.tpl, Ui: ui}
+	driver := &DockerDriver{Ctx: &b.config.ctx, Ui: ui}
 	if err := driver.Verify(); err != nil {
 		return nil, err
 	}
+
+	version, err := driver.Version()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[DEBUG] Docker version: %s", version.String())
 
 	steps := []multistep.Step{
 		&StepTempDir{},
 		&StepPull{},
 		&StepRun{},
-		&StepProvision{},
-		&StepExport{},
+		&communicator.StepConnect{
+			Config:    &b.config.Comm,
+			Host:      commHost,
+			SSHConfig: sshConfig(&b.config.Comm),
+			CustomConnect: map[string]multistep.Step{
+				"docker": &StepConnectDocker{},
+			},
+		},
+		&common.StepProvision{},
+	}
+
+	if b.config.Discard {
+		log.Print("[DEBUG] Container will be discarded")
+	} else if b.config.Commit {
+		log.Print("[DEBUG] Container will be committed")
+		steps = append(steps, new(StepCommit))
+	} else if b.config.ExportPath != "" {
+		log.Printf("[DEBUG] Container will be exported to %s", b.config.ExportPath)
+		steps = append(steps, new(StepExport))
+	} else {
+		return nil, errArtifactNotUsed
 	}
 
 	// Setup the state bag and initial state for the steps
@@ -48,15 +78,7 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	state.Put("driver", driver)
 
 	// Run!
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
+	b.runner = common.NewRunner(steps, b.config.PackerConfig, ui)
 	b.runner.Run(state)
 
 	// If there was an error, return that
@@ -64,8 +86,23 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		return nil, rawErr.(error)
 	}
 
+	// If it was cancelled, then just return
+	if _, ok := state.GetOk(multistep.StateCancelled); ok {
+		return nil, nil
+	}
+
 	// No errors, must've worked
-	artifact := &ExportArtifact{path: b.config.ExportPath}
+	var artifact packer.Artifact
+	if b.config.Commit {
+		artifact = &ImportArtifact{
+			IdValue:        state.Get("image_id").(string),
+			BuilderIdValue: BuilderIdImport,
+			Driver:         driver,
+		}
+	} else {
+		artifact = &ExportArtifact{path: b.config.ExportPath}
+	}
+
 	return artifact, nil
 }
 

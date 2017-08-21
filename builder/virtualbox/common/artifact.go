@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 // This is the common builder ID to all of these artifacts.
@@ -23,6 +23,9 @@ type artifact struct {
 func NewArtifact(dir string) (packer.Artifact, error) {
 	files := make([]string, 0, 5)
 	visit := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() {
 			files = append(files, path)
 		}
@@ -54,6 +57,10 @@ func (*artifact) Id() string {
 
 func (a *artifact) String() string {
 	return fmt.Sprintf("VM files in directory: %s", a.dir)
+}
+
+func (a *artifact) State(name string) interface{} {
+	return nil
 }
 
 func (a *artifact) Destroy() error {

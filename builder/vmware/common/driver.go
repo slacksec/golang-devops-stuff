@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,9 +29,9 @@ type Driver interface {
 	// Checks if the VMX file at the given path is running.
 	IsRunning(string) (bool, error)
 
-	// SSHAddress returns the SSH address for the VM that is being
+	// CommHost returns the host address for the VM that is being
 	// managed by this driver.
-	SSHAddress(multistep.StateBag) (string, error)
+	CommHost(multistep.StateBag) (string, error)
 
 	// Start starts a VM specified by the path to the VMX given.
 	Start(string, bool) error
@@ -78,19 +79,7 @@ func NewDriver(dconfig *DriverConfig, config *SSHConfig) (Driver, error) {
 			},
 		}
 	case "linux":
-		drivers = []Driver{
-			&Workstation10Driver{
-				Workstation9Driver: Workstation9Driver{
-					SSHConfig: config,
-				},
-			},
-			&Workstation9Driver{
-				SSHConfig: config,
-			},
-			&Player5LinuxDriver{
-				SSHConfig: config,
-			},
-		}
+		fallthrough
 	case "windows":
 		drivers = []Driver{
 			&Workstation10Driver{
@@ -99,6 +88,14 @@ func NewDriver(dconfig *DriverConfig, config *SSHConfig) (Driver, error) {
 				},
 			},
 			&Workstation9Driver{
+				SSHConfig: config,
+			},
+			&Player6Driver{
+				Player5Driver: Player5Driver{
+					SSHConfig: config,
+				},
+			},
+			&Player5Driver{
 				SSHConfig: config,
 			},
 		}
@@ -133,7 +130,24 @@ func runAndLog(cmd *exec.Cmd) (string, string, error) {
 	stderrString := strings.TrimSpace(stderr.String())
 
 	if _, ok := err.(*exec.ExitError); ok {
-		err = fmt.Errorf("VMware error: %s", stderrString)
+		message := stderrString
+		if message == "" {
+			message = stdoutString
+		}
+
+		err = fmt.Errorf("VMware error: %s", message)
+
+		// If "unknown error" is in there, add some additional notes
+		re := regexp.MustCompile(`(?i)unknown error`)
+		if re.MatchString(message) {
+			err = fmt.Errorf(
+				"%s\n\n%s", err,
+				"Packer detected a VMware 'Unknown Error'. Unfortunately VMware\n"+
+					"often has extremely vague error messages such as this and Packer\n"+
+					"itself can't do much about that. Please check the vmware.log files\n"+
+					"created by VMware when a VM is started (in the directory of the\n"+
+					"vmx file), which often contains more detailed error information.")
+		}
 	}
 
 	log.Printf("stdout: %s", stdoutString)
@@ -151,13 +165,13 @@ func normalizeVersion(version string) (string, error) {
 	i, err := strconv.Atoi(version)
 	if err != nil {
 		return "", fmt.Errorf(
-			"VMWare version '%s' is not numeric", version)
+			"VMware version '%s' is not numeric", version)
 	}
 
 	return fmt.Sprintf("%02d", i), nil
 }
 
-func compareVersions(versionFound string, versionWanted string) error {
+func compareVersions(versionFound string, versionWanted string, product string) error {
 	found, err := normalizeVersion(versionFound)
 	if err != nil {
 		return err
@@ -170,7 +184,7 @@ func compareVersions(versionFound string, versionWanted string) error {
 
 	if found < wanted {
 		return fmt.Errorf(
-			"VMWare WS version %s, or greater, is required. Found version: %s", versionWanted, versionFound)
+			"VMware %s version %s, or greater, is required. Found version: %s", product, versionWanted, versionFound)
 	}
 
 	return nil

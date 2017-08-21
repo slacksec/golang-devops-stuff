@@ -3,14 +3,23 @@ package vagrant
 import (
 	"archive/tar"
 	"compress/flate"
-	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"github.com/mitchellh/packer/packer"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+
+	"github.com/hashicorp/packer/packer"
+	"github.com/klauspost/pgzip"
+)
+
+var (
+	// ErrInvalidCompressionLevel is returned when the compression level passed
+	// to gzip is not in the expected range. See compress/flate for details.
+	ErrInvalidCompressionLevel = fmt.Errorf(
+		"Invalid compression level. Expected an integer from -1 to 9.")
 )
 
 // Copies a file by copying the contents of the file to another place.
@@ -60,10 +69,10 @@ func DirToBox(dst, dir string, ui packer.Ui, level int) error {
 	}
 	defer dstF.Close()
 
-	var dstWriter io.Writer = dstF
+	var dstWriter io.WriteCloser = dstF
 	if level != flate.NoCompression {
 		log.Printf("Compressing with gzip compression level: %d", level)
-		gzipWriter, err := gzip.NewWriterLevel(dstWriter, level)
+		gzipWriter, err := makePgzipWriter(dstWriter, level)
 		if err != nil {
 			return err
 		}
@@ -130,12 +139,25 @@ func DirToBox(dst, dir string, ui packer.Ui, level int) error {
 
 // WriteMetadata writes the "metadata.json" file for a Vagrant box.
 func WriteMetadata(dir string, contents interface{}) error {
-	f, err := os.Create(filepath.Join(dir, "metadata.json"))
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	if _, err := os.Stat(filepath.Join(dir, "metadata.json")); os.IsNotExist(err) {
+		f, err := os.Create(filepath.Join(dir, "metadata.json"))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
 
-	enc := json.NewEncoder(f)
-	return enc.Encode(contents)
+		enc := json.NewEncoder(f)
+		return enc.Encode(contents)
+	}
+
+	return nil
+}
+
+func makePgzipWriter(output io.WriteCloser, compressionLevel int) (io.WriteCloser, error) {
+	gzipWriter, err := pgzip.NewWriterLevel(output, compressionLevel)
+	if err != nil {
+		return nil, ErrInvalidCompressionLevel
+	}
+	gzipWriter.SetConcurrency(500000, runtime.GOMAXPROCS(-1))
+	return gzipWriter, nil
 }

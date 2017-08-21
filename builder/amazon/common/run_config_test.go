@@ -3,7 +3,10 @@ package common
 import (
 	"io/ioutil"
 	"os"
+	"regexp"
 	"testing"
+
+	"github.com/hashicorp/packer/helper/communicator"
 )
 
 func init() {
@@ -19,8 +22,18 @@ func testConfig() *RunConfig {
 	return &RunConfig{
 		SourceAmi:    "abcd",
 		InstanceType: "m1.small",
-		SSHUsername:  "root",
+
+		Comm: communicator.Config{
+			SSHUsername: "foo",
+		},
 	}
+}
+
+func testConfigFilter() *RunConfig {
+	config := testConfig()
+	config.SourceAmi = ""
+	config.SourceAmiFilter = AmiFilterOptions{}
+	return config
 }
 
 func TestRunConfigPrepare(t *testing.T) {
@@ -47,45 +60,56 @@ func TestRunConfigPrepare_SourceAmi(t *testing.T) {
 	}
 }
 
+func TestRunConfigPrepare_SourceAmiFilterBlank(t *testing.T) {
+	c := testConfigFilter()
+	if err := c.Prepare(nil); len(err) != 1 {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestRunConfigPrepare_SourceAmiFilterGood(t *testing.T) {
+	c := testConfigFilter()
+	owner := "123"
+	filter_key := "name"
+	filter_value := "foo"
+	goodFilter := AmiFilterOptions{Owners: []*string{&owner}, Filters: map[*string]*string{&filter_key: &filter_value}}
+	c.SourceAmiFilter = goodFilter
+	if err := c.Prepare(nil); len(err) != 0 {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestRunConfigPrepare_SpotAuto(t *testing.T) {
+	c := testConfig()
+	c.SpotPrice = "auto"
+	if err := c.Prepare(nil); len(err) != 1 {
+		t.Fatalf("err: %s", err)
+	}
+
+	c.SpotPriceAutoProduct = "foo"
+	if err := c.Prepare(nil); len(err) != 0 {
+		t.Fatalf("err: %s", err)
+	}
+}
+
 func TestRunConfigPrepare_SSHPort(t *testing.T) {
 	c := testConfig()
-	c.SSHPort = 0
+	c.Comm.SSHPort = 0
 	if err := c.Prepare(nil); len(err) != 0 {
 		t.Fatalf("err: %s", err)
 	}
 
-	if c.SSHPort != 22 {
-		t.Fatalf("invalid value: %d", c.SSHPort)
+	if c.Comm.SSHPort != 22 {
+		t.Fatalf("invalid value: %d", c.Comm.SSHPort)
 	}
 
-	c.SSHPort = 44
+	c.Comm.SSHPort = 44
 	if err := c.Prepare(nil); len(err) != 0 {
 		t.Fatalf("err: %s", err)
 	}
 
-	if c.SSHPort != 44 {
-		t.Fatalf("invalid value: %d", c.SSHPort)
-	}
-}
-
-func TestRunConfigPrepare_SSHTimeout(t *testing.T) {
-	c := testConfig()
-	c.RawSSHTimeout = ""
-	if err := c.Prepare(nil); len(err) != 0 {
-		t.Fatalf("err: %s", err)
-	}
-
-	c.RawSSHTimeout = "bad"
-	if err := c.Prepare(nil); len(err) != 1 {
-		t.Fatalf("err: %s", err)
-	}
-}
-
-func TestRunConfigPrepare_SSHUsername(t *testing.T) {
-	c := testConfig()
-	c.SSHUsername = ""
-	if err := c.Prepare(nil); len(err) != 1 {
-		t.Fatalf("err: %s", err)
+	if c.Comm.SSHPort != 44 {
+		t.Fatalf("invalid value: %d", c.Comm.SSHPort)
 	}
 }
 
@@ -135,6 +159,21 @@ func TestRunConfigPrepare_TemporaryKeyPairName(t *testing.T) {
 	}
 
 	if c.TemporaryKeyPairName == "" {
-		t.Fatal("keypair empty")
+		t.Fatal("keypair name is empty")
+	}
+
+	// Match prefix and UUID, e.g. "packer_5790d491-a0b8-c84c-c9d2-2aea55086550".
+	r := regexp.MustCompile(`\Apacker_(?:(?i)[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}?)\z`)
+	if !r.MatchString(c.TemporaryKeyPairName) {
+		t.Fatal("keypair name is not valid")
+	}
+
+	c.TemporaryKeyPairName = "ssh-key-123"
+	if err := c.Prepare(nil); len(err) != 0 {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c.TemporaryKeyPairName != "ssh-key-123" {
+		t.Fatal("keypair name does not match")
 	}
 }

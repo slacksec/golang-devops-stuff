@@ -3,92 +3,93 @@ package iso
 import (
 	"errors"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	parallelscommon "github.com/mitchellh/packer/builder/parallels/common"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
 	"log"
-	"strings"
+
+	parallelscommon "github.com/hashicorp/packer/builder/parallels/common"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
+	"github.com/mitchellh/multistep"
 )
 
 const BuilderId = "rickard-von-essen.parallels"
 
 type Builder struct {
-	config config
+	config Config
 	runner multistep.Runner
 }
 
-type config struct {
+type Config struct {
 	common.PackerConfig                 `mapstructure:",squash"`
-	parallelscommon.FloppyConfig        `mapstructure:",squash"`
+	common.HTTPConfig                   `mapstructure:",squash"`
+	common.ISOConfig                    `mapstructure:",squash"`
+	common.FloppyConfig                 `mapstructure:",squash"`
 	parallelscommon.OutputConfig        `mapstructure:",squash"`
+	parallelscommon.PrlctlConfig        `mapstructure:",squash"`
+	parallelscommon.PrlctlPostConfig    `mapstructure:",squash"`
+	parallelscommon.PrlctlVersionConfig `mapstructure:",squash"`
 	parallelscommon.RunConfig           `mapstructure:",squash"`
 	parallelscommon.ShutdownConfig      `mapstructure:",squash"`
 	parallelscommon.SSHConfig           `mapstructure:",squash"`
-	parallelscommon.PrlctlConfig        `mapstructure:",squash"`
-	parallelscommon.PrlctlVersionConfig `mapstructure:",squash"`
+	parallelscommon.ToolsConfig         `mapstructure:",squash"`
 
-	BootCommand             []string `mapstructure:"boot_command"`
-	DiskSize                uint     `mapstructure:"disk_size"`
-	ParallelsToolsMode      string   `mapstructure:"parallels_tools_mode"`
-	ParallelsToolsGuestPath string   `mapstructure:"parallels_tools_guest_path"`
-	ParallelsToolsHostPath  string   `mapstructure:"parallels_tools_host_path"`
-	GuestOSType             string   `mapstructure:"guest_os_type"`
-	GuestOSDistribution     string   `mapstructure:"guest_os_distribution"`
-	HardDriveInterface      string   `mapstructure:"hard_drive_interface"`
-	HostInterfaces          []string `mapstructure:"host_interfaces"`
-	HTTPDir                 string   `mapstructure:"http_directory"`
-	HTTPPortMin             uint     `mapstructure:"http_port_min"`
-	HTTPPortMax             uint     `mapstructure:"http_port_max"`
-	ISOChecksum             string   `mapstructure:"iso_checksum"`
-	ISOChecksumType         string   `mapstructure:"iso_checksum_type"`
-	ISOUrls                 []string `mapstructure:"iso_urls"`
-	VMName                  string   `mapstructure:"vm_name"`
+	BootCommand        []string `mapstructure:"boot_command"`
+	DiskSize           uint     `mapstructure:"disk_size"`
+	DiskType           string   `mapstructure:"disk_type"`
+	GuestOSType        string   `mapstructure:"guest_os_type"`
+	HardDriveInterface string   `mapstructure:"hard_drive_interface"`
+	HostInterfaces     []string `mapstructure:"host_interfaces"`
+	SkipCompaction     bool     `mapstructure:"skip_compaction"`
+	VMName             string   `mapstructure:"vm_name"`
 
-	RawSingleISOUrl string `mapstructure:"iso_url"`
-
-	tpl *packer.ConfigTemplate
+	ctx interpolate.Context
 }
 
 func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
-
-	md, err := common.DecodeConfig(&b.config, raws...)
+	err := config.Decode(&b.config, &config.DecodeOpts{
+		Interpolate:        true,
+		InterpolateContext: &b.config.ctx,
+		InterpolateFilter: &interpolate.RenderFilter{
+			Exclude: []string{
+				"boot_command",
+				"prlctl",
+				"prlctl_post",
+				"parallels_tools_guest_path",
+			},
+		},
+	}, raws...)
 	if err != nil {
 		return nil, err
 	}
-
-	b.config.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return nil, err
-	}
-	b.config.tpl.UserVars = b.config.PackerUserVars
 
 	// Accumulate any errors and warnings
-	errs := common.CheckUnusedConfig(md)
-	errs = packer.MultiErrorAppend(errs, b.config.FloppyConfig.Prepare(b.config.tpl)...)
-	errs = packer.MultiErrorAppend(
-		errs, b.config.OutputConfig.Prepare(b.config.tpl, &b.config.PackerConfig)...)
-	errs = packer.MultiErrorAppend(errs, b.config.RunConfig.Prepare(b.config.tpl)...)
-	errs = packer.MultiErrorAppend(errs, b.config.ShutdownConfig.Prepare(b.config.tpl)...)
-	errs = packer.MultiErrorAppend(errs, b.config.SSHConfig.Prepare(b.config.tpl)...)
-	errs = packer.MultiErrorAppend(errs, b.config.PrlctlConfig.Prepare(b.config.tpl)...)
-	errs = packer.MultiErrorAppend(errs, b.config.PrlctlVersionConfig.Prepare(b.config.tpl)...)
+	var errs *packer.MultiError
 	warnings := make([]string, 0)
+
+	isoWarnings, isoErrs := b.config.ISOConfig.Prepare(&b.config.ctx)
+	warnings = append(warnings, isoWarnings...)
+	errs = packer.MultiErrorAppend(errs, isoErrs...)
+
+	errs = packer.MultiErrorAppend(errs, b.config.HTTPConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.FloppyConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(
+		errs, b.config.OutputConfig.Prepare(&b.config.ctx, &b.config.PackerConfig)...)
+	errs = packer.MultiErrorAppend(errs, b.config.RunConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.PrlctlConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.PrlctlPostConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.PrlctlVersionConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.ShutdownConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.SSHConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.ToolsConfig.Prepare(&b.config.ctx)...)
 
 	if b.config.DiskSize == 0 {
 		b.config.DiskSize = 40000
 	}
 
-	if b.config.ParallelsToolsMode == "" {
-		b.config.ParallelsToolsMode = "upload"
-	}
-
-	if b.config.ParallelsToolsGuestPath == "" {
-		b.config.ParallelsToolsGuestPath = "prl-tools.iso"
-	}
-
-	if b.config.ParallelsToolsHostPath == "" {
-		b.config.ParallelsToolsHostPath = "/Applications/Parallels Desktop.app/Contents/Resources/Tools/prl-tools-other.iso"
+	if b.config.DiskType == "" {
+		b.config.DiskType = "expand"
 	}
 
 	if b.config.HardDriveInterface == "" {
@@ -97,18 +98,6 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 
 	if b.config.GuestOSType == "" {
 		b.config.GuestOSType = "other"
-	}
-
-	if b.config.GuestOSDistribution == "" {
-		b.config.GuestOSDistribution = "other"
-	}
-
-	if b.config.HTTPPortMin == 0 {
-		b.config.HTTPPortMin = 8000
-	}
-
-	if b.config.HTTPPortMax == 0 {
-		b.config.HTTPPortMax = 9000
 	}
 
 	if len(b.config.HostInterfaces) == 0 {
@@ -120,55 +109,15 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		b.config.VMName = fmt.Sprintf("packer-%s", b.config.PackerBuildName)
 	}
 
-	// Errors
-	templates := map[string]*string{
-		"parallels_tools_mode":       &b.config.ParallelsToolsMode,
-		"parallels_tools_host_path":  &b.config.ParallelsToolsHostPath,
-		"parallels_tools_guest_path": &b.config.ParallelsToolsGuestPath,
-		"guest_os_type":              &b.config.GuestOSType,
-		"guest_os_distribution":      &b.config.GuestOSDistribution,
-		"hard_drive_interface":       &b.config.HardDriveInterface,
-		"http_directory":             &b.config.HTTPDir,
-		"iso_checksum":               &b.config.ISOChecksum,
-		"iso_checksum_type":          &b.config.ISOChecksumType,
-		"iso_url":                    &b.config.RawSingleISOUrl,
-		"vm_name":                    &b.config.VMName,
+	if b.config.DiskType != "expand" && b.config.DiskType != "plain" {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("disk_type can only be expand, or plain"))
 	}
 
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = b.config.tpl.Process(*ptr, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
-	for i, url := range b.config.ISOUrls {
-		var err error
-		b.config.ISOUrls[i], err = b.config.tpl.Process(url, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing iso_urls[%d]: %s", i, err))
-		}
-	}
-
-	validates := map[string]*string{
-		"parallels_tools_guest_path": &b.config.ParallelsToolsGuestPath,
-	}
-
-	for n, ptr := range validates {
-		if err := b.config.tpl.Validate(*ptr); err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error parsing %s: %s", n, err))
-		}
-	}
-
-	for i, command := range b.config.BootCommand {
-		if err := b.config.tpl.Validate(command); err != nil {
-			errs = packer.MultiErrorAppend(errs,
-				fmt.Errorf("Error processing boot_command[%d]: %s", i, err))
-		}
+	if b.config.DiskType == "plain" && !b.config.SkipCompaction {
+		b.config.SkipCompaction = true
+		warnings = append(warnings,
+			"'skip_compaction' is enforced to be true for plain disks.")
 	}
 
 	if b.config.HardDriveInterface != "ide" && b.config.HardDriveInterface != "sata" && b.config.HardDriveInterface != "scsi" {
@@ -176,76 +125,7 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 			errs, errors.New("hard_drive_interface can only be ide, sata, or scsi"))
 	}
 
-	if b.config.HTTPPortMin > b.config.HTTPPortMax {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("http_port_min must be less than http_port_max"))
-	}
-
-	if b.config.ISOChecksumType == "" {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("The iso_checksum_type must be specified."))
-	} else {
-		b.config.ISOChecksumType = strings.ToLower(b.config.ISOChecksumType)
-		if b.config.ISOChecksumType != "none" {
-			if b.config.ISOChecksum == "" {
-				errs = packer.MultiErrorAppend(
-					errs, errors.New("Due to large file sizes, an iso_checksum is required"))
-			} else {
-				b.config.ISOChecksum = strings.ToLower(b.config.ISOChecksum)
-			}
-
-			if h := common.HashForType(b.config.ISOChecksumType); h == nil {
-				errs = packer.MultiErrorAppend(
-					errs,
-					fmt.Errorf("Unsupported checksum type: %s", b.config.ISOChecksumType))
-			}
-		}
-	}
-
-	if b.config.RawSingleISOUrl == "" && len(b.config.ISOUrls) == 0 {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("One of iso_url or iso_urls must be specified."))
-	} else if b.config.RawSingleISOUrl != "" && len(b.config.ISOUrls) > 0 {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("Only one of iso_url or iso_urls may be specified."))
-	} else if b.config.RawSingleISOUrl != "" {
-		b.config.ISOUrls = []string{b.config.RawSingleISOUrl}
-	}
-
-	for i, url := range b.config.ISOUrls {
-		b.config.ISOUrls[i], err = common.DownloadableURL(url)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Failed to parse iso_url %d: %s", i+1, err))
-		}
-	}
-
-	validMode := false
-	validModes := []string{
-		parallelscommon.ParallelsToolsModeDisable,
-		parallelscommon.ParallelsToolsModeAttach,
-		parallelscommon.ParallelsToolsModeUpload,
-	}
-
-	for _, mode := range validModes {
-		if b.config.ParallelsToolsMode == mode {
-			validMode = true
-			break
-		}
-	}
-
-	if !validMode {
-		errs = packer.MultiErrorAppend(errs,
-			fmt.Errorf("parallels_tools_mode is invalid. Must be one of: %v", validModes))
-	}
-
 	// Warnings
-	if b.config.ISOChecksumType == "none" {
-		warnings = append(warnings,
-			"A checksum type of 'none' was specified. Since ISO files are so big,\n"+
-				"a checksum is highly recommended.")
-	}
-
 	if b.config.ShutdownCommand == "" {
 		warnings = append(warnings,
 			"A shutdown_command was not specified. Without a shutdown command, Packer\n"+
@@ -267,11 +147,17 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	}
 
 	steps := []multistep.Step{
+		&parallelscommon.StepPrepareParallelsTools{
+			ParallelsToolsFlavor: b.config.ParallelsToolsFlavor,
+			ParallelsToolsMode:   b.config.ParallelsToolsMode,
+		},
 		&common.StepDownload{
 			Checksum:     b.config.ISOChecksum,
 			ChecksumType: b.config.ISOChecksumType,
 			Description:  "ISO",
+			Extension:    b.config.TargetExtension,
 			ResultKey:    "iso_path",
+			TargetPath:   b.config.TargetPath,
 			Url:          b.config.ISOUrls,
 		},
 		&parallelscommon.StepOutputDir{
@@ -279,71 +165,74 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 			Path:  b.config.OutputDir,
 		},
 		&common.StepCreateFloppy{
-			Files: b.config.FloppyFiles,
+			Files:       b.config.FloppyConfig.FloppyFiles,
+			Directories: b.config.FloppyConfig.FloppyDirectories,
 		},
-		new(stepHTTPServer),
+		&common.StepHTTPServer{
+			HTTPDir:     b.config.HTTPDir,
+			HTTPPortMin: b.config.HTTPPortMin,
+			HTTPPortMax: b.config.HTTPPortMax,
+		},
 		new(stepCreateVM),
 		new(stepCreateDisk),
+		new(stepSetBootOrder),
 		new(stepAttachISO),
 		&parallelscommon.StepAttachParallelsTools{
-			ParallelsToolsHostPath: b.config.ParallelsToolsHostPath,
-			ParallelsToolsMode:     b.config.ParallelsToolsMode,
+			ParallelsToolsMode: b.config.ParallelsToolsMode,
 		},
 		new(parallelscommon.StepAttachFloppy),
 		&parallelscommon.StepPrlctl{
 			Commands: b.config.Prlctl,
-			Tpl:      b.config.tpl,
+			Ctx:      b.config.ctx,
 		},
 		&parallelscommon.StepRun{
 			BootWait: b.config.BootWait,
-			Headless: b.config.Headless, // TODO: migth work on Enterprise Ed.
 		},
 		&parallelscommon.StepTypeBootCommand{
 			BootCommand:    b.config.BootCommand,
 			HostInterfaces: b.config.HostInterfaces,
 			VMName:         b.config.VMName,
-			Tpl:            b.config.tpl,
+			Ctx:            b.config.ctx,
 		},
-		&common.StepConnectSSH{
-			SSHAddress:     parallelscommon.SSHAddress,
-			SSHConfig:      parallelscommon.SSHConfigFunc(b.config.SSHConfig),
-			SSHWaitTimeout: b.config.SSHWaitTimeout,
+		&communicator.StepConnect{
+			Config:    &b.config.SSHConfig.Comm,
+			Host:      parallelscommon.CommHost,
+			SSHConfig: parallelscommon.SSHConfigFunc(b.config.SSHConfig),
 		},
 		&parallelscommon.StepUploadVersion{
 			Path: b.config.PrlctlVersionFile,
 		},
 		&parallelscommon.StepUploadParallelsTools{
+			ParallelsToolsFlavor:    b.config.ParallelsToolsFlavor,
 			ParallelsToolsGuestPath: b.config.ParallelsToolsGuestPath,
-			ParallelsToolsHostPath:  b.config.ParallelsToolsHostPath,
 			ParallelsToolsMode:      b.config.ParallelsToolsMode,
-			Tpl:                     b.config.tpl,
+			Ctx:                     b.config.ctx,
 		},
 		new(common.StepProvision),
 		&parallelscommon.StepShutdown{
 			Command: b.config.ShutdownCommand,
 			Timeout: b.config.ShutdownTimeout,
 		},
-		new(parallelscommon.StepRemoveDevices),
+		&parallelscommon.StepPrlctl{
+			Commands: b.config.PrlctlPost,
+			Ctx:      b.config.ctx,
+		},
+		&parallelscommon.StepCompactDisk{
+			Skip: b.config.SkipCompaction,
+		},
 	}
 
 	// Setup the state bag
 	state := new(multistep.BasicStateBag)
 	state.Put("cache", cache)
 	state.Put("config", &b.config)
+	state.Put("debug", b.config.PackerDebug)
 	state.Put("driver", driver)
 	state.Put("hook", hook)
 	state.Put("ui", ui)
 
 	// Run
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
+	b.runner = common.NewRunnerWithPauseFn(steps, b.config.PackerConfig, ui, state)
 	b.runner.Run(state)
 
 	// If there was an error, return that

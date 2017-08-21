@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 // This step configures a VMX by setting some default settings as well
@@ -18,6 +18,7 @@ import (
 //   vmx_path string
 type StepConfigureVMX struct {
 	CustomData map[string]string
+	SkipFloppy bool
 }
 
 func (s *StepConfigureVMX) Run(state multistep.StateBag) multistep.StepAction {
@@ -43,7 +44,7 @@ func (s *StepConfigureVMX) Run(state multistep.StateBag) multistep.StepAction {
 	// Delete any generated addresses since we want to regenerate
 	// them. Conflicting MAC addresses is a bad time.
 	addrRegex := regexp.MustCompile(`(?i)^ethernet\d+\.generatedAddress`)
-	for k, _ := range vmxData {
+	for k := range vmxData {
 		if addrRegex.MatchString(k) {
 			delete(vmxData, k)
 		}
@@ -56,12 +57,15 @@ func (s *StepConfigureVMX) Run(state multistep.StateBag) multistep.StepAction {
 		vmxData[k] = v
 	}
 
-	// Set a floppy disk if we have one
-	if floppyPathRaw, ok := state.GetOk("floppy_path"); ok {
-		log.Println("Floppy path present, setting in VMX")
-		vmxData["floppy0.present"] = "TRUE"
-		vmxData["floppy0.filetype"] = "file"
-		vmxData["floppy0.filename"] = floppyPathRaw.(string)
+	// Set a floppy disk, but only if we should
+	if !s.SkipFloppy {
+		// Set a floppy disk if we have one
+		if floppyPathRaw, ok := state.GetOk("floppy_path"); ok {
+			log.Println("Floppy path present, setting in VMX")
+			vmxData["floppy0.present"] = "TRUE"
+			vmxData["floppy0.filetype"] = "file"
+			vmxData["floppy0.filename"] = floppyPathRaw.(string)
+		}
 	}
 
 	if err := WriteVMX(vmxPath, vmxData); err != nil {

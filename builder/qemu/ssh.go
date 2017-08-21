@@ -1,30 +1,32 @@
 package qemu
 
 import (
-	gossh "code.google.com/p/go.crypto/ssh"
-	"fmt"
+	commonssh "github.com/hashicorp/packer/common/ssh"
+	"github.com/hashicorp/packer/communicator/ssh"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/communicator/ssh"
-	"io/ioutil"
-	"os"
+	gossh "golang.org/x/crypto/ssh"
 )
 
-func sshAddress(state multistep.StateBag) (string, error) {
+func commHost(state multistep.StateBag) (string, error) {
+	return "127.0.0.1", nil
+}
+
+func commPort(state multistep.StateBag) (int, error) {
 	sshHostPort := state.Get("sshHostPort").(uint)
-	return fmt.Sprintf("127.0.0.1:%d", sshHostPort), nil
+	return int(sshHostPort), nil
 }
 
 func sshConfig(state multistep.StateBag) (*gossh.ClientConfig, error) {
-	config := state.Get("config").(*config)
+	config := state.Get("config").(*Config)
 
 	auth := []gossh.AuthMethod{
-		gossh.Password(config.SSHPassword),
+		gossh.Password(config.Comm.SSHPassword),
 		gossh.KeyboardInteractive(
-			ssh.PasswordKeyboardInteractive(config.SSHPassword)),
+			ssh.PasswordKeyboardInteractive(config.Comm.SSHPassword)),
 	}
 
-	if config.SSHKeyPath != "" {
-		signer, err := sshKeyToSigner(config.SSHKeyPath)
+	if config.Comm.SSHPrivateKey != "" {
+		signer, err := commonssh.FileSigner(config.Comm.SSHPrivateKey)
 		if err != nil {
 			return nil, err
 		}
@@ -33,27 +35,8 @@ func sshConfig(state multistep.StateBag) (*gossh.ClientConfig, error) {
 	}
 
 	return &gossh.ClientConfig{
-		User: config.SSHUser,
-		Auth: auth,
+		User:            config.Comm.SSHUsername,
+		Auth:            auth,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	}, nil
-}
-
-func sshKeyToSigner(path string) (gossh.Signer, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	keyBytes, err := ioutil.ReadAll(f)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := gossh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("Error setting up SSH config: %s", err)
-	}
-
-	return signer, nil
 }

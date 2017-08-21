@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 func testStepShutdownState(t *testing.T) multistep.StateBag {
@@ -127,7 +127,7 @@ func TestStepShutdown_locks(t *testing.T) {
 	lockPath := filepath.Join(dir.dir, "nope.lck")
 	err := ioutil.WriteFile(lockPath, []byte("foo"), 0644)
 	if err != nil {
-		t.Fatalf("err: %s")
+		t.Fatalf("err: %s", err)
 	}
 
 	// Remove the lock file after a certain time

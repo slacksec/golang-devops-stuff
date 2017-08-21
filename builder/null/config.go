@@ -2,81 +2,64 @@ package null
 
 import (
 	"fmt"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
+
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type Config struct {
 	common.PackerConfig `mapstructure:",squash"`
 
-	Host              string `mapstructure:"host"`
-	Port              int    `mapstructure:"port"`
-	SSHUsername       string `mapstructure:"ssh_username"`
-	SSHPassword       string `mapstructure:"ssh_password"`
-	SSHPrivateKeyFile string `mapstructure:"ssh_private_key_file"`
-
-	tpl *packer.ConfigTemplate
+	CommConfig communicator.Config `mapstructure:",squash"`
 }
 
 func NewConfig(raws ...interface{}) (*Config, []string, error) {
-	c := new(Config)
-	md, err := common.DecodeConfig(c, raws...)
+	var c Config
+
+	err := config.Decode(&c, &config.DecodeOpts{
+		Interpolate:       true,
+		InterpolateFilter: &interpolate.RenderFilter{},
+	}, raws...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	c.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return nil, nil, err
+	var errs *packer.MultiError
+	if es := c.CommConfig.Prepare(nil); len(es) > 0 {
+		errs = packer.MultiErrorAppend(errs, es...)
 	}
 
-	c.tpl.UserVars = c.PackerUserVars
-
-	if c.Port == 0 {
-		c.Port = 22
-	}
-
-	errs := common.CheckUnusedConfig(md)
-
-	templates := map[string]*string{
-		"host":                 &c.Host,
-		"ssh_username":         &c.SSHUsername,
-		"ssh_password":         &c.SSHPassword,
-		"ssh_private_key_file": &c.SSHPrivateKeyFile,
-	}
-
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = c.tpl.Process(*ptr, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
+	if c.CommConfig.Type != "none" {
+		if c.CommConfig.Host() == "" {
+			errs = packer.MultiErrorAppend(errs,
+				fmt.Errorf("a Host must be specified, please reference your communicator documentation"))
 		}
-	}
 
-	if c.Host == "" {
-		errs = packer.MultiErrorAppend(errs,
-			fmt.Errorf("host must be specified"))
-	}
+		if c.CommConfig.User() == "" {
+			errs = packer.MultiErrorAppend(errs,
+				fmt.Errorf("a Username must be specified, please reference your communicator documentation"))
+		}
 
-	if c.SSHUsername == "" {
-		errs = packer.MultiErrorAppend(errs,
-			fmt.Errorf("ssh_username must be specified"))
-	}
+		if !c.CommConfig.SSHAgentAuth && c.CommConfig.Password() == "" && c.CommConfig.SSHPrivateKey == "" {
+			errs = packer.MultiErrorAppend(errs,
+				fmt.Errorf("one authentication method must be specified, please reference your communicator documentation"))
+		}
 
-	if c.SSHPassword == "" && c.SSHPrivateKeyFile == "" {
-		errs = packer.MultiErrorAppend(errs,
-			fmt.Errorf("one of ssh_password and ssh_private_key_file must be specified"))
-	}
+		if (c.CommConfig.SSHAgentAuth &&
+			(c.CommConfig.SSHPassword != "" || c.CommConfig.SSHPrivateKey != "")) ||
+			(c.CommConfig.SSHPassword != "" && c.CommConfig.SSHPrivateKey != "") {
+			errs = packer.MultiErrorAppend(errs,
+				fmt.Errorf("only one of ssh_agent_auth, ssh_password, and ssh_private_key_file must be specified"))
 
-	if c.SSHPassword != "" && c.SSHPrivateKeyFile != "" {
-		errs = packer.MultiErrorAppend(errs,
-			fmt.Errorf("only one of ssh_password and ssh_private_key_file must be specified"))
+		}
 	}
 
 	if errs != nil && len(errs.Errors) > 0 {
 		return nil, nil, errs
 	}
 
-	return c, nil, nil
+	return &c, nil, nil
 }

@@ -2,8 +2,8 @@ package docker
 
 import (
 	"fmt"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"log"
 )
 
@@ -20,6 +20,44 @@ func (s *StepPull) Run(state multistep.StateBag) multistep.StepAction {
 	}
 
 	ui.Say(fmt.Sprintf("Pulling Docker image: %s", config.Image))
+
+	if config.EcrLogin {
+		ui.Message("Fetching ECR credentials...")
+
+		username, password, err := config.EcrGetLogin(config.LoginServer)
+		if err != nil {
+			err := fmt.Errorf("Error fetching ECR credentials: %s", err)
+			state.Put("error", err)
+			ui.Error(err.Error())
+			return multistep.ActionHalt
+		}
+
+		config.LoginUsername = username
+		config.LoginPassword = password
+	}
+
+	if config.Login || config.EcrLogin {
+		ui.Message("Logging in...")
+		err := driver.Login(
+			config.LoginServer,
+			config.LoginEmail,
+			config.LoginUsername,
+			config.LoginPassword)
+		if err != nil {
+			err := fmt.Errorf("Error logging in: %s", err)
+			state.Put("error", err)
+			ui.Error(err.Error())
+			return multistep.ActionHalt
+		}
+
+		defer func() {
+			ui.Message("Logging out...")
+			if err := driver.Logout(config.LoginServer); err != nil {
+				ui.Error(fmt.Sprintf("Error logging out: %s", err))
+			}
+		}()
+	}
+
 	if err := driver.Pull(config.Image); err != nil {
 		err := fmt.Errorf("Error pulling Docker image: %s", err)
 		state.Put("error", err)

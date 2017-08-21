@@ -89,7 +89,7 @@ func NewDownloadClient(c *DownloadConfig) *DownloadClient {
 // downloading it.
 type Downloader interface {
 	Cancel()
-	Download(io.Writer, *url.URL) error
+	Download(*os.File, *url.URL) error
 	Progress() uint
 	Total() uint
 }
@@ -101,44 +101,62 @@ func (d *DownloadClient) Cancel() {
 func (d *DownloadClient) Get() (string, error) {
 	// If we already have the file and it matches, then just return the target path.
 	if verify, _ := d.VerifyChecksum(d.config.TargetPath); verify {
-		log.Println("Initial checksum matched, no download needed.")
+		log.Println("[DEBUG] Initial checksum matched, no download needed.")
 		return d.config.TargetPath, nil
 	}
 
-	url, err := url.Parse(d.config.Url)
+	u, err := url.Parse(d.config.Url)
 	if err != nil {
 		return "", err
 	}
 
-	log.Printf("Parsed URL: %#v", url)
+	log.Printf("Parsed URL: %#v", u)
 
 	// Files when we don't copy the file are special cased.
+	var f *os.File
 	var finalPath string
-	if url.Scheme == "file" && !d.config.CopyFile {
-		finalPath = url.Path
+	sourcePath := ""
+	if u.Scheme == "file" && !d.config.CopyFile {
+		// This is special case for relative path in this case user specify
+		// file:../ and after parse destination goes to Opaque
+		if u.Path != "" {
+			// If url.Path is set just use this
+			finalPath = u.Path
+		} else if u.Opaque != "" {
+			// otherwise try url.Opaque
+			finalPath = u.Opaque
+		}
+		// This is a special case where we use a source file that already exists
+		// locally and we don't make a copy. Normally we would copy or download.
+		log.Printf("[DEBUG] Using local file: %s", finalPath)
 
 		// Remove forward slash on absolute Windows file URLs before processing
-		if runtime.GOOS == "windows" && finalPath[0] == '/' {
-			finalPath = finalPath[1:len(finalPath)]
+		if runtime.GOOS == "windows" && len(finalPath) > 0 && finalPath[0] == '/' {
+			finalPath = finalPath[1:]
+		}
+		// Keep track of the source so we can make sure not to delete this later
+		sourcePath = finalPath
+		if _, err = os.Stat(finalPath); err != nil {
+			return "", err
 		}
 	} else {
 		finalPath = d.config.TargetPath
 
 		var ok bool
-		d.downloader, ok = d.config.DownloaderMap[url.Scheme]
+		d.downloader, ok = d.config.DownloaderMap[u.Scheme]
 		if !ok {
-			return "", fmt.Errorf("No downloader for scheme: %s", url.Scheme)
+			return "", fmt.Errorf("No downloader for scheme: %s", u.Scheme)
 		}
 
 		// Otherwise, download using the downloader.
-		f, err := os.Create(finalPath)
+		f, err = os.OpenFile(finalPath, os.O_RDWR|os.O_CREATE, os.FileMode(0666))
 		if err != nil {
 			return "", err
 		}
-		defer f.Close()
 
-		log.Printf("Downloading: %s", url.String())
-		err = d.downloader.Download(f, url)
+		log.Printf("[DEBUG] Downloading: %s", u.String())
+		err = d.downloader.Download(f, u)
+		f.Close()
 		if err != nil {
 			return "", err
 		}
@@ -148,7 +166,14 @@ func (d *DownloadClient) Get() (string, error) {
 		var verify bool
 		verify, err = d.VerifyChecksum(finalPath)
 		if err == nil && !verify {
-			err = fmt.Errorf("checksums didn't match expected: %s", hex.EncodeToString(d.config.Checksum))
+			// Only delete the file if we made a copy or downloaded it
+			if sourcePath != finalPath {
+				os.Remove(finalPath)
+			}
+
+			err = fmt.Errorf(
+				"checksums didn't match expected: %s",
+				hex.EncodeToString(d.config.Checksum))
 		}
 	}
 
@@ -180,7 +205,7 @@ func (d *DownloadClient) VerifyChecksum(path string) (bool, error) {
 	log.Printf("Verifying checksum of %s", path)
 	d.config.Hash.Reset()
 	io.Copy(d.config.Hash, f)
-	return bytes.Compare(d.config.Hash.Sum(nil), d.config.Checksum) == 0, nil
+	return bytes.Equal(d.config.Hash.Sum(nil), d.config.Checksum), nil
 }
 
 // HTTPDownloader is an implementation of Downloader that downloads
@@ -195,9 +220,21 @@ func (*HTTPDownloader) Cancel() {
 	// TODO(mitchellh): Implement
 }
 
-func (d *HTTPDownloader) Download(dst io.Writer, src *url.URL) error {
+func (d *HTTPDownloader) Download(dst *os.File, src *url.URL) error {
 	log.Printf("Starting download: %s", src.String())
-	req, err := http.NewRequest("GET", src.String(), nil)
+
+	// Seek to the beginning by default
+	if _, err := dst.Seek(0, 0); err != nil {
+		return err
+	}
+
+	// Reset our progress
+	d.progress = 0
+
+	// Make the request. We first make a HEAD request so we can check
+	// if the server supports range queries. If the server/URL doesn't
+	// support HEAD requests, we just fall back to GET.
+	req, err := http.NewRequest("HEAD", src.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -213,23 +250,28 @@ func (d *HTTPDownloader) Download(dst io.Writer, src *url.URL) error {
 	}
 
 	resp, err := httpClient.Do(req)
+	if err == nil && (resp.StatusCode >= 200 && resp.StatusCode < 300) {
+		// If the HEAD request succeeded, then attempt to set the range
+		// query if we can.
+		if resp.Header.Get("Accept-Ranges") == "bytes" {
+			if fi, err := dst.Stat(); err == nil {
+				if _, err = dst.Seek(0, os.SEEK_END); err == nil {
+					req.Header.Set("Range", fmt.Sprintf("bytes=%d-", fi.Size()))
+					d.progress = uint(fi.Size())
+				}
+			}
+		}
+	}
+
+	// Set the request to GET now, and redo the query to download
+	req.Method = "GET"
+
+	resp, err = httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 
-	if resp.StatusCode != 200 {
-		log.Printf(
-			"Non-200 status code: %d. Getting error body.", resp.StatusCode)
-
-		errorBody := new(bytes.Buffer)
-		io.Copy(errorBody, resp.Body)
-		return fmt.Errorf("HTTP error '%d'! Remote side responded:\n%s",
-			resp.StatusCode, errorBody.String())
-	}
-
-	d.progress = 0
-	d.total = uint(resp.ContentLength)
-
+	d.total = d.progress + uint(resp.ContentLength)
 	var buffer [4096]byte
 	for {
 		n, err := resp.Body.Read(buffer[:])

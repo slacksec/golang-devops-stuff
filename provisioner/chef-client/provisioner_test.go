@@ -1,11 +1,13 @@
 package chefclient
 
 import (
+	"bytes"
 	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 func testConfig() map[string]interface{} {
@@ -19,6 +21,22 @@ func TestProvisioner_Impl(t *testing.T) {
 	raw = &Provisioner{}
 	if _, ok := raw.(packer.Provisioner); !ok {
 		t.Fatalf("must be a Provisioner")
+	}
+}
+
+func TestProvisionerPrepare_chefEnvironment(t *testing.T) {
+	var p Provisioner
+
+	config := testConfig()
+	config["chef_environment"] = "some-env"
+
+	err := p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if p.config.ChefEnvironment != "some-env" {
+		t.Fatalf("unexpected: %#v", p.config.ChefEnvironment)
 	}
 }
 
@@ -69,6 +87,7 @@ func TestProvisionerPrepare_commands(t *testing.T) {
 	commands := []string{
 		"execute_command",
 		"install_command",
+		"knife_command",
 	}
 
 	for _, command := range commands {
@@ -117,5 +136,110 @@ func TestProvisionerPrepare_serverUrl(t *testing.T) {
 	err = p.Prepare(config)
 	if err != nil {
 		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestProvisionerPrepare_encryptedDataBagSecretPath(t *testing.T) {
+	var err error
+	var p Provisioner
+
+	// Test no config template
+	config := testConfig()
+	delete(config, "encrypted_data_bag_secret_path")
+	err = p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Test with a file
+	tf, err := ioutil.TempFile("", "packer")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer os.Remove(tf.Name())
+
+	config = testConfig()
+	config["encrypted_data_bag_secret_path"] = tf.Name()
+	p = Provisioner{}
+	err = p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Test with a directory
+	td, err := ioutil.TempDir("", "packer")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer os.RemoveAll(td)
+
+	config = testConfig()
+	config["encrypted_data_bag_secret_path"] = td
+	p = Provisioner{}
+	err = p.Prepare(config)
+	if err == nil {
+		t.Fatal("should have err")
+	}
+}
+
+func TestProvisioner_createDir(t *testing.T) {
+	for _, sudo := range []bool{true, false} {
+		config := testConfig()
+		config["prevent_sudo"] = !sudo
+
+		p := &Provisioner{}
+		comm := &packer.MockCommunicator{}
+		ui := &packer.BasicUi{
+			Reader: new(bytes.Buffer),
+			Writer: new(bytes.Buffer),
+		}
+
+		err := p.Prepare(config)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		if err := p.createDir(ui, comm, "/tmp/foo"); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		if !sudo && strings.HasPrefix(comm.StartCmd.Command, "sudo") {
+			t.Fatalf("createDir should not use sudo, got: \"%s\"", comm.StartCmd.Command)
+		}
+
+		if sudo && !strings.HasPrefix(comm.StartCmd.Command, "sudo") {
+			t.Fatalf("createDir should use sudo, got: \"%s\"", comm.StartCmd.Command)
+		}
+	}
+}
+
+func TestProvisioner_removeDir(t *testing.T) {
+	for _, sudo := range []bool{true, false} {
+		config := testConfig()
+		config["prevent_sudo"] = !sudo
+
+		p := &Provisioner{}
+		comm := &packer.MockCommunicator{}
+		ui := &packer.BasicUi{
+			Reader: new(bytes.Buffer),
+			Writer: new(bytes.Buffer),
+		}
+
+		err := p.Prepare(config)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		if err := p.removeDir(ui, comm, "/tmp/foo"); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		if !sudo && strings.HasPrefix(comm.StartCmd.Command, "sudo") {
+			t.Fatalf("removeDir should not use sudo, got: \"%s\"", comm.StartCmd.Command)
+		}
+
+		if sudo && !strings.HasPrefix(comm.StartCmd.Command, "sudo") {
+			t.Fatalf("removeDir should use sudo, got: \"%s\"", comm.StartCmd.Command)
+		}
 	}
 }

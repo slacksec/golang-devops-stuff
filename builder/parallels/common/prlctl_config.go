@@ -1,28 +1,20 @@
 package common
 
 import (
-	"fmt"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
+// PrlctlConfig contains the configuration for running "prlctl" commands
+// before the VM start.
 type PrlctlConfig struct {
 	Prlctl [][]string `mapstructure:"prlctl"`
 }
 
-func (c *PrlctlConfig) Prepare(t *packer.ConfigTemplate) []error {
+// Prepare sets the default value of "Prlctl" property.
+func (c *PrlctlConfig) Prepare(ctx *interpolate.Context) []error {
 	if c.Prlctl == nil {
 		c.Prlctl = make([][]string, 0)
 	}
 
-	errs := make([]error, 0)
-	for i, args := range c.Prlctl {
-		for j, arg := range args {
-			if err := t.Validate(arg); err != nil {
-				errs = append(errs,
-					fmt.Errorf("Error processing prlctl[%d][%d]: %s", i, j, err))
-			}
-		}
-	}
-
-	return errs
+	return nil
 }

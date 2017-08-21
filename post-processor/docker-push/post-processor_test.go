@@ -2,9 +2,9 @@ package dockerpush
 
 import (
 	"bytes"
-	"github.com/mitchellh/packer/builder/docker"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/post-processor/docker-import"
+	"github.com/hashicorp/packer/builder/docker"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/post-processor/docker-import"
 	"testing"
 )
 
@@ -108,7 +108,7 @@ func TestPostProcessor_PostProcess_tags(t *testing.T) {
 	if !driver.PushCalled {
 		t.Fatal("should call push")
 	}
-	if driver.PushName != "hashicorp/ubuntu" {
+	if driver.PushName != "hashicorp/ubuntu:precise" {
 		t.Fatalf("bad name: %s", driver.PushName)
 	}
 }

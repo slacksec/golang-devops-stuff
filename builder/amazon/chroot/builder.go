@@ -6,15 +6,16 @@ package chroot
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"runtime"
 
-	"github.com/mitchellh/goamz/ec2"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	awscommon "github.com/hashicorp/packer/builder/amazon/common"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/multistep"
-	awscommon "github.com/mitchellh/packer/builder/amazon/common"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
 )
 
 // The unique ID for this builder
@@ -23,18 +24,27 @@ const BuilderId = "mitchellh.amazon.chroot"
 // Config is the configuration that is chained through the steps and
 // settable from the template.
 type Config struct {
-	common.PackerConfig    `mapstructure:",squash"`
-	awscommon.AccessConfig `mapstructure:",squash"`
-	awscommon.AMIConfig    `mapstructure:",squash"`
+	common.PackerConfig       `mapstructure:",squash"`
+	awscommon.AMIBlockDevices `mapstructure:",squash"`
+	awscommon.AMIConfig       `mapstructure:",squash"`
+	awscommon.AccessConfig    `mapstructure:",squash"`
 
-	ChrootMounts   [][]string `mapstructure:"chroot_mounts"`
-	CommandWrapper string     `mapstructure:"command_wrapper"`
-	CopyFiles      []string   `mapstructure:"copy_files"`
-	DevicePath     string     `mapstructure:"device_path"`
-	MountPath      string     `mapstructure:"mount_path"`
-	SourceAmi      string     `mapstructure:"source_ami"`
+	ChrootMounts      [][]string                 `mapstructure:"chroot_mounts"`
+	CommandWrapper    string                     `mapstructure:"command_wrapper"`
+	CopyFiles         []string                   `mapstructure:"copy_files"`
+	DevicePath        string                     `mapstructure:"device_path"`
+	FromScratch       bool                       `mapstructure:"from_scratch"`
+	MountOptions      []string                   `mapstructure:"mount_options"`
+	MountPartition    int                        `mapstructure:"mount_partition"`
+	MountPath         string                     `mapstructure:"mount_path"`
+	PostMountCommands []string                   `mapstructure:"post_mount_commands"`
+	PreMountCommands  []string                   `mapstructure:"pre_mount_commands"`
+	RootDeviceName    string                     `mapstructure:"root_device_name"`
+	RootVolumeSize    int64                      `mapstructure:"root_volume_size"`
+	SourceAmi         string                     `mapstructure:"source_ami"`
+	SourceAmiFilter   awscommon.AmiFilterOptions `mapstructure:"source_ami_filter"`
 
-	tpl *packer.ConfigTemplate
+	ctx interpolate.Context
 }
 
 type wrappedCommandTemplate struct {
@@ -47,39 +57,51 @@ type Builder struct {
 }
 
 func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
-	md, err := common.DecodeConfig(&b.config, raws...)
+	b.config.ctx.Funcs = awscommon.TemplateFuncs
+	err := config.Decode(&b.config, &config.DecodeOpts{
+		Interpolate:        true,
+		InterpolateContext: &b.config.ctx,
+		InterpolateFilter: &interpolate.RenderFilter{
+			Exclude: []string{
+				"ami_description",
+				"snapshot_tags",
+				"tags",
+				"command_wrapper",
+				"post_mount_commands",
+				"pre_mount_commands",
+				"mount_path",
+			},
+		},
+	}, raws...)
 	if err != nil {
 		return nil, err
 	}
 
-	b.config.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return nil, err
+	if b.config.PackerConfig.PackerForce {
+		b.config.AMIForceDeregister = true
 	}
-	b.config.tpl.UserVars = b.config.PackerUserVars
-	b.config.tpl.Funcs(awscommon.TemplateFuncs)
 
 	// Defaults
 	if b.config.ChrootMounts == nil {
 		b.config.ChrootMounts = make([][]string, 0)
 	}
 
-	if b.config.CopyFiles == nil {
-		b.config.CopyFiles = make([]string, 0)
-	}
-
 	if len(b.config.ChrootMounts) == 0 {
 		b.config.ChrootMounts = [][]string{
-			[]string{"proc", "proc", "/proc"},
-			[]string{"sysfs", "sysfs", "/sys"},
-			[]string{"bind", "/dev", "/dev"},
-			[]string{"devpts", "devpts", "/dev/pts"},
-			[]string{"binfmt_misc", "binfmt_misc", "/proc/sys/fs/binfmt_misc"},
+			{"proc", "proc", "/proc"},
+			{"sysfs", "sysfs", "/sys"},
+			{"bind", "/dev", "/dev"},
+			{"devpts", "devpts", "/dev/pts"},
+			{"binfmt_misc", "binfmt_misc", "/proc/sys/fs/binfmt_misc"},
 		}
 	}
 
-	if len(b.config.CopyFiles) == 0 {
-		b.config.CopyFiles = []string{"/etc/resolv.conf"}
+	// set default copy file if we're not giving our own
+	if b.config.CopyFiles == nil {
+		b.config.CopyFiles = make([]string, 0)
+		if !b.config.FromScratch {
+			b.config.CopyFiles = []string{"/etc/resolv.conf"}
+		}
 	}
 
 	if b.config.CommandWrapper == "" {
@@ -90,62 +112,68 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		b.config.MountPath = "/mnt/packer-amazon-chroot-volumes/{{.Device}}"
 	}
 
-	// Accumulate any errors
-	errs := common.CheckUnusedConfig(md)
-	errs = packer.MultiErrorAppend(errs, b.config.AccessConfig.Prepare(b.config.tpl)...)
-	errs = packer.MultiErrorAppend(errs, b.config.AMIConfig.Prepare(b.config.tpl)...)
+	if b.config.MountPartition == 0 {
+		b.config.MountPartition = 1
+	}
 
-	for i, mounts := range b.config.ChrootMounts {
+	// Accumulate any errors or warnings
+	var errs *packer.MultiError
+	var warns []string
+
+	errs = packer.MultiErrorAppend(errs, b.config.AccessConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.AMIConfig.Prepare(&b.config.ctx)...)
+
+	for _, mounts := range b.config.ChrootMounts {
 		if len(mounts) != 3 {
 			errs = packer.MultiErrorAppend(
 				errs, errors.New("Each chroot_mounts entry should be three elements."))
 			break
 		}
+	}
 
-		for j, entry := range mounts {
-			b.config.ChrootMounts[i][j], err = b.config.tpl.Process(entry, nil)
-			if err != nil {
-				errs = packer.MultiErrorAppend(errs,
-					fmt.Errorf("Error processing chroot_mounts[%d][%d]: %s",
-						i, j, err))
-			}
+	if b.config.FromScratch {
+		if b.config.SourceAmi != "" || !b.config.SourceAmiFilter.Empty() {
+			warns = append(warns, "source_ami and source_ami_filter are unused when from_scratch is true")
 		}
-	}
-
-	for i, file := range b.config.CopyFiles {
-		var err error
-		b.config.CopyFiles[i], err = b.config.tpl.Process(file, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(errs,
-				fmt.Errorf("Error processing copy_files[%d]: %s",
-					i, err))
-		}
-	}
-
-	if b.config.SourceAmi == "" {
-		errs = packer.MultiErrorAppend(errs, errors.New("source_ami is required."))
-	}
-
-	templates := map[string]*string{
-		"device_path": &b.config.DevicePath,
-		"source_ami":  &b.config.SourceAmi,
-	}
-
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = b.config.tpl.Process(*ptr, nil)
-		if err != nil {
+		if b.config.RootVolumeSize == 0 {
 			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
+				errs, errors.New("root_volume_size is required with from_scratch."))
+		}
+		if len(b.config.PreMountCommands) == 0 {
+			errs = packer.MultiErrorAppend(
+				errs, errors.New("pre_mount_commands is required with from_scratch."))
+		}
+		if b.config.AMIVirtType == "" {
+			errs = packer.MultiErrorAppend(
+				errs, errors.New("ami_virtualization_type is required with from_scratch."))
+		}
+		if b.config.RootDeviceName == "" {
+			errs = packer.MultiErrorAppend(
+				errs, errors.New("root_device_name is required with from_scratch."))
+		}
+		if len(b.config.AMIMappings) == 0 {
+			errs = packer.MultiErrorAppend(
+				errs, errors.New("ami_block_device_mappings is required with from_scratch."))
+		}
+	} else {
+		if b.config.SourceAmi == "" && b.config.SourceAmiFilter.Empty() {
+			errs = packer.MultiErrorAppend(
+				errs, errors.New("source_ami or source_ami_filter is required."))
+		}
+		if len(b.config.AMIMappings) != 0 {
+			warns = append(warns, "ami_block_device_mappings are unused when from_scratch is false")
+		}
+		if b.config.RootDeviceName != "" {
+			warns = append(warns, "root_device_name is unused when from_scratch is false")
 		}
 	}
 
 	if errs != nil && len(errs.Errors) > 0 {
-		return nil, errs
+		return warns, errs
 	}
 
 	log.Println(common.ScrubConfig(b.config, b.config.AccessKey, b.config.SecretKey))
-	return nil, nil
+	return warns, nil
 }
 
 func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
@@ -153,23 +181,16 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		return nil, errors.New("The amazon-chroot builder only works on Linux environments.")
 	}
 
-	region, err := b.config.Region()
+	session, err := b.config.Session()
 	if err != nil {
 		return nil, err
 	}
-
-	auth, err := b.config.AccessConfig.Auth()
-	if err != nil {
-		return nil, err
-	}
-
-	ec2conn := ec2.New(auth, region)
+	ec2conn := ec2.New(session)
 
 	wrappedCommand := func(command string) (string, error) {
-		return b.config.tpl.Process(
-			b.config.CommandWrapper, &wrappedCommandTemplate{
-				Command: command,
-			})
+		ctx := b.config.ctx
+		ctx.Data = &wrappedCommandTemplate{Command: command}
+		return interpolate.Render(b.config.CommandWrapper, &ctx)
 	}
 
 	// Setup the state bag and initial state for the steps
@@ -182,47 +203,86 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 
 	// Build the steps
 	steps := []multistep.Step{
-		&StepInstanceInfo{},
-		&awscommon.StepSourceAMIInfo{
-			SourceAmi:          b.config.SourceAmi,
-			EnhancedNetworking: b.config.AMIEnhancedNetworking,
+		&awscommon.StepPreValidate{
+			DestAmiName:     b.config.AMIName,
+			ForceDeregister: b.config.AMIForceDeregister,
 		},
-		&StepCheckRootDevice{},
+		&StepInstanceInfo{},
+	}
+
+	if !b.config.FromScratch {
+		steps = append(steps,
+			&awscommon.StepSourceAMIInfo{
+				SourceAmi:          b.config.SourceAmi,
+				EnhancedNetworking: b.config.AMIEnhancedNetworking,
+				AmiFilters:         b.config.SourceAmiFilter,
+			},
+			&StepCheckRootDevice{},
+		)
+	}
+
+	steps = append(steps,
 		&StepFlock{},
 		&StepPrepareDevice{},
-		&StepCreateVolume{},
+		&StepCreateVolume{
+			RootVolumeSize: b.config.RootVolumeSize,
+		},
 		&StepAttachVolume{},
 		&StepEarlyUnflock{},
-		&StepMountDevice{},
+		&StepPreMountCommands{
+			Commands: b.config.PreMountCommands,
+		},
+		&StepMountDevice{
+			MountOptions:   b.config.MountOptions,
+			MountPartition: b.config.MountPartition,
+		},
+		&StepPostMountCommands{
+			Commands: b.config.PostMountCommands,
+		},
 		&StepMountExtra{},
 		&StepCopyFiles{},
 		&StepChrootProvision{},
 		&StepEarlyCleanup{},
 		&StepSnapshot{},
-		&StepRegisterAMI{},
+		&awscommon.StepDeregisterAMI{
+			ForceDeregister:     b.config.AMIForceDeregister,
+			ForceDeleteSnapshot: b.config.AMIForceDeleteSnapshot,
+			AMIName:             b.config.AMIName,
+		},
+		&StepRegisterAMI{
+			RootVolumeSize: b.config.RootVolumeSize,
+		},
+		&awscommon.StepCreateEncryptedAMICopy{
+			KeyID:             b.config.AMIKmsKeyId,
+			EncryptBootVolume: b.config.AMIEncryptBootVolume,
+			Name:              b.config.AMIName,
+			AMIMappings:       b.config.AMIBlockDevices.AMIMappings,
+		},
 		&awscommon.StepAMIRegionCopy{
-			Regions: b.config.AMIRegions,
+			AccessConfig:      &b.config.AccessConfig,
+			Regions:           b.config.AMIRegions,
+			RegionKeyIds:      b.config.AMIRegionKMSKeyIDs,
+			EncryptBootVolume: b.config.AMIEncryptBootVolume,
+			Name:              b.config.AMIName,
 		},
 		&awscommon.StepModifyAMIAttributes{
-			Description: b.config.AMIDescription,
-			Users:       b.config.AMIUsers,
-			Groups:      b.config.AMIGroups,
+			Description:    b.config.AMIDescription,
+			Users:          b.config.AMIUsers,
+			Groups:         b.config.AMIGroups,
+			ProductCodes:   b.config.AMIProductCodes,
+			SnapshotUsers:  b.config.SnapshotUsers,
+			SnapshotGroups: b.config.SnapshotGroups,
+			Ctx:            b.config.ctx,
 		},
 		&awscommon.StepCreateTags{
-			Tags: b.config.AMITags,
+			Tags:         b.config.AMITags,
+			SnapshotTags: b.config.SnapshotTags,
+			Ctx:          b.config.ctx,
 		},
-	}
+	)
 
 	// Run!
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
+	b.runner = common.NewRunner(steps, b.config.PackerConfig, ui)
 	b.runner.Run(state)
 
 	// If there was an error, return that

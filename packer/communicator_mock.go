@@ -3,6 +3,7 @@ package packer
 import (
 	"bytes"
 	"io"
+	"os"
 	"sync"
 )
 
@@ -23,6 +24,10 @@ type MockCommunicator struct {
 	UploadDirDst     string
 	UploadDirSrc     string
 	UploadDirExclude []string
+
+	DownloadDirDst     string
+	DownloadDirSrc     string
+	DownloadDirExclude []string
 
 	DownloadCalled bool
 	DownloadPath   string
@@ -68,7 +73,7 @@ func (c *MockCommunicator) Start(rc *RemoteCmd) error {
 	return nil
 }
 
-func (c *MockCommunicator) Upload(path string, r io.Reader) error {
+func (c *MockCommunicator) Upload(path string, r io.Reader, fi *os.FileInfo) error {
 	c.UploadCalled = true
 	c.UploadPath = path
 
@@ -94,6 +99,14 @@ func (c *MockCommunicator) Download(path string, w io.Writer) error {
 	c.DownloadCalled = true
 	c.DownloadPath = path
 	w.Write([]byte(c.DownloadData))
+
+	return nil
+}
+
+func (c *MockCommunicator) DownloadDir(src string, dst string, excl []string) error {
+	c.DownloadDirDst = dst
+	c.DownloadDirSrc = src
+	c.DownloadDirExclude = excl
 
 	return nil
 }

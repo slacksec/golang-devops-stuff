@@ -1,12 +1,13 @@
 package iso
 
 import (
-	"github.com/mitchellh/packer/packer"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
-	"time"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 func testConfig() map[string]interface{} {
@@ -29,92 +30,6 @@ func TestBuilder_ImplementsBuilder(t *testing.T) {
 	}
 }
 
-func TestBuilderPrepare_ISOChecksum(t *testing.T) {
-	var b Builder
-	config := testConfig()
-
-	// Test bad
-	config["iso_checksum"] = ""
-	warns, err := b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	// Test good
-	config["iso_checksum"] = "FOo"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-
-	if b.config.ISOChecksum != "foo" {
-		t.Fatalf("should've lowercased: %s", b.config.ISOChecksum)
-	}
-}
-
-func TestBuilderPrepare_ISOChecksumType(t *testing.T) {
-	var b Builder
-	config := testConfig()
-
-	// Test bad
-	config["iso_checksum_type"] = ""
-	warns, err := b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	// Test good
-	config["iso_checksum_type"] = "mD5"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-
-	if b.config.ISOChecksumType != "md5" {
-		t.Fatalf("should've lowercased: %s", b.config.ISOChecksumType)
-	}
-
-	// Test unknown
-	config["iso_checksum_type"] = "fake"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	// Test none
-	config["iso_checksum_type"] = "none"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) == 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-
-	if b.config.ISOChecksumType != "none" {
-		t.Fatalf("should've lowercased: %s", b.config.ISOChecksumType)
-	}
-}
-
 func TestBuilderPrepare_Defaults(t *testing.T) {
 	var b Builder
 	config := testConfig()
@@ -134,8 +49,8 @@ func TestBuilderPrepare_Defaults(t *testing.T) {
 		t.Errorf("bad output dir: %s", b.config.OutputDir)
 	}
 
-	if b.config.SSHWaitTimeout != (20 * time.Minute) {
-		t.Errorf("bad wait timeout: %s", b.config.SSHWaitTimeout)
+	if b.config.Version != "9" {
+		t.Errorf("bad Version: %s", b.config.Version)
 	}
 
 	if b.config.VMName != "packer-foo" {
@@ -171,7 +86,7 @@ func TestBuilderPrepare_DiskSize(t *testing.T) {
 	}
 
 	if b.config.DiskSize != 60000 {
-		t.Fatalf("bad size: %s", b.config.DiskSize)
+		t.Fatalf("bad size: %d", b.config.DiskSize)
 	}
 }
 
@@ -192,7 +107,8 @@ func TestBuilderPrepare_FloppyFiles(t *testing.T) {
 		t.Fatalf("bad: %#v", b.config.FloppyFiles)
 	}
 
-	config["floppy_files"] = []string{"foo", "bar"}
+	floppies_path := "../../../common/test-fixtures/floppies"
+	config["floppy_files"] = []string{fmt.Sprintf("%s/bar.bat", floppies_path), fmt.Sprintf("%s/foo.ps1", floppies_path)}
 	b = Builder{}
 	warns, err = b.Prepare(config)
 	if len(warns) > 0 {
@@ -202,19 +118,33 @@ func TestBuilderPrepare_FloppyFiles(t *testing.T) {
 		t.Fatalf("should not have error: %s", err)
 	}
 
-	expected := []string{"foo", "bar"}
+	expected := []string{fmt.Sprintf("%s/bar.bat", floppies_path), fmt.Sprintf("%s/foo.ps1", floppies_path)}
 	if !reflect.DeepEqual(b.config.FloppyFiles, expected) {
 		t.Fatalf("bad: %#v", b.config.FloppyFiles)
 	}
 }
 
-func TestBuilderPrepare_HTTPPort(t *testing.T) {
+func TestBuilderPrepare_InvalidFloppies(t *testing.T) {
+	var b Builder
+	config := testConfig()
+	config["floppy_files"] = []string{"nonexistent.bat", "nonexistent.ps1"}
+	b = Builder{}
+	_, errs := b.Prepare(config)
+	if errs == nil {
+		t.Fatalf("Nonexistent floppies should trigger multierror")
+	}
+
+	if len(errs.(*packer.MultiError).Errors) != 2 {
+		t.Fatalf("Multierror should work and report 2 errors")
+	}
+}
+
+func TestBuilderPrepare_Format(t *testing.T) {
 	var b Builder
 	config := testConfig()
 
 	// Bad
-	config["http_port_min"] = 1000
-	config["http_port_max"] = 500
+	config["format"] = "foobar"
 	warns, err := b.Prepare(config)
 	if len(warns) > 0 {
 		t.Fatalf("bad: %#v", warns)
@@ -223,27 +153,19 @@ func TestBuilderPrepare_HTTPPort(t *testing.T) {
 		t.Fatal("should have error")
 	}
 
-	// Bad
-	config["http_port_min"] = -500
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
+	goodFormats := []string{"ova", "ovf", "vmx"}
 
-	// Good
-	config["http_port_min"] = 500
-	config["http_port_max"] = 1000
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
+	for _, format := range goodFormats {
+		// Good
+		config["format"] = format
+		b = Builder{}
+		warns, err = b.Prepare(config)
+		if len(warns) > 0 {
+			t.Fatalf("bad: %#v", warns)
+		}
+		if err != nil {
+			t.Fatalf("should not have error: %s", err)
+		}
 	}
 }
 
@@ -259,76 +181,6 @@ func TestBuilderPrepare_InvalidKey(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("should have error")
-	}
-}
-
-func TestBuilderPrepare_ISOUrl(t *testing.T) {
-	var b Builder
-	config := testConfig()
-	delete(config, "iso_url")
-	delete(config, "iso_urls")
-
-	// Test both epty
-	config["iso_url"] = ""
-	b = Builder{}
-	warns, err := b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	// Test iso_url set
-	config["iso_url"] = "http://www.packer.io"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Errorf("should not have error: %s", err)
-	}
-
-	expected := []string{"http://www.packer.io"}
-	if !reflect.DeepEqual(b.config.ISOUrls, expected) {
-		t.Fatalf("bad: %#v", b.config.ISOUrls)
-	}
-
-	// Test both set
-	config["iso_url"] = "http://www.packer.io"
-	config["iso_urls"] = []string{"http://www.packer.io"}
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	// Test just iso_urls set
-	delete(config, "iso_url")
-	config["iso_urls"] = []string{
-		"http://www.packer.io",
-		"http://www.hashicorp.com",
-	}
-
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Errorf("should not have error: %s", err)
-	}
-
-	expected = []string{
-		"http://www.packer.io",
-		"http://www.hashicorp.com",
-	}
-	if !reflect.DeepEqual(b.config.ISOUrls, expected) {
-		t.Fatalf("bad: %#v", b.config.ISOUrls)
 	}
 }
 
@@ -349,8 +201,8 @@ func TestBuilderPrepare_OutputDir(t *testing.T) {
 	if len(warns) > 0 {
 		t.Fatalf("bad: %#v", warns)
 	}
-	if err == nil {
-		t.Fatal("should have error")
+	if err != nil {
+		t.Fatalf("err: %s", err)
 	}
 
 	// Test with a good one
@@ -501,5 +353,63 @@ func TestBuilderPrepare_VNCPort(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("should not have error: %s", err)
+	}
+}
+
+func TestBuilderPrepare_CommConfig(t *testing.T) {
+	// Test Winrm
+	{
+		config := testConfig()
+		config["communicator"] = "winrm"
+		config["winrm_username"] = "username"
+		config["winrm_password"] = "password"
+		config["winrm_host"] = "1.2.3.4"
+
+		var b Builder
+		warns, err := b.Prepare(config)
+		if len(warns) > 0 {
+			t.Fatalf("bad: %#v", warns)
+		}
+		if err != nil {
+			t.Fatalf("should not have error: %s", err)
+		}
+
+		if b.config.CommConfig.WinRMUser != "username" {
+			t.Errorf("bad winrm_username: %s", b.config.CommConfig.WinRMUser)
+		}
+		if b.config.CommConfig.WinRMPassword != "password" {
+			t.Errorf("bad winrm_password: %s", b.config.CommConfig.WinRMPassword)
+		}
+		if host := b.config.CommConfig.Host(); host != "1.2.3.4" {
+			t.Errorf("bad host: %s", host)
+		}
+	}
+
+	// Test SSH
+	{
+		config := testConfig()
+		config["communicator"] = "ssh"
+		config["ssh_username"] = "username"
+		config["ssh_password"] = "password"
+		config["ssh_host"] = "1.2.3.4"
+
+		var b Builder
+		warns, err := b.Prepare(config)
+		if len(warns) > 0 {
+			t.Fatalf("bad: %#v", warns)
+		}
+		if err != nil {
+			t.Fatalf("should not have error: %s", err)
+		}
+
+		if b.config.CommConfig.SSHUsername != "username" {
+			t.Errorf("bad ssh_username: %s", b.config.CommConfig.SSHUsername)
+		}
+		if b.config.CommConfig.SSHPassword != "password" {
+			t.Errorf("bad ssh_password: %s", b.config.CommConfig.SSHPassword)
+		}
+		if host := b.config.CommConfig.Host(); host != "1.2.3.4" {
+			t.Errorf("bad host: %s", host)
+		}
 	}
 }
