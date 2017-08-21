@@ -1,12 +1,14 @@
 package deb
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/smira/aptly/aptly"
-	"github.com/smira/aptly/utils"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/smira/aptly/aptly"
+	"github.com/smira/aptly/utils"
 )
 
 // Package is single instance of Debian package
@@ -22,19 +24,41 @@ type Package struct {
 	Source string
 	// List of virtual packages this package provides
 	Provides []string
-	// Is this source package
-	IsSource bool
 	// Hash of files section
 	FilesHash uint64
+	// Is this source package
+	IsSource bool
+	// Is this udeb package
+	IsUdeb bool
 	// Is this >= 0.6 package?
 	V06Plus bool
 	// Offload fields
-	deps  *PackageDependencies
-	extra *Stanza
-	files *PackageFiles
+	deps     *PackageDependencies
+	extra    *Stanza
+	files    *PackageFiles
+	contents []string
 	// Mother collection
 	collection *PackageCollection
 }
+
+// Package types
+const (
+	PackageTypeBinary = "deb"
+	PackageTypeUdeb   = "udeb"
+	PackageTypeSource = "source"
+)
+
+// Special arhictectures
+const (
+	ArchitectureAll    = "all"
+	ArhictectureAny    = "any"
+	ArchitectureSource = "source"
+)
+
+// Check interface
+var (
+	_ json.Marshaler = &Package{}
+)
 
 // NewPackageFromControlFile creates Package from parsed Debian control file
 func NewPackageFromControlFile(input Stanza) *Package {
@@ -53,21 +77,30 @@ func NewPackageFromControlFile(input Stanza) *Package {
 
 	filesize, _ := strconv.ParseInt(input["Size"], 10, 64)
 
+	md5, ok := input["MD5sum"]
+	if !ok {
+		// there are some broken repos out there with MD5 in wrong field
+		md5 = input["MD5Sum"]
+	}
+
 	result.UpdateFiles(PackageFiles{PackageFile{
 		Filename:     filepath.Base(input["Filename"]),
 		downloadPath: filepath.Dir(input["Filename"]),
 		Checksums: utils.ChecksumInfo{
 			Size:   filesize,
-			MD5:    strings.TrimSpace(input["MD5sum"]),
+			MD5:    strings.TrimSpace(md5),
 			SHA1:   strings.TrimSpace(input["SHA1"]),
 			SHA256: strings.TrimSpace(input["SHA256"]),
+			SHA512: strings.TrimSpace(input["SHA512"]),
 		},
 	}})
 
 	delete(input, "Filename")
 	delete(input, "MD5sum")
+	delete(input, "MD5Sum")
 	delete(input, "SHA1")
 	delete(input, "SHA256")
+	delete(input, "SHA512")
 	delete(input, "Size")
 
 	depends := &PackageDependencies{}
@@ -99,62 +132,20 @@ func NewSourcePackageFromControlFile(input Stanza) (*Package, error) {
 	delete(input, "Version")
 	delete(input, "Architecture")
 
+	var err error
+
 	files := make(PackageFiles, 0, 3)
-
-	parseSums := func(field string, setter func(sum *utils.ChecksumInfo, data string)) error {
-		for _, line := range strings.Split(input[field], "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.Fields(line)
-
-			if len(parts) != 3 {
-				return fmt.Errorf("unparseable hash sum line: %#v", line)
-			}
-
-			size, err := strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				return fmt.Errorf("unable to parse size: %s", err)
-			}
-
-			filename := filepath.Base(parts[2])
-
-			found := false
-			pos := 0
-			for i, file := range files {
-				if file.Filename == filename {
-					found = true
-					pos = i
-					break
-				}
-			}
-
-			if !found {
-				files = append(files, PackageFile{Filename: filename, downloadPath: input["Directory"]})
-				pos = len(files) - 1
-			}
-
-			files[pos].Checksums.Size = size
-			setter(&files[pos].Checksums, parts[0])
-		}
-
-		delete(input, field)
-
-		return nil
-	}
-
-	err := parseSums("Files", func(sum *utils.ChecksumInfo, data string) { sum.MD5 = data })
+	files, err = files.ParseSumFields(input)
 	if err != nil {
 		return nil, err
 	}
-	err = parseSums("Checksums-Sha1", func(sum *utils.ChecksumInfo, data string) { sum.SHA1 = data })
-	if err != nil {
-		return nil, err
-	}
-	err = parseSums("Checksums-Sha256", func(sum *utils.ChecksumInfo, data string) { sum.SHA256 = data })
-	if err != nil {
-		return nil, err
+
+	delete(input, "Files")
+	delete(input, "Checksums-Sha1")
+	delete(input, "Checksums-Sha256")
+
+	for i := range files {
+		files[i].downloadPath = input["Directory"]
 	}
 
 	result.UpdateFiles(files)
@@ -167,6 +158,14 @@ func NewSourcePackageFromControlFile(input Stanza) (*Package, error) {
 	result.extra = &input
 
 	return result, nil
+}
+
+// NewUdebPackageFromControlFile creates .udeb Package from parsed Debian control file
+func NewUdebPackageFromControlFile(input Stanza) *Package {
+	p := NewPackageFromControlFile(input)
+	p.IsUdeb = true
+
+	return p
 }
 
 // Key returns unique key identifying package
@@ -186,6 +185,21 @@ func (p *Package) ShortKey(prefix string) []byte {
 // String creates readable representation
 func (p *Package) String() string {
 	return fmt.Sprintf("%s_%s_%s", p.Name, p.Version, p.Architecture)
+}
+
+// ExtendedStanza returns package stanza enhanced with aptly-specific fields
+func (p *Package) ExtendedStanza() Stanza {
+	stanza := p.Stanza()
+	stanza["FilesHash"] = fmt.Sprintf("%08x", p.FilesHash)
+	stanza["Key"] = string(p.Key(""))
+	stanza["ShortKey"] = string(p.ShortKey(""))
+
+	return stanza
+}
+
+// MarshalJSON implements json.Marshaller interface
+func (p *Package) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.ExtendedStanza())
 }
 
 // GetField returns fields from package
@@ -218,9 +232,12 @@ func (p *Package) GetField(name string) string {
 		return p.Architecture
 	case "$PackageType":
 		if p.IsSource {
-			return "source"
+			return PackageTypeSource
 		}
-		return "deb"
+		if p.IsUdeb {
+			return PackageTypeUdeb
+		}
+		return PackageTypeBinary
 	case "Name":
 		return p.Name
 	case "Version":
@@ -249,12 +266,11 @@ func (p *Package) GetField(name string) string {
 	default:
 		return p.Extra()[name]
 	}
-	return ""
 }
 
 // MatchesArchitecture checks whether packages matches specified architecture
 func (p *Package) MatchesArchitecture(arch string) bool {
-	if p.Architecture == "all" && arch != "source" {
+	if p.Architecture == ArchitectureAll && arch != ArchitectureSource {
 		return true
 	}
 
@@ -301,7 +317,22 @@ func (p *Package) MatchesDependency(dep Dependency) bool {
 	panic("unknown relation")
 }
 
-// GetDependencies compiles list of dependenices by flags from options
+// GetName returns package name
+func (p *Package) GetName() string {
+	return p.Name
+}
+
+// GetVersion returns package version
+func (p *Package) GetVersion() string {
+	return p.Version
+}
+
+// GetArchitecture returns package arch
+func (p *Package) GetArchitecture() string {
+	return p.Architecture
+}
+
+// GetDependencies compiles list of dependncies by flags from options
 func (p *Package) GetDependencies(options int) (dependencies []string) {
 	deps := p.Deps()
 
@@ -327,7 +358,7 @@ func (p *Package) GetDependencies(options int) (dependencies []string) {
 		if source == "" {
 			source = p.Name
 		}
-		if strings.Index(source, ")") != -1 {
+		if strings.Contains(source, ")") {
 			dependencies = append(dependencies, fmt.Sprintf("%s {source}", source))
 		} else {
 			dependencies = append(dependencies, fmt.Sprintf("%s (= %s) {source}", source, p.Version))
@@ -335,6 +366,16 @@ func (p *Package) GetDependencies(options int) (dependencies []string) {
 	}
 
 	return
+}
+
+// QualifiedName returns [$SECTION/]$NAME
+func (p *Package) QualifiedName() string {
+	section := p.Extra()["Section"]
+	if section != "" {
+		return section + "/" + p.Name
+	}
+
+	return p.Name
 }
 
 // Extra returns Stanza of extra fields (it may load it from collection)
@@ -375,6 +416,50 @@ func (p *Package) Files() PackageFiles {
 	return *p.files
 }
 
+// Contents returns cached package contents
+func (p *Package) Contents(packagePool aptly.PackagePool, progress aptly.Progress) []string {
+	if p.IsSource {
+		return nil
+	}
+
+	return p.collection.loadContents(p, packagePool, progress)
+}
+
+// CalculateContents looks up contents in package file
+func (p *Package) CalculateContents(packagePool aptly.PackagePool, progress aptly.Progress) ([]string, error) {
+	if p.IsSource {
+		return nil, nil
+	}
+
+	file := p.Files()[0]
+	poolPath, err := file.GetPoolPath(packagePool)
+	if err != nil {
+		if progress != nil {
+			progress.ColoredPrintf("@y[!]@| @!Failed to build pool path: @| %s", err)
+		}
+		return nil, err
+	}
+
+	reader, err := packagePool.Open(poolPath)
+	if err != nil {
+		if progress != nil {
+			progress.ColoredPrintf("@y[!]@| @!Failed to open package in pool: @| %s", err)
+		}
+		return nil, err
+	}
+	defer reader.Close()
+
+	contents, err := GetContentsFromDeb(reader, file.Filename)
+	if err != nil {
+		if progress != nil {
+			progress.ColoredPrintf("@y[!]@| @!Failed to generate package contents: @| %s", err)
+		}
+		return nil, err
+	}
+
+	return contents, nil
+}
+
 // UpdateFiles saves new state of files
 func (p *Package) UpdateFiles(files PackageFiles) {
 	p.files = &files
@@ -391,11 +476,13 @@ func (p *Package) Stanza() (result Stanza) {
 		result["Architecture"] = p.SourceArchitecture
 	} else {
 		result["Architecture"] = p.Architecture
-		result["Source"] = p.Source
+		if p.Source != "" {
+			result["Source"] = p.Source
+		}
 	}
 
 	if p.IsSource {
-		md5, sha1, sha256 := make([]string, 0), make([]string, 0), make([]string, 0)
+		md5, sha1, sha256, sha512 := []string{}, []string{}, []string{}, []string{}
 
 		for _, f := range p.Files() {
 			if f.Checksums.MD5 != "" {
@@ -407,11 +494,21 @@ func (p *Package) Stanza() (result Stanza) {
 			if f.Checksums.SHA256 != "" {
 				sha256 = append(sha256, fmt.Sprintf(" %s %d %s\n", f.Checksums.SHA256, f.Checksums.Size, f.Filename))
 			}
+			if f.Checksums.SHA512 != "" {
+				sha512 = append(sha512, fmt.Sprintf(" %s %d %s\n", f.Checksums.SHA512, f.Checksums.Size, f.Filename))
+			}
 		}
 
 		result["Files"] = strings.Join(md5, "")
-		result["Checksums-Sha1"] = strings.Join(sha1, "")
-		result["Checksums-Sha256"] = strings.Join(sha256, "")
+		if len(sha1) > 0 {
+			result["Checksums-Sha1"] = strings.Join(sha1, "")
+		}
+		if len(sha256) > 0 {
+			result["Checksums-Sha256"] = strings.Join(sha256, "")
+		}
+		if len(sha512) > 0 {
+			result["Checksums-Sha512"] = strings.Join(sha512, "")
+		}
 	} else {
 		f := p.Files()[0]
 		result["Filename"] = f.DownloadURL()
@@ -419,10 +516,13 @@ func (p *Package) Stanza() (result Stanza) {
 			result["MD5sum"] = f.Checksums.MD5
 		}
 		if f.Checksums.SHA1 != "" {
-			result["SHA1"] = " " + f.Checksums.SHA1
+			result["SHA1"] = f.Checksums.SHA1
 		}
 		if f.Checksums.SHA256 != "" {
-			result["SHA256"] = " " + f.Checksums.SHA256
+			result["SHA256"] = f.Checksums.SHA256
+		}
+		if f.Checksums.SHA512 != "" {
+			result["SHA512"] = f.Checksums.SHA512
 		}
 		result["Size"] = fmt.Sprintf("%d", f.Checksums.Size)
 	}
@@ -470,7 +570,7 @@ func (p *Package) LinkFromPool(publishedStorage aptly.PublishedStorage, packageP
 	}
 
 	for i, f := range p.Files() {
-		sourcePath, err := packagePool.Path(f.Filename, f.Checksums.MD5)
+		sourcePoolPath, err := f.GetPoolPath(packagePool)
 		if err != nil {
 			return err
 		}
@@ -478,7 +578,7 @@ func (p *Package) LinkFromPool(publishedStorage aptly.PublishedStorage, packageP
 		relPath := filepath.Join("pool", component, poolDir)
 		publishedDirectory := filepath.Join(prefix, relPath)
 
-		err = publishedStorage.LinkFromPool(publishedDirectory, packagePool, sourcePath, f.Checksums.MD5, force)
+		err = publishedStorage.LinkFromPool(publishedDirectory, f.Filename, packagePool, sourcePoolPath, f.Checksums, force)
 		if err != nil {
 			return err
 		}
@@ -519,29 +619,25 @@ func (p *Package) PoolDirectory() (string, error) {
 
 // PackageDownloadTask is a element of download queue for the package
 type PackageDownloadTask struct {
-	RepoURI         string
-	DestinationPath string
-	Checksums       utils.ChecksumInfo
+	File         *PackageFile
+	Additional   []PackageDownloadTask
+	TempDownPath string
 }
 
 // DownloadList returns list of missing package files for download in format
 // [[srcpath, dstpath]]
-func (p *Package) DownloadList(packagePool aptly.PackagePool) (result []PackageDownloadTask, err error) {
+func (p *Package) DownloadList(packagePool aptly.PackagePool, checksumStorage aptly.ChecksumStorage) (result []PackageDownloadTask, err error) {
 	result = make([]PackageDownloadTask, 0, 1)
 
-	for _, f := range p.Files() {
-		poolPath, err := packagePool.Path(f.Filename, f.Checksums.MD5)
-		if err != nil {
-			return nil, err
-		}
-
-		verified, err := f.Verify(packagePool)
+	files := p.Files()
+	for idx := range files {
+		verified, err := files[idx].Verify(packagePool, checksumStorage)
 		if err != nil {
 			return nil, err
 		}
 
 		if !verified {
-			result = append(result, PackageDownloadTask{RepoURI: f.DownloadURL(), DestinationPath: poolPath, Checksums: f.Checksums})
+			result = append(result, PackageDownloadTask{File: &files[idx]})
 		}
 	}
 
@@ -549,11 +645,11 @@ func (p *Package) DownloadList(packagePool aptly.PackagePool) (result []PackageD
 }
 
 // VerifyFiles verifies that all package files have neen correctly downloaded
-func (p *Package) VerifyFiles(packagePool aptly.PackagePool) (result bool, err error) {
+func (p *Package) VerifyFiles(packagePool aptly.PackagePool, checksumStorage aptly.ChecksumStorage) (result bool, err error) {
 	result = true
 
 	for _, f := range p.Files() {
-		result, err = f.Verify(packagePool)
+		result, err = f.Verify(packagePool, checksumStorage)
 		if err != nil || !result {
 			return
 		}
@@ -568,7 +664,7 @@ func (p *Package) FilepathList(packagePool aptly.PackagePool) ([]string, error) 
 	result := make([]string, len(p.Files()))
 
 	for i, f := range p.Files() {
-		result[i], err = packagePool.RelativePath(f.Filename, f.Checksums.MD5)
+		result[i], err = f.GetPoolPath(packagePool)
 		if err != nil {
 			return nil, err
 		}

@@ -2,8 +2,10 @@ package deb
 
 import (
 	"errors"
+
 	"github.com/smira/aptly/database"
-	. "launchpad.net/gocheck"
+
+	. "gopkg.in/check.v1"
 )
 
 type PackageRefListSuite struct {
@@ -42,7 +44,7 @@ func (s *PackageRefListSuite) SetUpTest(c *C) {
 }
 
 func (s *PackageRefListSuite) TestNewPackageListFromRefList(c *C) {
-	db, _ := database.OpenDB(c.MkDir())
+	db, _ := database.NewOpenDB(c.MkDir())
 	coll := NewPackageCollection(db)
 	coll.Update(s.p1)
 	coll.Update(s.p3)
@@ -128,6 +130,19 @@ func (s *PackageRefListSuite) TestPackageRefListForeach(c *C) {
 	c.Check(err, Equals, e)
 }
 
+func (s *PackageRefListSuite) TestHas(c *C) {
+	s.list.Add(s.p1)
+	s.list.Add(s.p3)
+	s.list.Add(s.p5)
+	reflist := NewPackageRefListFromPackageList(s.list)
+
+	c.Check(reflist.Has(s.p1), Equals, true)
+	c.Check(reflist.Has(s.p3), Equals, true)
+	c.Check(reflist.Has(s.p5), Equals, true)
+	c.Check(reflist.Has(s.p2), Equals, true)
+	c.Check(reflist.Has(s.p6), Equals, false)
+}
+
 func (s *PackageRefListSuite) TestSubstract(c *C) {
 	r1 := []byte("r1")
 	r2 := []byte("r2")
@@ -142,26 +157,26 @@ func (s *PackageRefListSuite) TestSubstract(c *C) {
 	l4 := &PackageRefList{Refs: [][]byte{r4, r5}}
 	l5 := &PackageRefList{Refs: [][]byte{r1, r2, r3}}
 
-	c.Check(l1.Substract(empty), DeepEquals, l1)
-	c.Check(l1.Substract(l2), DeepEquals, l3)
-	c.Check(l1.Substract(l3), DeepEquals, l2)
-	c.Check(l1.Substract(l4), DeepEquals, l5)
-	c.Check(empty.Substract(l1), DeepEquals, empty)
-	c.Check(l2.Substract(l3), DeepEquals, l2)
+	c.Check(l1.Subtract(empty), DeepEquals, l1)
+	c.Check(l1.Subtract(l2), DeepEquals, l3)
+	c.Check(l1.Subtract(l3), DeepEquals, l2)
+	c.Check(l1.Subtract(l4), DeepEquals, l5)
+	c.Check(empty.Subtract(l1), DeepEquals, empty)
+	c.Check(l2.Subtract(l3), DeepEquals, l2)
 }
 
 func (s *PackageRefListSuite) TestDiff(c *C) {
-	db, _ := database.OpenDB(c.MkDir())
+	db, _ := database.NewOpenDB(c.MkDir())
 	coll := NewPackageCollection(db)
 
 	packages := []*Package{
-		&Package{Name: "lib", Version: "1.0", Architecture: "i386"},      //0
-		&Package{Name: "dpkg", Version: "1.7", Architecture: "i386"},     //1
-		&Package{Name: "data", Version: "1.1~bp1", Architecture: "all"},  //2
-		&Package{Name: "app", Version: "1.1~bp1", Architecture: "i386"},  //3
-		&Package{Name: "app", Version: "1.1~bp2", Architecture: "i386"},  //4
-		&Package{Name: "app", Version: "1.1~bp2", Architecture: "amd64"}, //5
-		&Package{Name: "xyz", Version: "3.0", Architecture: "sparc"},     //6
+		{Name: "lib", Version: "1.0", Architecture: "i386"},      //0
+		{Name: "dpkg", Version: "1.7", Architecture: "i386"},     //1
+		{Name: "data", Version: "1.1~bp1", Architecture: "all"},  //2
+		{Name: "app", Version: "1.1~bp1", Architecture: "i386"},  //3
+		{Name: "app", Version: "1.1~bp2", Architecture: "i386"},  //4
+		{Name: "app", Version: "1.1~bp2", Architecture: "amd64"}, //5
+		{Name: "xyz", Version: "3.0", Architecture: "sparc"},     //6
 	}
 
 	for _, p := range packages {
@@ -223,21 +238,24 @@ func (s *PackageRefListSuite) TestDiff(c *C) {
 }
 
 func (s *PackageRefListSuite) TestMerge(c *C) {
-	db, _ := database.OpenDB(c.MkDir())
+	db, _ := database.NewOpenDB(c.MkDir())
 	coll := NewPackageCollection(db)
 
 	packages := []*Package{
-		&Package{Name: "lib", Version: "1.0", Architecture: "i386"},      //0
-		&Package{Name: "dpkg", Version: "1.7", Architecture: "i386"},     //1
-		&Package{Name: "data", Version: "1.1~bp1", Architecture: "all"},  //2
-		&Package{Name: "app", Version: "1.1~bp1", Architecture: "i386"},  //3
-		&Package{Name: "app", Version: "1.1~bp2", Architecture: "i386"},  //4
-		&Package{Name: "app", Version: "1.1~bp2", Architecture: "amd64"}, //5
-		&Package{Name: "dpkg", Version: "1.0", Architecture: "i386"},     //6
-		&Package{Name: "xyz", Version: "1.0", Architecture: "sparc"},     //7
+		{Name: "lib", Version: "1.0", Architecture: "i386"},                      //0
+		{Name: "dpkg", Version: "1.7", Architecture: "i386"},                     //1
+		{Name: "data", Version: "1.1~bp1", Architecture: "all"},                  //2
+		{Name: "app", Version: "1.1~bp1", Architecture: "i386"},                  //3
+		{Name: "app", Version: "1.1~bp2", Architecture: "i386"},                  //4
+		{Name: "app", Version: "1.1~bp2", Architecture: "amd64"},                 //5
+		{Name: "dpkg", Version: "1.0", Architecture: "i386"},                     //6
+		{Name: "xyz", Version: "1.0", Architecture: "sparc"},                     //7
+		{Name: "dpkg", Version: "1.0", Architecture: "i386", FilesHash: 0x34445}, //8
+		{Name: "app", Version: "1.1~bp2", Architecture: "i386", FilesHash: 0x44}, //9
 	}
 
 	for _, p := range packages {
+		p.V06Plus = true
 		coll.Update(p)
 	}
 
@@ -255,35 +273,67 @@ func (s *PackageRefListSuite) TestMerge(c *C) {
 	listB.Add(packages[5])
 	listB.Add(packages[6])
 
+	listC := NewPackageList()
+	listC.Add(packages[0])
+	listC.Add(packages[8])
+	listC.Add(packages[9])
+
 	reflistA := NewPackageRefListFromPackageList(listA)
 	reflistB := NewPackageRefListFromPackageList(listB)
+	reflistC := NewPackageRefListFromPackageList(listC)
 
-	mergeAB := reflistA.Merge(reflistB, true)
-	mergeBA := reflistB.Merge(reflistA, true)
+	mergeAB := reflistA.Merge(reflistB, true, false)
+	mergeBA := reflistB.Merge(reflistA, true, false)
+	mergeAC := reflistA.Merge(reflistC, true, false)
+	mergeBC := reflistB.Merge(reflistC, true, false)
+	mergeCB := reflistC.Merge(reflistB, true, false)
 
 	c.Check(toStrSlice(mergeAB), DeepEquals,
-		[]string{"Pall data 1.1~bp1", "Pamd64 app 1.1~bp2", "Pi386 app 1.1~bp2", "Pi386 dpkg 1.0", "Pi386 lib 1.0", "Psparc xyz 1.0"})
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp2 00000000", "Pi386 dpkg 1.0 00000000", "Pi386 lib 1.0 00000000", "Psparc xyz 1.0 00000000"})
 	c.Check(toStrSlice(mergeBA), DeepEquals,
-		[]string{"Pall data 1.1~bp1", "Pamd64 app 1.1~bp2", "Pi386 app 1.1~bp1", "Pi386 dpkg 1.7", "Pi386 lib 1.0", "Psparc xyz 1.0"})
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp1 00000000", "Pi386 dpkg 1.7 00000000", "Pi386 lib 1.0 00000000", "Psparc xyz 1.0 00000000"})
+	c.Check(toStrSlice(mergeAC), DeepEquals,
+		[]string{"Pall data 1.1~bp1 00000000", "Pi386 app 1.1~bp2 00000044", "Pi386 dpkg 1.0 00034445", "Pi386 lib 1.0 00000000", "Psparc xyz 1.0 00000000"})
+	c.Check(toStrSlice(mergeBC), DeepEquals,
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp2 00000044", "Pi386 dpkg 1.0 00034445", "Pi386 lib 1.0 00000000"})
+	c.Check(toStrSlice(mergeCB), DeepEquals,
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp2 00000000", "Pi386 dpkg 1.0 00000000", "Pi386 lib 1.0 00000000"})
 
-	mergeABall := reflistA.Merge(reflistB, false)
-	mergeBAall := reflistB.Merge(reflistA, false)
+	mergeABall := reflistA.Merge(reflistB, false, false)
+	mergeBAall := reflistB.Merge(reflistA, false, false)
+	mergeACall := reflistA.Merge(reflistC, false, false)
+	mergeBCall := reflistB.Merge(reflistC, false, false)
+	mergeCBall := reflistC.Merge(reflistB, false, false)
 
 	c.Check(mergeABall, DeepEquals, mergeBAall)
 	c.Check(toStrSlice(mergeBAall), DeepEquals,
-		[]string{"Pall data 1.1~bp1", "Pamd64 app 1.1~bp2", "Pi386 app 1.1~bp1", "Pi386 app 1.1~bp2", "Pi386 dpkg 1.0", "Pi386 dpkg 1.7", "Pi386 lib 1.0", "Psparc xyz 1.0"})
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp1 00000000", "Pi386 app 1.1~bp2 00000000",
+			"Pi386 dpkg 1.0 00000000", "Pi386 dpkg 1.7 00000000", "Pi386 lib 1.0 00000000", "Psparc xyz 1.0 00000000"})
+
+	c.Check(mergeBCall, Not(DeepEquals), mergeCBall)
+	c.Check(toStrSlice(mergeACall), DeepEquals,
+		[]string{"Pall data 1.1~bp1 00000000", "Pi386 app 1.1~bp1 00000000", "Pi386 app 1.1~bp2 00000044", "Pi386 dpkg 1.0 00034445",
+			"Pi386 dpkg 1.7 00000000", "Pi386 lib 1.0 00000000", "Psparc xyz 1.0 00000000"})
+	c.Check(toStrSlice(mergeBCall), DeepEquals,
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp2 00000044", "Pi386 dpkg 1.0 00034445",
+			"Pi386 lib 1.0 00000000"})
+
+	mergeBCwithConflicts := reflistB.Merge(reflistC, false, true)
+	c.Check(toStrSlice(mergeBCwithConflicts), DeepEquals,
+		[]string{"Pall data 1.1~bp1 00000000", "Pamd64 app 1.1~bp2 00000000", "Pi386 app 1.1~bp2 00000000", "Pi386 app 1.1~bp2 00000044",
+			"Pi386 dpkg 1.0 00000000", "Pi386 dpkg 1.0 00034445", "Pi386 lib 1.0 00000000"})
 }
 
 func (s *PackageRefListSuite) TestFilterLatestRefs(c *C) {
 	packages := []*Package{
-		&Package{Name: "lib", Version: "1.0", Architecture: "i386"},
-		&Package{Name: "lib", Version: "1.2~bp1", Architecture: "i386"},
-		&Package{Name: "lib", Version: "1.2", Architecture: "i386"},
-		&Package{Name: "dpkg", Version: "1.2", Architecture: "i386"},
-		&Package{Name: "dpkg", Version: "1.3", Architecture: "i386"},
-		&Package{Name: "dpkg", Version: "1.3~bp2", Architecture: "i386"},
-		&Package{Name: "dpkg", Version: "1.5", Architecture: "i386"},
-		&Package{Name: "dpkg", Version: "1.6", Architecture: "i386"},
+		{Name: "lib", Version: "1.0", Architecture: "i386"},
+		{Name: "lib", Version: "1.2~bp1", Architecture: "i386"},
+		{Name: "lib", Version: "1.2", Architecture: "i386"},
+		{Name: "dpkg", Version: "1.2", Architecture: "i386"},
+		{Name: "dpkg", Version: "1.3", Architecture: "i386"},
+		{Name: "dpkg", Version: "1.3~bp2", Architecture: "i386"},
+		{Name: "dpkg", Version: "1.5", Architecture: "i386"},
+		{Name: "dpkg", Version: "1.6", Architecture: "i386"},
 	}
 
 	rl := NewPackageList()
@@ -297,7 +347,7 @@ func (s *PackageRefListSuite) TestFilterLatestRefs(c *C) {
 	rl.Add(packages[7])
 
 	result := NewPackageRefListFromPackageList(rl)
-	FilterLatestRefs(result)
+	result.FilterLatestRefs()
 
 	c.Check(toStrSlice(result), DeepEquals,
 		[]string{"Pi386 dpkg 1.6", "Pi386 lib 1.2"})

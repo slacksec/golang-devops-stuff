@@ -20,6 +20,8 @@ func makeCmdRepo() *commander.Command {
 			makeCmdRepoRemove(),
 			makeCmdRepoShow(),
 			makeCmdRepoRename(),
+			makeCmdRepoSearch(),
+			makeCmdRepoInclude(),
 		},
 	}
 }

@@ -1,0 +1,5 @@
+Origin: Debian
+Label: . wheezy
+Archive: wheezy
+Architecture: i386
+Component: main

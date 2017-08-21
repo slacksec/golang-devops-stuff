@@ -1,15 +1,17 @@
 Name: mirror14
-Archive Root URL: http://download.opensuse.org/repositories/home:/DeepDiver1975/xUbuntu_10.04/
-Distribution: ./
+Archive Root URL: https://cloud.r-project.org/bin/linux/debian/
+Distribution: ./jessie-cran3/
 Components: 
 Architectures: 
 Download Sources: no
+Download .udebs: no
 Last update: never
 
 Information from release file:
-Date: Tue May 21 21:01:30 2013
-Description:  Open Build Service home:DeepDiver1975 xUbuntu_10.04
-
-Label: DeepDiver1975's Home Project (xUbuntu_10.04)
-Origin: Open Build Service home:DeepDiver1975 xUbuntu_10.04
-Version: 0.00
+Architectures: i386 amd64 armel all
+Codename: jessie-cran3
+Components: main
+Date: Sun, 12 Mar 2017 23:23:14 UTC
+Label: CRAN Backports
+Origin: CRAN
+Suite: jessie-cran3

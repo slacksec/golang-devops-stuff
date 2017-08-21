@@ -4,17 +4,16 @@ Distribution: wheezy/updates
 Components: main
 Architectures: i386
 Download Sources: yes
+Download .udebs: no
 Last update: never
 
 Information from release file:
-Architectures: amd64 armel armhf i386 ia64 kfreebsd-amd64 kfreebsd-i386 mips mipsel powerpc s390 s390x sparc
+Architectures: amd64 armel armhf i386
 Codename: wheezy
 Components: updates/main updates/contrib updates/non-free
-Date: Tue, 11 Mar 2014 21:11:28 UTC
-Description:  Debian 7.0 Security Updates
+Description:  Long Term Support for Debian 7
 
 Label: Debian-Security
 Origin: Debian
-Suite: stable
-Valid-Until: Fri, 21 Mar 2014 21:11:28 UTC
+Suite: oldoldstable
 Version: 7.0

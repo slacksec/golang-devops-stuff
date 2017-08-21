@@ -1,11 +1,23 @@
 import os
 import hashlib
 import inspect
+import zlib
 from lib import BaseTest
 
 
 def strip_processor(output):
     return "\n".join([l for l in output.split("\n") if not l.startswith(' ') and not l.startswith('Date:')])
+
+
+def sorted_processor(output):
+    return "\n".join(sorted(output.split("\n")))
+
+
+def ungzip_if_required(output):
+    if output.startswith("\x1f\x8b"):
+        return zlib.decompress(output, 16+zlib.MAX_WBITS)
+
+    return output
 
 
 class PublishSnapshot1Test(BaseTest):
@@ -27,12 +39,18 @@ class PublishSnapshot1Test(BaseTest):
         self.check_exists('public/dists/maverick/Release')
         self.check_exists('public/dists/maverick/Release.gpg')
 
+        self.check_exists('public/dists/maverick/main/binary-i386/Release')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-i386.gz')
+        self.check_exists('public/dists/maverick/main/binary-amd64/Release')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-amd64.gz')
+        self.check_not_exists('public/dists/maverick/main/debian-installer/binary-i386/Packages')
+        self.check_not_exists('public/dists/maverick/main/debian-installer/binary-amd64/Packages')
 
         self.check_exists('public/pool/main/g/gnuplot/gnuplot-doc_4.6.1-1~maverick2_all.deb')
 
@@ -41,6 +59,12 @@ class PublishSnapshot1Test(BaseTest):
 
         self.check_file_contents('public/dists/maverick/main/binary-i386/Release', 'release_i386')
         self.check_file_contents('public/dists/maverick/main/binary-amd64/Release', 'release_amd64')
+
+        self.check_file_contents('public/dists/maverick/main/binary-i386/Packages', 'packages_i386', match_prepare=sorted_processor)
+        self.check_file_contents('public/dists/maverick/main/binary-amd64/Packages', 'packages_amd64', match_prepare=sorted_processor)
+
+        self.check_file_contents('public/dists/maverick/main/Contents-i386.gz', 'contents_i386', match_prepare=ungzip_if_required)
+        self.check_file_contents('public/dists/maverick/main/Contents-amd64.gz', 'contents_amd64', match_prepare=ungzip_if_required)
 
         # verify signatures
         self.run_cmd(["gpg", "--no-auto-check-trustdb", "--keyring", os.path.join(os.path.dirname(inspect.getsourcefile(BaseTest)), "files", "aptly.pub"),
@@ -67,8 +91,10 @@ class PublishSnapshot1Test(BaseTest):
                 h = hashlib.md5()
             elif len(fileHash) == 40:
                 h = hashlib.sha1()
-            else:
+            elif len(fileHash) == 64:
                 h = hashlib.sha256()
+            else:
+                h = hashlib.sha512()
 
             h.update(self.read_file(os.path.join('public/dists/maverick', path)))
 
@@ -77,7 +103,8 @@ class PublishSnapshot1Test(BaseTest):
 
         if pathsSeen != set(['main/binary-amd64/Packages', 'main/binary-i386/Packages', 'main/binary-i386/Packages.gz',
                              'main/binary-amd64/Packages.gz', 'main/binary-amd64/Packages.bz2', 'main/binary-i386/Packages.bz2',
-                             'main/binary-amd64/Release', 'main/binary-i386/Release']):
+                             'main/binary-amd64/Release', 'main/binary-i386/Release', 'main/Contents-amd64.gz',
+                             'main/Contents-i386.gz']):
             raise Exception("path seen wrong: %r" % (pathsSeen, ))
 
 
@@ -103,9 +130,11 @@ class PublishSnapshot2Test(BaseTest):
         self.check_exists('public/dists/squeeze/main/binary-i386/Packages')
         self.check_exists('public/dists/squeeze/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/squeeze/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/squeeze/main/Contents-i386.gz')
         self.check_exists('public/dists/squeeze/main/binary-amd64/Packages')
         self.check_exists('public/dists/squeeze/main/binary-amd64/Packages.gz')
         self.check_exists('public/dists/squeeze/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/squeeze/main/Contents-amd64.gz')
 
         self.check_exists('public/pool/main/g/gnuplot/gnuplot-doc_4.6.1-1~maverick2_all.deb')
 
@@ -135,9 +164,11 @@ class PublishSnapshot3Test(BaseTest):
         self.check_exists('public/dists/squeeze/contrib/binary-i386/Packages')
         self.check_exists('public/dists/squeeze/contrib/binary-i386/Packages.gz')
         self.check_exists('public/dists/squeeze/contrib/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/squeeze/contrib/Contents-i386.gz')
         self.check_exists('public/dists/squeeze/contrib/binary-amd64/Packages')
         self.check_exists('public/dists/squeeze/contrib/binary-amd64/Packages.gz')
         self.check_exists('public/dists/squeeze/contrib/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/squeeze/contrib/Contents-amd64.gz')
 
         self.check_exists('public/pool/contrib/g/gnuplot/gnuplot-doc_4.6.1-1~maverick2_all.deb')
 
@@ -167,9 +198,11 @@ class PublishSnapshot4Test(BaseTest):
         self.check_exists('public/dists/squeeze/main/binary-i386/Packages')
         self.check_exists('public/dists/squeeze/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/squeeze/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/squeeze/main/Contents-i386.gz')
         self.check_not_exists('public/dists/squeeze/main/binary-amd64/Packages')
         self.check_not_exists('public/dists/squeeze/main/binary-amd64/Packages.gz')
         self.check_not_exists('public/dists/squeeze/main/binary-amd64/Packages.bz2')
+        self.check_not_exists('public/dists/squeeze/main/Contents-amd64.gz')
 
         self.check_exists('public/pool/main/g/gnuplot/gnuplot-doc_4.6.1-1~maverick2_all.deb')
 
@@ -200,9 +233,11 @@ class PublishSnapshot5Test(BaseTest):
         self.check_exists('public/ppa/smira/dists/squeeze/main/binary-i386/Packages')
         self.check_exists('public/ppa/smira/dists/squeeze/main/binary-i386/Packages.gz')
         self.check_exists('public/ppa/smira/dists/squeeze/main/binary-i386/Packages.bz2')
+        self.check_exists('public/ppa/smira/dists/squeeze/main/Contents-i386.gz')
         self.check_exists('public/ppa/smira/dists/squeeze/main/binary-amd64/Packages')
         self.check_exists('public/ppa/smira/dists/squeeze/main/binary-amd64/Packages.gz')
         self.check_exists('public/ppa/smira/dists/squeeze/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/ppa/smira/dists/squeeze/main/Contents-amd64.gz')
 
         self.check_exists('public/ppa/smira/pool/main/g/gnuplot/gnuplot-doc_4.6.1-1~maverick2_all.deb')
 
@@ -316,9 +351,11 @@ class PublishSnapshot13Test(BaseTest):
         self.check_exists('public/dists/maverick/main/binary-i386/Packages')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-i386.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-amd64.gz')
 
         # verify contents except of sums
         self.check_file_contents('public/dists/maverick/Release', 'release', match_prepare=strip_processor)
@@ -359,9 +396,11 @@ class PublishSnapshot15Test(BaseTest):
         self.check_exists('public/dists/maverick/main/binary-i386/Packages')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-i386.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-amd64.gz')
 
         # verify contents except of sums
         self.check_file_contents('public/dists/maverick/Release', 'release', match_prepare=strip_processor)
@@ -389,12 +428,15 @@ class PublishSnapshot16Test(BaseTest):
         self.check_exists('public/dists/maverick/main/binary-i386/Packages')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-i386.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-amd64.gz')
         self.check_exists('public/dists/maverick/main/source/Sources')
         self.check_exists('public/dists/maverick/main/source/Sources.gz')
         self.check_exists('public/dists/maverick/main/source/Sources.bz2')
+        self.check_not_exists('public/dists/maverick/main/Contents-source.gz')
 
         self.check_exists('public/pool/main/g/gnuplot/gnuplot-doc_4.6.1-1~maverick2_all.deb')
         self.check_exists('public/pool/main/g/gnuplot/gnuplot_4.6.1-1~maverick2.debian.tar.gz')
@@ -435,9 +477,11 @@ class PublishSnapshot17Test(BaseTest):
         self.check_exists('public/dists/maverick/main/binary-i386/Packages')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-i386.gz')
         self.check_exists('public/dists/maverick/main/source/Sources')
         self.check_exists('public/dists/maverick/main/source/Sources.gz')
         self.check_exists('public/dists/maverick/main/source/Sources.bz2')
+        self.check_not_exists('public/dists/maverick/main/Contents-source.gz')
 
         self.check_exists('public/pool/main/p/pyspi/pyspi_0.6.1-1.3.dsc')
         self.check_exists('public/pool/main/p/pyspi/pyspi_0.6.1-1.3.diff.gz')
@@ -564,14 +608,14 @@ class PublishSnapshot23Test(BaseTest):
 
 class PublishSnapshot24Test(BaseTest):
     """
-    publish snapshot: custom origin
+    publish snapshot: custom origin, notautomatic and butautomaticupgrades
     """
     fixtureDB = True
     fixturePool = True
     fixtureCmds = [
         "aptly snapshot create snap24 from mirror gnuplot-maverick",
     ]
-    runCmd = "aptly publish snapshot -keyring=${files}/aptly.pub -secret-keyring=${files}/aptly.sec -distribution=squeeze -origin=aptly24 snap24"
+    runCmd = "aptly publish snapshot -keyring=${files}/aptly.pub -secret-keyring=${files}/aptly.sec -distribution=squeeze -origin=aptly24 -notautomatic=yes -butautomaticupgrades=yes snap24"
     gold_processor = BaseTest.expand_environ
 
     def check(self):
@@ -632,19 +676,24 @@ class PublishSnapshot26Test(BaseTest):
         self.check_exists('public/dists/maverick/main/binary-i386/Packages')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-i386.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.gz')
         self.check_exists('public/dists/maverick/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/maverick/main/Contents-amd64.gz')
         self.check_exists('public/dists/maverick/main/source/Sources')
         self.check_exists('public/dists/maverick/main/source/Sources.gz')
         self.check_exists('public/dists/maverick/main/source/Sources.bz2')
+        self.check_not_exists('public/dists/maverick/main/Contents-source.gz')
 
         self.check_exists('public/dists/maverick/contrib/binary-i386/Packages')
         self.check_exists('public/dists/maverick/contrib/binary-i386/Packages.gz')
         self.check_exists('public/dists/maverick/contrib/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/maverick/contrib/Contents-i386.gz')
         self.check_exists('public/dists/maverick/contrib/binary-amd64/Packages')
         self.check_exists('public/dists/maverick/contrib/binary-amd64/Packages.gz')
         self.check_exists('public/dists/maverick/contrib/binary-amd64/Packages.bz2')
+        self.check_not_exists('public/dists/maverick/contrib/Contents-amd64.gz')
         self.check_exists('public/dists/maverick/contrib/source/Sources')
         self.check_exists('public/dists/maverick/contrib/source/Sources.gz')
         self.check_exists('public/dists/maverick/contrib/source/Sources.bz2')
@@ -684,8 +733,10 @@ class PublishSnapshot26Test(BaseTest):
                 h = hashlib.md5()
             elif len(fileHash) == 40:
                 h = hashlib.sha1()
-            else:
+            elif len(fileHash) == 64:
                 h = hashlib.sha256()
+            else:
+                h = hashlib.sha512()
 
             h.update(self.read_file(os.path.join('public/dists/maverick', path)))
 
@@ -699,7 +750,8 @@ class PublishSnapshot26Test(BaseTest):
                              'contrib/binary-amd64/Packages.gz', 'contrib/binary-amd64/Packages.bz2', 'contrib/binary-i386/Packages.bz2',
                              'contrib/source/Sources', 'contrib/source/Sources.gz', 'contrib/source/Sources.bz2',
                              'main/binary-amd64/Release', 'main/binary-i386/Release', 'main/source/Release',
-                             'contrib/binary-amd64/Release', 'contrib/binary-i386/Release', 'contrib/source/Release']):
+                             'contrib/binary-amd64/Release', 'contrib/binary-i386/Release', 'contrib/source/Release',
+                             'contrib/Contents-i386.gz', 'main/Contents-i386.gz', 'main/Contents-amd64.gz']):
             raise Exception("path seen wrong: %r" % (pathsSeen, ))
 
 
@@ -781,7 +833,9 @@ class PublishSnapshot32Test(BaseTest):
     ]
     runCmd = "aptly publish snapshot -component=main,contrib snap32.1"
     expectedCode = 2
-    outputMatchPrepare = lambda _, s: "\n".join([l for l in s.split("\n") if l.startswith("ERROR")])
+
+    def outputMatchPrepare(_, s):
+        return "\n".join([l for l in s.split("\n") if l.startswith("ERROR")])
 
 
 class PublishSnapshot33Test(BaseTest):
@@ -822,3 +876,143 @@ class PublishSnapshot34Test(BaseTest):
         super(PublishSnapshot34Test, self).check()
 
         self.check_file_contents("public/pool/main/p/pyspi/pyspi_0.6.1.orig.tar.gz", "file")
+
+
+class PublishSnapshot35Test(BaseTest):
+    """
+    publish snapshot: mirror with udebs
+    """
+    fixtureGpg = True
+    fixtureCmds = [
+        "aptly -architectures=i386,amd64 mirror create -keyring=aptlytest.gpg -filter='$$Source (gnupg)' -with-udebs wheezy http://mirror.yandex.ru/debian/ wheezy main non-free",
+        "aptly mirror update -keyring=aptlytest.gpg wheezy",
+        "aptly snapshot create wheezy from mirror wheezy",
+    ]
+    runCmd = "aptly publish snapshot -keyring=${files}/aptly.pub -secret-keyring=${files}/aptly.sec wheezy"
+    gold_processor = BaseTest.expand_environ
+
+    def check(self):
+        super(PublishSnapshot35Test, self).check()
+
+        self.check_exists('public/dists/wheezy/InRelease')
+        self.check_exists('public/dists/wheezy/Release')
+        self.check_exists('public/dists/wheezy/Release.gpg')
+
+        self.check_exists('public/dists/wheezy/main/binary-i386/Release')
+        self.check_exists('public/dists/wheezy/main/binary-i386/Packages')
+        self.check_exists('public/dists/wheezy/main/binary-i386/Packages.gz')
+        self.check_exists('public/dists/wheezy/main/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/wheezy/main/Contents-i386.gz')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-i386/Release')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-i386/Packages')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-i386/Packages.gz')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-i386/Packages.bz2')
+        self.check_exists('public/dists/wheezy/main/Contents-udeb-i386.gz')
+        self.check_exists('public/dists/wheezy/main/binary-amd64/Release')
+        self.check_exists('public/dists/wheezy/main/binary-amd64/Packages')
+        self.check_exists('public/dists/wheezy/main/binary-amd64/Packages.gz')
+        self.check_exists('public/dists/wheezy/main/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/wheezy/main/Contents-amd64.gz')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-amd64/Release')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-amd64/Packages')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-amd64/Packages.gz')
+        self.check_exists('public/dists/wheezy/main/debian-installer/binary-amd64/Packages.bz2')
+        self.check_exists('public/dists/wheezy/main/Contents-udeb-amd64.gz')
+        self.check_not_exists('public/dists/wheezy/main/source/Sources')
+        self.check_not_exists('public/dists/wheezy/main/source/Sources.gz')
+        self.check_not_exists('public/dists/wheezy/main/source/Sources.bz2')
+
+        self.check_exists('public/pool/main/g/gnupg/gpgv-udeb_1.4.12-7+deb7u7_amd64.udeb')
+        self.check_exists('public/pool/main/g/gnupg/gpgv-udeb_1.4.12-7+deb7u7_i386.udeb')
+        self.check_exists('public/pool/main/g/gnupg/gpgv_1.4.12-7+deb7u7_amd64.deb')
+        self.check_exists('public/pool/main/g/gnupg/gpgv_1.4.12-7+deb7u7_i386.deb')
+
+        self.check_file_contents('public/dists/wheezy/main/binary-i386/Packages', 'packages_i386', match_prepare=sorted_processor)
+        self.check_file_contents('public/dists/wheezy/main/debian-installer/binary-i386/Packages', 'packages_udeb_i386', match_prepare=sorted_processor)
+        self.check_file_contents('public/dists/wheezy/main/binary-amd64/Packages', 'packages_amd64', match_prepare=sorted_processor)
+        self.check_file_contents('public/dists/wheezy/main/debian-installer/binary-amd64/Packages', 'packages_udeb_amd64', match_prepare=sorted_processor)
+
+        # verify contents except of sums
+        self.check_file_contents('public/dists/wheezy/Release', 'release', match_prepare=strip_processor)
+
+        self.check_file_contents('public/dists/wheezy/main/debian-installer/binary-i386/Release', 'release_udeb_i386', match_prepare=strip_processor)
+
+        # verify sums
+        release = self.read_file('public/dists/wheezy/Release').split("\n")
+        release = [l for l in release if l.startswith(" ")]
+        pathsSeen = set()
+        for l in release:
+            fileHash, fileSize, path = l.split()
+            pathsSeen.add(path)
+
+            fileSize = int(fileSize)
+
+            st = os.stat(os.path.join(os.environ["HOME"], ".aptly", 'public/dists/wheezy/', path))
+            if fileSize != st.st_size:
+                raise Exception("file size doesn't match for %s: %d != %d" % (path, fileSize, st.st_size))
+
+            if len(fileHash) == 32:
+                h = hashlib.md5()
+            elif len(fileHash) == 40:
+                h = hashlib.sha1()
+            elif len(fileHash) == 64:
+                h = hashlib.sha256()
+            else:
+                h = hashlib.sha512()
+
+            h.update(self.read_file(os.path.join('public/dists/wheezy', path)))
+
+            if h.hexdigest() != fileHash:
+                raise Exception("file hash doesn't match for %s: %s != %s" % (path, fileHash, h.hexdigest()))
+
+        pathsExepcted = set()
+        for arch in ("i386", "amd64"):
+            for udeb in ("", "debian-installer/"):
+                for ext in ("", ".gz", ".bz2"):
+                    pathsExepcted.add("main/%sbinary-%s/Packages%s" % (udeb, arch, ext))
+
+                pathsExepcted.add("main/Contents-%s%s.gz" % ("udeb-" if udeb != "" else "", arch))
+
+                pathsExepcted.add("main/%sbinary-%s/Release" % (udeb, arch))
+
+        if pathsSeen != pathsExepcted:
+            raise Exception("path seen wrong: %r != %r" % (pathsSeen, pathsExepcted))
+
+
+class PublishSnapshot36Test(BaseTest):
+    """
+    publish snapshot: -skip-contents
+    """
+    fixtureDB = True
+    fixturePool = True
+    fixtureCmds = [
+        "aptly snapshot create snap36 from mirror gnuplot-maverick",
+    ]
+    runCmd = "aptly publish snapshot -keyring=${files}/aptly.pub -secret-keyring=${files}/aptly.sec -skip-contents snap36"
+    gold_processor = BaseTest.expand_environ
+
+    def check(self):
+        super(PublishSnapshot36Test, self).check()
+
+        self.check_exists('public/dists/maverick/Release')
+        self.check_exists('public/dists/maverick/Release.gpg')
+
+        self.check_exists('public/dists/maverick/main/binary-i386/Release')
+        self.check_not_exists('public/dists/maverick/main/Contents-i386.gz')
+        self.check_exists('public/dists/maverick/main/binary-amd64/Release')
+        self.check_not_exists('public/dists/maverick/main/Contents-amd64.gz')
+
+
+class PublishSnapshot37Test(BaseTest):
+    """
+    publish snapshot: mirror with double mirror update
+    """
+    fixtureGpg = True
+    fixtureCmds = [
+        "aptly -architectures=i386,amd64 mirror create -keyring=aptlytest.gpg -filter='$$Source (gnupg)' -with-udebs wheezy http://mirror.yandex.ru/debian/ wheezy main non-free",
+        "aptly mirror update -keyring=aptlytest.gpg wheezy",
+        "aptly mirror update -keyring=aptlytest.gpg wheezy",
+        "aptly snapshot create wheezy from mirror wheezy",
+    ]
+    runCmd = "aptly publish snapshot -keyring=${files}/aptly.pub -secret-keyring=${files}/aptly.sec wheezy"
+    gold_processor = BaseTest.expand_environ

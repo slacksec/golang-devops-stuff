@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"fmt"
+
+	"github.com/AlekSi/pointer"
+	"github.com/smira/aptly/deb"
 	"github.com/smira/commander"
 	"github.com/smira/flag"
 )
@@ -23,16 +26,30 @@ func aptlyRepoEdit(cmd *commander.Command, args []string) error {
 		return fmt.Errorf("unable to edit: %s", err)
 	}
 
-	if context.flags.Lookup("comment").Value.String() != "" {
-		repo.Comment = context.flags.Lookup("comment").Value.String()
-	}
+	var uploadersFile *string
 
-	if context.flags.Lookup("distribution").Value.String() != "" {
-		repo.DefaultDistribution = context.flags.Lookup("distribution").Value.String()
-	}
+	context.Flags().Visit(func(flag *flag.Flag) {
+		switch flag.Name {
+		case "comment":
+			repo.Comment = flag.Value.String()
+		case "distribution":
+			repo.DefaultDistribution = flag.Value.String()
+		case "component":
+			repo.DefaultComponent = flag.Value.String()
+		case "uploaders-file":
+			uploadersFile = pointer.ToString(flag.Value.String())
+		}
+	})
 
-	if context.flags.Lookup("component").Value.String() != "" {
-		repo.DefaultComponent = context.flags.Lookup("component").Value.String()
+	if uploadersFile != nil {
+		if *uploadersFile != "" {
+			repo.Uploaders, err = deb.NewUploadersFromFile(*uploadersFile)
+			if err != nil {
+				return err
+			}
+		} else {
+			repo.Uploaders = nil
+		}
 	}
 
 	err = context.CollectionFactory().LocalRepoCollection().Update(repo)
@@ -50,7 +67,7 @@ func makeCmdRepoEdit() *commander.Command {
 		UsageLine: "edit <name>",
 		Short:     "edit properties of local repository",
 		Long: `
-Command edit allows to change metadata of local repository:
+Command edit allows one to change metadata of local repository:
 comment, default distribution and component.
 
 Example:
@@ -63,6 +80,7 @@ Example:
 	cmd.Flag.String("comment", "", "any text that would be used to described local repository")
 	cmd.Flag.String("distribution", "", "default distribution when publishing")
 	cmd.Flag.String("component", "", "default component when publishing")
+	cmd.Flag.String("uploaders-file", "", "uploaders.json to be used when including .changes into this repository")
 
 	return cmd
 }

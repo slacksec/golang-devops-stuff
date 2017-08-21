@@ -2,8 +2,10 @@ package deb
 
 import (
 	"errors"
+
 	"github.com/smira/aptly/database"
-	. "launchpad.net/gocheck"
+
+	. "gopkg.in/check.v1"
 )
 
 type SnapshotSuite struct {
@@ -15,7 +17,7 @@ var _ = Suite(&SnapshotSuite{})
 
 func (s *SnapshotSuite) SetUpTest(c *C) {
 	s.SetUpPackages()
-	s.repo, _ = NewRemoteRepo("yandex", "http://mirror.yandex.ru/debian/", "squeeze", []string{"main"}, []string{}, false)
+	s.repo, _ = NewRemoteRepo("yandex", "http://mirror.yandex.ru/debian/", "squeeze", []string{"main"}, []string{}, false, false)
 	s.repo.packageRefs = s.reflist
 }
 
@@ -24,7 +26,7 @@ func (s *SnapshotSuite) TestNewSnapshotFromRepository(c *C) {
 	c.Check(snapshot.Name, Equals, "snap1")
 	c.Check(snapshot.NumPackages(), Equals, 3)
 	c.Check(snapshot.RefList().Len(), Equals, 3)
-	c.Check(snapshot.SourceKind, Equals, "repo")
+	c.Check(snapshot.SourceKind, Equals, SourceRemoteRepo)
 	c.Check(snapshot.SourceIDs, DeepEquals, []string{s.repo.UUID})
 
 	s.repo.packageRefs = nil
@@ -35,11 +37,17 @@ func (s *SnapshotSuite) TestNewSnapshotFromRepository(c *C) {
 func (s *SnapshotSuite) TestNewSnapshotFromLocalRepo(c *C) {
 	localRepo := NewLocalRepo("lala", "hoorah!")
 
-	_, err := NewSnapshotFromLocalRepo("snap2", localRepo)
-	c.Check(err, ErrorMatches, "local repo doesn't have packages")
+	snapshot, err := NewSnapshotFromLocalRepo("snap2", localRepo)
+	c.Assert(err, IsNil)
+	c.Check(snapshot.Name, Equals, "snap2")
+	c.Check(snapshot.NumPackages(), Equals, 0)
+	c.Check(snapshot.RefList().Len(), Equals, 0)
+	c.Check(snapshot.SourceKind, Equals, "local")
+	c.Check(snapshot.SourceIDs, DeepEquals, []string{localRepo.UUID})
 
 	localRepo.UpdateRefList(s.reflist)
-	snapshot, _ := NewSnapshotFromLocalRepo("snap1", localRepo)
+	snapshot, err = NewSnapshotFromLocalRepo("snap1", localRepo)
+	c.Assert(err, IsNil)
 	c.Check(snapshot.Name, Equals, "snap1")
 	c.Check(snapshot.NumPackages(), Equals, 3)
 	c.Check(snapshot.RefList().Len(), Equals, 3)
@@ -104,15 +112,15 @@ type SnapshotCollectionSuite struct {
 var _ = Suite(&SnapshotCollectionSuite{})
 
 func (s *SnapshotCollectionSuite) SetUpTest(c *C) {
-	s.db, _ = database.OpenDB(c.MkDir())
+	s.db, _ = database.NewOpenDB(c.MkDir())
 	s.collection = NewSnapshotCollection(s.db)
 	s.SetUpPackages()
 
-	s.repo1, _ = NewRemoteRepo("yandex", "http://mirror.yandex.ru/debian/", "squeeze", []string{"main"}, []string{}, false)
+	s.repo1, _ = NewRemoteRepo("yandex", "http://mirror.yandex.ru/debian/", "squeeze", []string{"main"}, []string{}, false, false)
 	s.repo1.packageRefs = s.reflist
 	s.snapshot1, _ = NewSnapshotFromRepository("snap1", s.repo1)
 
-	s.repo2, _ = NewRemoteRepo("android", "http://mirror.yandex.ru/debian/", "lenny", []string{"main"}, []string{}, false)
+	s.repo2, _ = NewRemoteRepo("android", "http://mirror.yandex.ru/debian/", "lenny", []string{"main"}, []string{}, false, false)
 	s.repo2.packageRefs = s.reflist
 	s.snapshot2, _ = NewSnapshotFromRepository("snap2", s.repo2)
 
@@ -130,7 +138,7 @@ func (s *SnapshotCollectionSuite) TearDownTest(c *C) {
 }
 
 func (s *SnapshotCollectionSuite) TestAddByNameByUUID(c *C) {
-	snapshot, err := s.collection.ByName("snap1")
+	_, err := s.collection.ByName("snap1")
 	c.Assert(err, ErrorMatches, "*.not found")
 
 	c.Assert(s.collection.Add(s.snapshot1), IsNil)
@@ -138,7 +146,7 @@ func (s *SnapshotCollectionSuite) TestAddByNameByUUID(c *C) {
 
 	c.Assert(s.collection.Add(s.snapshot2), IsNil)
 
-	snapshot, err = s.collection.ByName("snap1")
+	snapshot, err := s.collection.ByName("snap1")
 	c.Assert(err, IsNil)
 	c.Assert(snapshot.String(), Equals, s.snapshot1.String())
 
@@ -192,9 +200,9 @@ func (s *SnapshotCollectionSuite) TestFindByRemoteRepoSource(c *C) {
 	c.Check(s.collection.ByRemoteRepoSource(s.repo1), DeepEquals, []*Snapshot{s.snapshot1})
 	c.Check(s.collection.ByRemoteRepoSource(s.repo2), DeepEquals, []*Snapshot{s.snapshot2})
 
-	repo3, _ := NewRemoteRepo("other", "http://mirror.yandex.ru/debian/", "lenny", []string{"main"}, []string{}, false)
+	repo3, _ := NewRemoteRepo("other", "http://mirror.yandex.ru/debian/", "lenny", []string{"main"}, []string{}, false, false)
 
-	c.Check(s.collection.ByRemoteRepoSource(repo3), DeepEquals, []*Snapshot{})
+	c.Check(s.collection.ByRemoteRepoSource(repo3), DeepEquals, []*Snapshot(nil))
 }
 
 func (s *SnapshotCollectionSuite) TestFindByLocalRepoSource(c *C) {
@@ -208,7 +216,7 @@ func (s *SnapshotCollectionSuite) TestFindByLocalRepoSource(c *C) {
 
 	lrepo3 := NewLocalRepo("other", "")
 
-	c.Check(s.collection.ByLocalRepoSource(lrepo3), DeepEquals, []*Snapshot{})
+	c.Check(s.collection.ByLocalRepoSource(lrepo3), DeepEquals, []*Snapshot(nil))
 }
 
 func (s *SnapshotCollectionSuite) TestFindSnapshotSource(c *C) {
@@ -224,7 +232,7 @@ func (s *SnapshotCollectionSuite) TestFindSnapshotSource(c *C) {
 
 	c.Check(s.collection.BySnapshotSource(s.snapshot1), DeepEquals, []*Snapshot{snapshot3, snapshot4})
 	c.Check(s.collection.BySnapshotSource(s.snapshot2), DeepEquals, []*Snapshot{snapshot3})
-	c.Check(s.collection.BySnapshotSource(snapshot5), DeepEquals, []*Snapshot{})
+	c.Check(s.collection.BySnapshotSource(snapshot5), DeepEquals, []*Snapshot(nil))
 }
 
 func (s *SnapshotCollectionSuite) TestDrop(c *C) {

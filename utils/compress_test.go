@@ -4,8 +4,9 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"io/ioutil"
-	. "launchpad.net/gocheck"
 	"os"
+
+	. "gopkg.in/check.v1"
 )
 
 type CompressSuite struct {
@@ -26,10 +27,8 @@ func (s *CompressSuite) TearDownTest(c *C) {
 }
 
 func (s *CompressSuite) TestCompress(c *C) {
-	err := CompressFile(s.tempfile)
+	err := CompressFile(s.tempfile, false)
 	c.Assert(err, IsNil)
-
-	buf := make([]byte, len(testString))
 
 	file, err := os.Open(s.tempfile.Name() + ".gz")
 	c.Assert(err, IsNil)
@@ -37,7 +36,7 @@ func (s *CompressSuite) TestCompress(c *C) {
 	gzReader, err := gzip.NewReader(file)
 	c.Assert(err, IsNil)
 
-	_, err = gzReader.Read(buf)
+	buf, err := ioutil.ReadAll(gzReader)
 	c.Assert(err, IsNil)
 
 	gzReader.Close()

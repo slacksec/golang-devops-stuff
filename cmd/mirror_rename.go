@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/smira/aptly/deb"
 	"github.com/smira/commander"
 )
@@ -20,6 +21,11 @@ func aptlyMirrorRename(cmd *commander.Command, args []string) error {
 	oldName, newName := args[0], args[1]
 
 	repo, err = context.CollectionFactory().RemoteRepoCollection().ByName(oldName)
+	if err != nil {
+		return fmt.Errorf("unable to rename: %s", err)
+	}
+
+	err = repo.CheckLock()
 	if err != nil {
 		return fmt.Errorf("unable to rename: %s", err)
 	}

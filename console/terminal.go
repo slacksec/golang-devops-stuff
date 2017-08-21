@@ -1,10 +1,9 @@
-// +build !freebsd
-
 package console
 
 import (
-	"code.google.com/p/go.crypto/ssh/terminal"
 	"syscall"
+
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 // RunningOnTerminal checks whether stdout is terminal
