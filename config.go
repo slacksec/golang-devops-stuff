@@ -19,35 +19,35 @@ import (
 )
 
 type Config struct {
-	BasePath          string   // Base URL path. e.g. "/"
 	Addr              []string // TCP addresses to listen on. e.g. ":1234", "1.2.3.4:1234" or "[::1]:1234"
 	MaxForks          int      // Number of allowable concurrent forks
 	LogLevel          libwebsocketd.LogLevel
+	RedirPort         int
 	CertFile, KeyFile string
 	*libwebsocketd.Config
 }
 
-type AddrList []string
+type Arglist []string
 
-func (al *AddrList) String() string {
+func (al *Arglist) String() string {
 	return fmt.Sprintf("%v", []string(*al))
 }
 
-func (al *AddrList) Set(value string) error {
+func (al *Arglist) Set(value string) error {
 	*al = append(*al, value)
 	return nil
 }
 
 // Borrowed from net/http/cgi
 var defaultPassEnv = map[string]string{
-	"darwin":  "DYLD_LIBRARY_PATH",
-	"freebsd": "LD_LIBRARY_PATH",
-	"hpux":    "LD_LIBRARY_PATH,SHLIB_PATH",
-	"irix":    "LD_LIBRARY_PATH,LD_LIBRARYN32_PATH,LD_LIBRARY64_PATH",
-	"linux":   "LD_LIBRARY_PATH",
-	"openbsd": "LD_LIBRARY_PATH",
-	"solaris": "LD_LIBRARY_PATH,LD_LIBRARY_PATH_32,LD_LIBRARY_PATH_64",
-	"windows": "SystemRoot,COMSPEC,PATHEXT,WINDIR",
+	"darwin":  "PATH,DYLD_LIBRARY_PATH",
+	"freebsd": "PATH,LD_LIBRARY_PATH",
+	"hpux":    "PATH,LD_LIBRARY_PATH,SHLIB_PATH",
+	"irix":    "PATH,LD_LIBRARY_PATH,LD_LIBRARYN32_PATH,LD_LIBRARY64_PATH",
+	"linux":   "PATH,LD_LIBRARY_PATH",
+	"openbsd": "PATH,LD_LIBRARY_PATH",
+	"solaris": "PATH,LD_LIBRARY_PATH,LD_LIBRARY_PATH_32,LD_LIBRARY_PATH_64",
+	"windows": "PATH,SystemRoot,COMSPEC,PATHEXT,WINDIR",
 }
 
 func parseCommandLine() *Config {
@@ -60,7 +60,7 @@ func parseCommandLine() *Config {
 	// If adding new command line options, also update the help text in help.go.
 	// The flag library's auto-generate help message isn't pretty enough.
 
-	addrlist := AddrList(make([]string, 0, 1)) // pre-reserve for 1 address
+	addrlist := Arglist(make([]string, 0, 1)) // pre-reserve for 1 address
 	flag.Var(&addrlist, "address", "Interfaces to bind to (e.g. 127.0.0.1 or [::1]).")
 
 	// server config options
@@ -72,10 +72,12 @@ func parseCommandLine() *Config {
 	sslCert := flag.String("sslcert", "", "Should point to certificate PEM file when --ssl is used")
 	sslKey := flag.String("sslkey", "", "Should point to certificate private key file when --ssl is used")
 	maxForksFlag := flag.Int("maxforks", 0, "Max forks, zero means unlimited")
+	closeMsFlag := flag.Uint("closems", 0, "Time to start sending signals (0 never)")
+	redirPortFlag := flag.Int("redirport", 0, "HTTP port to redirect to canonical --port address")
 
 	// lib config options
-	basePathFlag := flag.String("basepath", "/", "Base URL path (e.g /)")
-	reverseLookupFlag := flag.Bool("reverselookup", true, "Perform reverse DNS lookups on remote clients")
+	binaryFlag := flag.Bool("binary", false, "Set websocketd to experimental binary mode (default is line by line)")
+	reverseLookupFlag := flag.Bool("reverselookup", false, "Perform reverse DNS lookups on remote clients")
 	scriptDirFlag := flag.String("dir", "", "Base directory for WebSocket scripts")
 	staticDirFlag := flag.String("staticdir", "", "Serve static content from this directory over HTTP")
 	cgiDirFlag := flag.String("cgidir", "", "Serve CGI scripts from this directory over HTTP")
@@ -84,14 +86,22 @@ func parseCommandLine() *Config {
 	sameOriginFlag := flag.Bool("sameorigin", false, "Restrict upgrades if origin and host headers differ")
 	allowOriginsFlag := flag.String("origin", "", "Restrict upgrades if origin does not match the list")
 
+	headers := Arglist(make([]string, 0))
+	headersWs := Arglist(make([]string, 0))
+	headersHttp := Arglist(make([]string, 0))
+	flag.Var(&headers, "header", "Custom headers for any response.")
+	flag.Var(&headersWs, "header-ws", "Custom headers for successful WebSocket upgrade responses.")
+	flag.Var(&headersHttp, "header-http", "Custom headers for all but WebSocket upgrade HTTP responses.")
+
 	err := flag.CommandLine.Parse(os.Args[1:])
 	if err != nil {
 		if err == flag.ErrHelp {
 			PrintHelp()
+			os.Exit(0)
 		} else {
 			ShortHelp()
+			os.Exit(2)
 		}
-		os.Exit(2)
 	}
 
 	port := *portFlag
@@ -112,7 +122,7 @@ func parseCommandLine() *Config {
 		mainConfig.Addr = []string{fmt.Sprintf(":%d", port)}
 	}
 	mainConfig.MaxForks = *maxForksFlag
-	mainConfig.BasePath = *basePathFlag
+	mainConfig.RedirPort = *redirPortFlag
 	mainConfig.LogLevel = libwebsocketd.LevelFromString(*logLevelFlag)
 	if mainConfig.LogLevel == libwebsocketd.LogUnknown {
 		fmt.Printf("Incorrect loglevel flag '%s'. Use --help to see allowed values.\n", *logLevelFlag)
@@ -120,6 +130,12 @@ func parseCommandLine() *Config {
 		os.Exit(1)
 	}
 
+	config.Headers = []string(headers)
+	config.HeadersWs = []string(headersWs)
+	config.HeadersHTTP = []string(headersHttp)
+
+	config.CloseMs = *closeMsFlag
+	config.Binary = *binaryFlag
 	config.ReverseLookup = *reverseLookupFlag
 	config.Ssl = *sslFlag
 	config.ScriptDir = *scriptDirFlag
@@ -137,13 +153,13 @@ func parseCommandLine() *Config {
 
 	if *versionFlag {
 		fmt.Printf("%s %s\n", HelpProcessName(), Version())
-		os.Exit(2)
+		os.Exit(0)
 	}
 
 	if *licenseFlag {
 		fmt.Printf("%s %s\n", HelpProcessName(), Version())
 		fmt.Printf("%s\n", libwebsocketd.License)
-		os.Exit(2)
+		os.Exit(0)
 	}
 
 	// Reading SSL options

@@ -22,6 +22,8 @@ Any text printed by the process to `STDOUT` shall be sent as a WebSocket message
 Download
 --------
 
+If you're on a Mac, you can install `websocketd` using [Homebrew](http://brew.sh/). Just run `brew install websocketd`. For other operating systems, or if you don't want to use Homebrew, check out the link below.
+
 **[Download for Linux, OS X and Windows](https://github.com/joewalnes/websocketd/wiki/Download-and-install)**
 
 
@@ -36,7 +38,7 @@ __count.sh__:
 
 ```sh
 #!/bin/bash
-for COUNT in $(seq 1 10); do
+for ((COUNT = 1; COUNT <= 10; COUNT++)); do
   echo $COUNT
   sleep 1
 done
@@ -114,6 +116,7 @@ Example Projects
 
 *   [Plot real time Linux CPU/IO/Mem stats to a HTML5 dashboard using websocketd and vmstat](https://github.com/joewalnes/web-vmstats) _(for Linux)_
 *   [Remote JScript & VBScript code execution tool based on websocketd](https://github.com/dab00/ws-console) _(for Windows)_
+*   [Arbitrary REPL in the browser using websocketd](https://github.com/rowanthorpe/ws-repl)
 
 Got more examples? Open a pull request.
 
@@ -125,11 +128,3 @@ My Other Projects
 *   Visit [The Igloo Lab](http://theigloolab.com/) to see and subscribe to other thingies I make.
 
 And [follow @joewalnes](https://twitter.com/joewalnes)!
-
-=======
-
-[![githalytics.com alpha](https://cruel-carlota.pagodabox.com/aeb01930fd25ab098615558d14e52ccb "githalytics.com")](http://githalytics.com/joewalnes/websocketd)
-
-
-[![Bitdeli Badge](https://d2weczhvl823v0.cloudfront.net/joewalnes/websocketd/trend.png)](https://bitdeli.com/free "Bitdeli Badge")
-
