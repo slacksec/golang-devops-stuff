@@ -59,6 +59,7 @@ type Region struct {
 	SDBEndpoint            string
 	SNSEndpoint            string
 	SQSEndpoint            string
+	SESEndpoint            string
 	IAMEndpoint            string
 	ELBEndpoint            string
 	DynamoDBEndpoint       string
@@ -66,12 +67,16 @@ type Region struct {
 	AutoScalingEndpoint    string
 	RDSEndpoint            ServiceInfo
 	KinesisEndpoint        string
+	STSEndpoint            string
+	CloudFormationEndpoint string
+	ElastiCacheEndpoint    string
 }
 
 var Regions = map[string]Region{
 	APNortheast.Name:  APNortheast,
 	APSoutheast.Name:  APSoutheast,
 	APSoutheast2.Name: APSoutheast2,
+	EUCentral.Name:    EUCentral,
 	EUWest.Name:       EUWest,
 	USEast.Name:       USEast,
 	USWest.Name:       USWest,
@@ -164,6 +169,11 @@ func (s *Service) BuildError(r *http.Response) error {
 	return &err
 }
 
+type ServiceError interface {
+	error
+	ErrorCode() string
+}
+
 type ErrorResponse struct {
 	Errors    Error  `xml:"Error"`
 	RequestId string // A unique ID for tracking the request
@@ -181,6 +191,10 @@ func (err *Error) Error() string {
 	return fmt.Sprintf("Type: %s, Code: %s, Message: %s",
 		err.Type, err.Code, err.Message,
 	)
+}
+
+func (err *Error) ErrorCode() string {
+	return err.Code
 }
 
 type Auth struct {
@@ -201,6 +215,16 @@ func (a *Auth) Token() string {
 
 func (a *Auth) Expiration() time.Time {
 	return a.expiration
+}
+
+// To be used with other APIs that return auth credentials such as STS
+func NewAuth(accessKey, secretKey, token string, expiration time.Time) *Auth {
+	return &Auth{
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
+		token:      token,
+		expiration: expiration,
+	}
 }
 
 // ResponseMetadata
@@ -241,6 +265,9 @@ type credentials struct {
 	Expiration      string
 }
 
+// GetMetaData retrieves instance metadata about the current machine.
+//
+// See http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AESDG-chapter-instancedata.html for more details.
 func GetMetaData(path string) (contents []byte, err error) {
 	c := http.Client{
 		Transport: &http.Transport{
@@ -276,7 +303,15 @@ func GetMetaData(path string) (contents []byte, err error) {
 	return []byte(body), err
 }
 
-func getInstanceCredentials() (cred credentials, err error) {
+func GetRegion(regionName string) (region Region) {
+	region = Regions[regionName]
+	return
+}
+
+// GetInstanceCredentials creates an Auth based on the instance's role credentials.
+// If the running instance is not in EC2 or does not have a valid IAM role, an error will be returned.
+// For more info about setting up IAM roles, see http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html
+func GetInstanceCredentials() (cred credentials, err error) {
 	credentialPath := "iam/security-credentials/"
 
 	// Get the instance role
@@ -311,7 +346,7 @@ func GetAuth(accessKey string, secretKey, token string, expiration time.Time) (a
 	}
 
 	// Next try getting auth from the instance role
-	cred, err := getInstanceCredentials()
+	cred, err := GetInstanceCredentials()
 	if err == nil {
 		// Found auth, return
 		auth.AccessKey = cred.AccessKeyId
@@ -399,7 +434,7 @@ func CredentialFileAuth(filePath string, profile string, expiration time.Duratio
 
 	secretKey, ok := profileData["aws_secret_access_key"]
 	if !ok {
-		err = errors.New("The credentials file did not contain required attribute aws_access_key_id")
+		err = errors.New("The credentials file did not contain required attribute aws_secret_access_key")
 		return
 	}
 
@@ -483,7 +518,7 @@ func dialTimeout(network, addr string) (net.Conn, error) {
 	return net.DialTimeout(network, addr, time.Duration(2*time.Second))
 }
 
-func InstanceRegion() string {
+func AvailabilityZone() string {
 	transport := http.Transport{Dial: dialTimeout}
 	client := http.Client{
 		Transport: &transport,
@@ -497,10 +532,18 @@ func InstanceRegion() string {
 		if err != nil {
 			return "unknown"
 		} else {
-			b := string(body)
-			region := b[:len(b)-1]
-			return region
+			return string(body)
 		}
+	}
+}
+
+func InstanceRegion() string {
+	az := AvailabilityZone()
+	if az == "unknown" {
+		return az
+	} else {
+		region := az[:len(az)-1]
+		return region
 	}
 }
 
