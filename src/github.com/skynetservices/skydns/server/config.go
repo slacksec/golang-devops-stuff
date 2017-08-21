@@ -2,25 +2,32 @@
 // Use of this source code is governed by The MIT License (MIT) that can be
 // found in the LICENSE file.
 
-package main
+package server
 
 import (
-	"encoding/json"
+	"crypto"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/coreos/go-etcd/etcd"
-	"github.com/coreos/go-log/log"
 	"github.com/miekg/dns"
+)
+
+const (
+	SCacheCapacity = 10000
+	RCacheCapacity = 100000
+	RCacheTtl      = 60
+	Ndots          = 2
 )
 
 // Config provides options to the SkyDNS resolver.
 type Config struct {
 	// The ip:port SkyDNS should be listening on for incoming DNS requests.
 	DnsAddr string `json:"dns_addr,omitempty"`
+	// bind to port(s) activated by systemd. If set to true, this overrides DnsAddr.
+	Systemd bool `json:"systemd,omitempty"`
 	// The domain SkyDNS is authoritative for, defaults to skydns.local.
 	Domain string `json:"domain,omitempty"`
 	// Domain pointing to a key where service info is stored when being queried
@@ -31,8 +38,12 @@ type Config struct {
 	DNSSEC     string `json:"dnssec,omitempty"`
 	// Round robin A/AAAA replies. Default is true.
 	RoundRobin bool `json:"round_robin,omitempty"`
-	// List of ip:port, seperated by commas of recursive nameservers to forward queries to.
-	Nameservers []string      `json:"nameservers,omitempty"`
+	// Round robin selection of nameservers from among those listed, rather than have all forwarded requests try the first listed server first every time.
+	NSRotate bool `json:"ns_rotate,omitempty"`
+	// List of ip:port, separated by commas of recursive nameservers to forward queries to.
+	Nameservers []string `json:"nameservers,omitempty"`
+	// Never provide a recursive service.
+	NoRec       bool          `json:"no_rec,omitempty"`
 	ReadTimeout time.Duration `json:"read_timeout,omitempty"`
 	// Default priority on SRV records when none is given. Defaults to 10.
 	Priority uint16 `json:"priority"`
@@ -48,43 +59,28 @@ type Config struct {
 	RCacheTtl int `json:"rcache_ttl,omitempty"`
 	// How many labels a name should have before we allow forwarding. Default to 2.
 	Ndots int `json:"ndot,omitempty"`
+	// Etcd flag that dictates if etcd version 3 is supported during skydns' run. Default to false.
+	Etcd3 bool
 
 	// DNSSEC key material
-	PubKey       *dns.DNSKEY    `json:"-"`
-	KeyTag       uint16         `json:"-"`
-	PrivKey      dns.PrivateKey `json:"-"`
-	DomainLabels int            `json:"-"`
+	PubKey  *dns.DNSKEY   `json:"-"`
+	KeyTag  uint16        `json:"-"`
+	PrivKey crypto.Signer `json:"-"`
 
-	log *log.Logger
+	Verbose bool `json:"-"`
+
+	Version bool
 
 	// some predefined string "constants"
 	localDomain string // "local.dns." + config.Domain
-	dnsDomain   string // "dns". + config.Domain
+	dnsDomain   string // "ns.dns". + config.Domain
+
+	// Stub zones support. Pointer to a map that we refresh when we see
+	// an update. Map contains domainname -> nameserver:port
+	stub *map[string][]string
 }
 
-func loadConfig(client *etcd.Client, config *Config) (*Config, error) {
-	config.log = log.New("skydns", false,
-		log.CombinedSink(os.Stderr, "[%s] %s %-9s | %s\n", []string{"prefix", "time", "priority", "message"}))
-
-	// Override wat isn't set yet from the command line.
-	n, err := client.Get("/skydns/config", false, false)
-	if err != nil {
-		config.log.Info("falling back to default configuration, could not read from etcd:", err)
-		if err := setDefaults(config); err != nil {
-			return nil, err
-		}
-		return config, nil
-	}
-	if err := json.Unmarshal([]byte(n.Node.Value), &config); err != nil {
-		return nil, err
-	}
-	if err := setDefaults(config); err != nil {
-		return nil, err
-	}
-	return config, nil
-}
-
-func setDefaults(config *Config) error {
+func SetDefaults(config *Config) error {
 	if config.ReadTimeout == 0 {
 		config.ReadTimeout = 2 * time.Second
 	}
@@ -95,7 +91,7 @@ func setDefaults(config *Config) error {
 		config.Domain = "skydns.local."
 	}
 	if config.Hostmaster == "" {
-		config.Hostmaster = "hostmaster." + config.Domain
+		config.Hostmaster = appendDomain("hostmaster", config.Domain)
 	}
 	// People probably don't know that SOA's email addresses cannot
 	// contain @-signs, replace them with dots
@@ -119,20 +115,21 @@ func setDefaults(config *Config) error {
 		config.RCacheTtl = RCacheTtl
 	}
 	if config.Ndots <= 0 {
-		config.Ndots = 2
+		config.Ndots = Ndots
 	}
 
 	if len(config.Nameservers) == 0 {
 		c, err := dns.ClientConfigFromFile("/etc/resolv.conf")
-		if err != nil {
-			return err
-		}
-		for _, s := range c.Servers {
-			config.Nameservers = append(config.Nameservers, net.JoinHostPort(s, c.Port))
+		if !os.IsNotExist(err) {
+			if err != nil {
+				return err
+			}
+			for _, s := range c.Servers {
+				config.Nameservers = append(config.Nameservers, net.JoinHostPort(s, c.Port))
+			}
 		}
 	}
 	config.Domain = dns.Fqdn(strings.ToLower(config.Domain))
-	config.DomainLabels = dns.CountLabel(config.Domain)
 	if config.DNSSEC != "" {
 		// For some reason the + are replaces by spaces in etcd. Re-replace them
 		keyfile := strings.Replace(config.DNSSEC, " ", "+", -1)
@@ -148,7 +145,16 @@ func setDefaults(config *Config) error {
 		config.KeyTag = k.KeyTag()
 		config.PrivKey = p
 	}
-	config.localDomain = "local.dns." + config.Domain
-	config.dnsDomain = "dns." + config.Domain
+	config.localDomain = appendDomain("local.dns", config.Domain)
+	config.dnsDomain = appendDomain("ns.dns", config.Domain)
+	stubmap := make(map[string][]string)
+	config.stub = &stubmap
 	return nil
+}
+
+func appendDomain(s1, s2 string) string {
+	if len(s2) > 0 && s2[0] == '.' {
+		return s1 + s2
+	}
+	return s1 + "." + s2
 }

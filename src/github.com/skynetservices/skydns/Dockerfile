@@ -1,8 +1,9 @@
-FROM crosbymichael/golang
+FROM alpine:latest
 MAINTAINER Miek Gieben <miek@miek.nl> (@miekg)
 
-ADD . /go/src/github.com/skynetservices/skydns
-RUN go get github.com/skynetservices/skydns
+RUN apk --update add bind-tools && rm -rf /var/cache/apk/*
 
-EXPOSE 53
-ENTRYPOINT ["skydns"]
+ADD skydns skydns
+
+EXPOSE 53 53/udp
+ENTRYPOINT ["/skydns"]
