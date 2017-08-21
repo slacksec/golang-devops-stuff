@@ -1,6 +1,7 @@
 package models_test
 
 import (
+	"code.cloudfoundry.org/lager"
 	. "github.com/cloudfoundry/hm9000/models"
 	. "github.com/cloudfoundry/hm9000/testhelpers/custommatchers"
 	. "github.com/onsi/ginkgo"
@@ -165,7 +166,7 @@ var _ = Describe("DesiredAppState", func() {
 		})
 
 		It("should return correct message", func() {
-			Ω(desiredAppState.LogDescription()).Should(Equal(map[string]string{
+			Ω(desiredAppState.LogDescription()).Should(Equal(lager.Data{
 				"AppGuid":           "app_guid_abc",
 				"AppVersion":        "app_version_123",
 				"NumberOfInstances": "3",

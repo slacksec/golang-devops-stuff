@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"code.cloudfoundry.org/lager"
 )
 
 type App struct {
@@ -45,13 +47,11 @@ func (a *App) ToJSON() []byte {
 		AppGuid    string `json:"droplet"`
 		AppVersion string `json:"version"`
 
-		Desired            DesiredAppState     `json:"desired"`
 		InstanceHeartbeats []InstanceHeartbeat `json:"instance_heartbeats"`
 		CrashCounts        []CrashCount        `json:"crash_counts"`
 	}{
 		a.AppGuid,
 		a.AppVersion,
-		a.Desired,
 		a.InstanceHeartbeats,
 		crashCounts,
 	}
@@ -60,7 +60,7 @@ func (a *App) ToJSON() []byte {
 	return result
 }
 
-func (a *App) LogDescription() map[string]string {
+func (a *App) LogDescription() lager.Data {
 	var desired string
 	if a.IsDesired() {
 		desired = fmt.Sprintf(`{"NumberOfInstances":%d,"State":"%s","PackageState":"%s"}`, a.Desired.NumberOfInstances, a.Desired.State, a.Desired.PackageState)
@@ -78,7 +78,7 @@ func (a *App) LogDescription() map[string]string {
 		crashCounts = append(crashCounts, fmt.Sprintf(`{"InstanceIndex":%d, "CrashCount":%d}`, crashCount.InstanceIndex, crashCount.CrashCount))
 	}
 
-	return map[string]string{
+	return lager.Data{
 		"AppGuid":            a.AppGuid,
 		"AppVersion":         a.AppVersion,
 		"Desired":            desired,
@@ -204,6 +204,10 @@ func (a *App) HasStartingOrRunningInstanceAtIndex(index int) bool {
 	}
 
 	return false
+}
+
+func (a *App) HasEvacuatingInstanceAtIndex(index int) bool {
+	return len(a.EvacuatingInstancesAtIndex(index)) > 0
 }
 
 func (a *App) HasCrashedInstanceAtIndex(index int) bool {

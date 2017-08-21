@@ -3,23 +3,24 @@ package desiredstatefetcher_test
 import (
 	"errors"
 	"fmt"
+
 	"github.com/cloudfoundry/hm9000/config"
 	. "github.com/cloudfoundry/hm9000/desiredstatefetcher"
 	"github.com/cloudfoundry/hm9000/models"
-	storepackage "github.com/cloudfoundry/hm9000/store"
 	"github.com/cloudfoundry/hm9000/testhelpers/appfixture"
 	. "github.com/cloudfoundry/hm9000/testhelpers/custommatchers"
 	"github.com/cloudfoundry/hm9000/testhelpers/fakelogger"
-	"github.com/cloudfoundry/hm9000/testhelpers/fakemetricsaccountant"
 	"github.com/cloudfoundry/storeadapter/fakestoreadapter"
+	"code.cloudfoundry.org/clock/fakeclock"
 
-	"github.com/cloudfoundry/gunk/timeprovider/faketimeprovider"
-	"github.com/cloudfoundry/hm9000/testhelpers/fakehttpclient"
 	"time"
+
+	"github.com/cloudfoundry/hm9000/testhelpers/fakehttpclient"
+
+	"net/http"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"net/http"
 )
 
 type brokenReader struct{}
@@ -34,93 +35,90 @@ func (b *brokenReader) Close() error {
 
 var _ = Describe("DesiredStateFetcher", func() {
 	var (
-		conf              *config.Config
-		fetcher           *DesiredStateFetcher
-		httpClient        *fakehttpclient.FakeHttpClient
-		timeProvider      *faketimeprovider.FakeTimeProvider
-		store             storepackage.Store
-		storeAdapter      *fakestoreadapter.FakeStoreAdapter
-		resultChan        chan DesiredStateFetcherResult
-		metricsAccountant *fakemetricsaccountant.FakeMetricsAccountant
+		conf         *config.Config
+		fetcher      *DesiredStateFetcher
+		httpClient   *fakehttpclient.FakeHttpClient
+		timeProvider *fakeclock.FakeClock
+		storeAdapter *fakestoreadapter.FakeStoreAdapter
+		resultChan   chan DesiredStateFetcherResult
+		appQueue     *models.AppQueue
 	)
 
 	BeforeEach(func() {
 		var err error
 		conf, err = config.DefaultConfig()
-		Ω(err).ShouldNot(HaveOccurred())
-
-		metricsAccountant = fakemetricsaccountant.New()
+		Expect(err).ToNot(HaveOccurred())
 
 		resultChan = make(chan DesiredStateFetcherResult, 1)
-		timeProvider = &faketimeprovider.FakeTimeProvider{
-			TimeToProvide: time.Unix(100, 0),
-		}
+		timeProvider = fakeclock.NewFakeClock(time.Unix(100, 0))
 
 		httpClient = fakehttpclient.NewFakeHttpClient()
 		storeAdapter = fakestoreadapter.New()
-		store = storepackage.NewStore(conf, storeAdapter, fakelogger.NewFakeLogger())
 
-		fetcher = New(conf, store, metricsAccountant, httpClient, timeProvider, fakelogger.NewFakeLogger())
-		fetcher.Fetch(resultChan)
+		appQueue = models.NewAppQueue()
+
+		fetcher = New(conf, httpClient, timeProvider, fakelogger.NewFakeLogger())
+	})
+
+	JustBeforeEach(func() {
+		fetcher.Fetch(resultChan, appQueue)
+	})
+
+	AfterEach(func() {
+
 	})
 
 	Describe("Fetching with an invalid URL", func() {
 		BeforeEach(func() {
 			conf.CCBaseURL = "http://example.com/#%ZZ"
-			fetcher = New(conf, store, metricsAccountant, httpClient, timeProvider, fakelogger.NewFakeLogger())
-			fetcher.Fetch(resultChan)
+			fetcher = New(conf, httpClient, timeProvider, fakelogger.NewFakeLogger())
 		})
 
-		It("should send an error down the result channel", func(done Done) {
-			result := <-resultChan
-			Ω(result.Success).Should(BeFalse())
-			Ω(result.Message).Should(Equal("Failed to generate URL request"))
-			Ω(result.Error).Should(HaveOccurred())
-			close(done)
-		}, 0.1)
+		It("should send an error down the result channel", func() {
+			var result DesiredStateFetcherResult
+			Eventually(resultChan).Should(Receive(&result))
+			Expect(result.Success).To(BeFalse())
+			Expect(result.Message).To(Equal("Failed to generate URL request"))
+			Expect(result.Error).To(HaveOccurred())
+		})
 	})
 
 	Describe("Fetching batches", func() {
 		var response DesiredStateServerResponse
 
 		It("should make the correct request", func() {
-			Ω(httpClient.Requests).Should(HaveLen(1))
+			Expect(httpClient.Requests).To(HaveLen(1))
 			request := httpClient.Requests[0]
 
-			Ω(request.URL.String()).Should(ContainSubstring(conf.CCBaseURL))
-			Ω(request.URL.Path).Should(ContainSubstring("/bulk/apps"))
+			Expect(request.URL.String()).To(ContainSubstring(conf.CCBaseURL))
+			Expect(request.URL.Path).To(ContainSubstring("/bulk/apps"))
 
 			expectedAuth := models.BasicAuthInfo{
 				User:     "mcat",
 				Password: "testing",
 			}.Encode()
 
-			Ω(request.Header.Get("Authorization")).Should(Equal(expectedAuth))
+			Expect(request.Header.Get("Authorization")).To(Equal(expectedAuth))
 		})
 
 		It("should request a batch size with an empty bulk token", func() {
 			query := httpClient.LastRequest().URL.Query()
-			Ω(query.Get("batch_size")).Should(Equal(fmt.Sprintf("%d", conf.DesiredStateBatchSize)))
-			Ω(query.Get("bulk_token")).Should(Equal("{}"))
+			Expect(query.Get("batch_size")).To(Equal(fmt.Sprintf("%d", conf.DesiredStateBatchSize)))
+			Expect(query.Get("bulk_token")).To(Equal("{}"))
 		})
 
 		assertFailure := func(expectedMessage string, numRequests int) {
 			It("should stop requesting batches", func() {
-				Ω(httpClient.Requests).Should(HaveLen(numRequests))
+				Expect(httpClient.Requests).To(HaveLen(numRequests))
 			})
 
-			It("should not bump the freshness", func() {
-				fresh, _ := store.IsDesiredStateFresh()
-				Ω(fresh).Should(BeFalse())
+			It("should send an error down the result channel", func() {
+				var result DesiredStateFetcherResult
+				Eventually(resultChan).Should(Receive(&result))
+				Expect(result.Success).To(BeFalse())
+				Expect(result.Message).To(Equal(expectedMessage))
+				Expect(result.Error).To(HaveOccurred())
 			})
-
-			It("should send an error down the result channel", func(done Done) {
-				result := <-resultChan
-				Ω(result.Success).Should(BeFalse())
-				Ω(result.Message).Should(Equal(expectedMessage))
-				Ω(result.Error).Should(HaveOccurred())
-				close(done)
-			}, 1.0)
 		}
 
 		Context("when a response with desired state is received", func() {
@@ -137,7 +135,6 @@ var _ = Describe("DesiredStateFetcher", func() {
 
 			BeforeEach(func() {
 				deletedApp = appfixture.NewAppFixture()
-				store.SyncDesiredState(deletedApp.DesiredState(1))
 
 				a1 = appfixture.NewAppFixture()
 				a2 = appfixture.NewAppFixture()
@@ -166,28 +163,23 @@ var _ = Describe("DesiredStateFetcher", func() {
 						Id: 5,
 					},
 				}
+			})
 
+			JustBeforeEach(func() {
 				httpClient.LastRequest().Succeed(response.ToJSON())
 			})
 
-			It("should not store the desired state (yet)", func() {
-				desired, _ := store.GetDesiredState()
-				Ω(desired).Should(HaveLen(1))
-				Ω(desired[deletedApp.DesiredState(1).StoreKey()]).Should(EqualDesiredState(deletedApp.DesiredState(1)))
-			})
-
 			It("should request the next batch", func() {
-				Ω(httpClient.Requests).Should(HaveLen(2))
-				Ω(httpClient.LastRequest().URL.Query().Get("bulk_token")).Should(Equal(response.BulkTokenRepresentation()))
-			})
-
-			It("should not bump the freshness yet", func() {
-				fresh, _ := store.IsDesiredStateFresh()
-				Ω(fresh).Should(BeFalse())
+				Expect(httpClient.Requests).To(HaveLen(2))
+				Expect(httpClient.LastRequest().URL.Query().Get("bulk_token")).To(Equal(response.BulkTokenRepresentation()))
 			})
 
 			It("should not send a result down the resultChan yet", func() {
-				Ω(resultChan).Should(HaveLen(0))
+				Expect(resultChan).To(HaveLen(0))
+			})
+
+			It("should send a batch of desired state down the appQueue", func() {
+				Expect(appQueue.DesiredApps).To(HaveLen(1))
 			})
 
 			Context("when an empty response is received", func() {
@@ -203,54 +195,56 @@ var _ = Describe("DesiredStateFetcher", func() {
 				})
 
 				It("should stop requesting batches", func() {
-					Ω(httpClient.Requests).Should(HaveLen(2))
+					Expect(httpClient.Requests).To(HaveLen(2))
 				})
 
-				It("should bump the freshness", func() {
-					fresh, _ := store.IsDesiredStateFresh()
-					Ω(fresh).Should(BeTrue())
+				It("has sent all the desired apps state on the appQueue's DesiredApps channel", func() {
+					var desired map[string]models.DesiredAppState
+
+					Eventually(appQueue.DesiredApps).Should(Receive(&desired))
+					Expect(desired).To(HaveLen(3))
+					Expect(desired).To(ContainElement(EqualDesiredState(a1.DesiredState(1))))
+					Expect(desired).To(ContainElement(EqualDesiredState(a2.DesiredState(1))))
+					Expect(desired).To(ContainElement(EqualDesiredState(pendingStagingDesiredState)))
 				})
 
-				It("should store any desired state that is in the STARTED appstate and STAGED package state, and delete any stale data", func() {
-					desired, _ := store.GetDesiredState()
-					Ω(desired).Should(HaveLen(3))
-					Ω(desired).Should(ContainElement(EqualDesiredState(a1.DesiredState(1))))
-					Ω(desired).Should(ContainElement(EqualDesiredState(a2.DesiredState(1))))
-					Ω(desired).Should(ContainElement(EqualDesiredState(pendingStagingDesiredState)))
-				})
-
-				It("should track the time taken to sync desired state", func() {
-					Ω(metricsAccountant.TrackedDesiredStateSyncTime).ShouldNot(BeZero())
-				})
-
-				It("should send a succesful result down the result channel", func(done Done) {
-					result := <-resultChan
-					Ω(result.Success).Should(BeTrue())
-					Ω(result.Message).Should(BeZero())
-					Ω(result.Error).ShouldNot(HaveOccurred())
-					close(done)
-				}, 0.1)
-
-				Context("and it fails to write to the store", func() {
-					BeforeEach(func() {
-						storeAdapter.SetErrInjector = fakestoreadapter.NewFakeStoreAdapterErrorInjector("desired", errors.New("oops!"))
-					})
-
-					assertFailure("Failed to sync desired state to the store", 2)
-				})
-
-				Context("and it fails to read from the store", func() {
-					BeforeEach(func() {
-						storeAdapter.ListErrInjector = fakestoreadapter.NewFakeStoreAdapterErrorInjector("apps", errors.New("oops!"))
-					})
-
-					assertFailure("Failed to sync desired state to the store", 2)
+				It("should send a succesful result down the result channel", func() {
+					var result DesiredStateFetcherResult
+					Eventually(resultChan).Should(Receive(&result))
+					Expect(result.Success).To(BeTrue())
+					Expect(result.Message).To(BeZero())
+					Expect(result.Error).ToNot(HaveOccurred())
 				})
 			})
 		})
 
-		Context("when an unauthorized response is received", func() {
+		Context("when the analyzer encountered is not analyzing", func() {
 			BeforeEach(func() {
+				close(appQueue.DoneAnalyzing)
+				a1 := appfixture.NewAppFixture()
+
+				response = DesiredStateServerResponse{
+					Results: map[string]models.DesiredAppState{
+						a1.AppGuid: a1.DesiredState(1),
+					},
+					BulkToken: BulkToken{
+						Id: 1,
+					},
+				}
+
+				// Fill up the app queue with info so sendBatch cannot send
+				appQueue.DesiredApps <- map[string]models.DesiredAppState{}
+			})
+
+			JustBeforeEach(func() {
+				httpClient.LastRequest().Succeed(response.ToJSON())
+			})
+
+			assertFailure("Stopping fetcher", 1)
+		})
+
+		Context("when an unauthorized response is received", func() {
+			JustBeforeEach(func() {
 				httpClient.LastRequest().RespondWithStatus(http.StatusUnauthorized)
 			})
 
@@ -258,7 +252,7 @@ var _ = Describe("DesiredStateFetcher", func() {
 		})
 
 		Context("when the HTTP request returns a non-200 response", func() {
-			BeforeEach(func() {
+			JustBeforeEach(func() {
 				httpClient.LastRequest().RespondWithStatus(http.StatusNotFound)
 			})
 
@@ -266,7 +260,7 @@ var _ = Describe("DesiredStateFetcher", func() {
 		})
 
 		Context("when the HTTP request fails with an error", func() {
-			BeforeEach(func() {
+			JustBeforeEach(func() {
 				httpClient.LastRequest().RespondWithError(errors.New(":("))
 			})
 
@@ -274,7 +268,7 @@ var _ = Describe("DesiredStateFetcher", func() {
 		})
 
 		Context("when a broken body is received", func() {
-			BeforeEach(func() {
+			JustBeforeEach(func() {
 				response := &http.Response{
 					Status:     "StatusOK (200)",
 					StatusCode: http.StatusOK,
@@ -290,7 +284,7 @@ var _ = Describe("DesiredStateFetcher", func() {
 		})
 
 		Context("when a malformed response is received", func() {
-			BeforeEach(func() {
+			JustBeforeEach(func() {
 				httpClient.LastRequest().Succeed([]byte("ß"))
 			})
 

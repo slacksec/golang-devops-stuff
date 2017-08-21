@@ -4,18 +4,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/cloudfoundry/gunk/timeprovider"
-	"github.com/cloudfoundry/hm9000/config"
-	"github.com/cloudfoundry/hm9000/helpers/logger"
-	"github.com/cloudfoundry/hm9000/models"
-	"github.com/cloudfoundry/storeadapter"
 	"os"
 	"sort"
 	"strings"
 	"time"
+
+	"code.cloudfoundry.org/lager"
+	"github.com/cloudfoundry/hm9000/config"
+	"github.com/cloudfoundry/hm9000/models"
+	"github.com/cloudfoundry/storeadapter"
+	"code.cloudfoundry.org/clock"
 )
 
-func Dump(l logger.Logger, conf *config.Config, raw bool) {
+func Dump(l lager.Logger, conf *config.Config, raw bool) {
 	if raw {
 		dumpRaw(l, conf)
 	} else {
@@ -23,11 +24,11 @@ func Dump(l logger.Logger, conf *config.Config, raw bool) {
 	}
 }
 
-func dumpStructured(l logger.Logger, conf *config.Config) {
-	timeProvider := buildTimeProvider(l)
-	store, _ := connectToStore(l, conf)
-	fmt.Printf("Dump - Current timestamp %d\n", timeProvider.Time().Unix())
-	err := store.VerifyFreshness(timeProvider.Time())
+func dumpStructured(l lager.Logger, conf *config.Config) {
+	clock := buildClock(l)
+	store := connectToStore(l, conf)
+	fmt.Printf("Dump - Current timestamp %d\n", clock.Now().Unix())
+	err := store.VerifyFreshness(clock.Now())
 	if err == nil {
 		fmt.Printf("Store is fresh\n")
 	} else {
@@ -59,11 +60,11 @@ func dumpStructured(l logger.Logger, conf *config.Config) {
 	}
 	sort.Sort(appKeys)
 	for _, appKey := range appKeys {
-		dumpApp(apps[appKey], starts, stops, timeProvider)
+		dumpApp(apps[appKey], starts, stops, clock)
 	}
 }
 
-func dumpApp(app *models.App, starts map[string]models.PendingStartMessage, stops map[string]models.PendingStopMessage, timeProvider timeprovider.TimeProvider) {
+func dumpApp(app *models.App, starts map[string]models.PendingStartMessage, stops map[string]models.PendingStopMessage, clock clock.Clock) {
 	fmt.Printf("\n")
 	fmt.Printf("Guid: %s | Version: %s\n", app.AppGuid, app.AppVersion)
 	if app.IsDesired() {
@@ -115,9 +116,9 @@ func dumpApp(app *models.App, starts map[string]models.PendingStartMessage, stop
 			}
 			if start.SentOn != 0 {
 				message = append(message, "send:SENT")
-				message = append(message, fmt.Sprintf("delete:%s", time.Unix(start.SentOn+int64(start.KeepAlive), 0).Sub(timeProvider.Time())))
+				message = append(message, fmt.Sprintf("delete:%s", time.Unix(start.SentOn+int64(start.KeepAlive), 0).Sub(clock.Now())))
 			} else {
-				message = append(message, fmt.Sprintf("send:%s", time.Unix(start.SendOn, 0).Sub(timeProvider.Time())))
+				message = append(message, fmt.Sprintf("send:%s", time.Unix(start.SendOn, 0).Sub(clock.Now())))
 			}
 
 			fmt.Printf("    %s\n", strings.Join(message, " "))
@@ -131,9 +132,9 @@ func dumpApp(app *models.App, starts map[string]models.PendingStartMessage, stop
 			message = append(message, stop.InstanceGuid)
 			if stop.SentOn != 0 {
 				message = append(message, "send:SENT")
-				message = append(message, fmt.Sprintf("delete:%s", time.Unix(stop.SentOn+int64(stop.KeepAlive), 0).Sub(timeProvider.Time())))
+				message = append(message, fmt.Sprintf("delete:%s", time.Unix(stop.SentOn+int64(stop.KeepAlive), 0).Sub(clock.Now())))
 			} else {
-				message = append(message, fmt.Sprintf("send:%s", time.Unix(stop.SendOn, 0).Sub(timeProvider.Time())))
+				message = append(message, fmt.Sprintf("send:%s", time.Unix(stop.SendOn, 0).Sub(clock.Now())))
 			}
 
 			fmt.Printf("    %s\n", strings.Join(message, " "))
@@ -141,8 +142,8 @@ func dumpApp(app *models.App, starts map[string]models.PendingStartMessage, stop
 	}
 }
 
-func dumpRaw(l logger.Logger, conf *config.Config) {
-	storeAdapter, _ := connectToStoreAdapter(l, conf)
+func dumpRaw(l lager.Logger, conf *config.Config) {
+	storeAdapter := connectToStoreAdapter(l, conf)
 	fmt.Printf("Raw Dump - Current timestamp %d\n", time.Now().Unix())
 
 	entries := sort.StringSlice{}

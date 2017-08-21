@@ -2,10 +2,12 @@ package store
 
 import (
 	"fmt"
-	"github.com/cloudfoundry/hm9000/models"
-	"github.com/cloudfoundry/storeadapter"
 	"strconv"
 	"time"
+
+	"code.cloudfoundry.org/lager"
+	"github.com/cloudfoundry/hm9000/models"
+	"github.com/cloudfoundry/storeadapter"
 )
 
 func (store *RealStore) crashCountStoreKey(crashCount models.CrashCount) string {
@@ -26,7 +28,7 @@ func (store *RealStore) SaveCrashCounts(crashCounts ...models.CrashCount) error 
 
 	err := store.adapter.SetMulti(nodes)
 
-	store.logger.Debug(fmt.Sprintf("Save Duration Crash Counts"), map[string]string{
+	store.logger.Debug(fmt.Sprintf("Save Duration Crash Counts"), lager.Data{
 		"Number of Items": fmt.Sprintf("%d", len(crashCounts)),
 		"Duration":        fmt.Sprintf("%.4f seconds", time.Since(t).Seconds()),
 	})
@@ -35,10 +37,10 @@ func (store *RealStore) SaveCrashCounts(crashCounts ...models.CrashCount) error 
 
 func (store *RealStore) getCrashCounts() (results []models.CrashCount, err error) {
 	node, err := store.adapter.ListRecursively(store.SchemaRoot() + "/apps/crashes")
-
-	if err == storeadapter.ErrorKeyNotFound {
-		return results, nil
-	} else if err != nil {
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			return results, nil
+		}
 		return results, err
 	}
 
@@ -55,9 +57,10 @@ func (store *RealStore) getCrashCounts() (results []models.CrashCount, err error
 
 func (store *RealStore) getCrashCountForApp(appGuid string, appVersion string) (results []models.CrashCount, err error) {
 	node, err := store.adapter.ListRecursively(store.SchemaRoot() + "/apps/crashes/" + store.AppKey(appGuid, appVersion))
-	if err == storeadapter.ErrorKeyNotFound {
-		return []models.CrashCount{}, nil
-	} else if err != nil {
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			return []models.CrashCount{}, nil
+		}
 		return []models.CrashCount{}, err
 	}
 

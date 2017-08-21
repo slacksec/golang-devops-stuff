@@ -2,16 +2,15 @@ package store
 
 import (
 	"fmt"
-	"github.com/cloudfoundry/hm9000/models"
-	"github.com/cloudfoundry/storeadapter"
 	"strings"
 	"time"
+
+	"code.cloudfoundry.org/lager"
+	"github.com/cloudfoundry/hm9000/models"
+	"github.com/cloudfoundry/storeadapter"
 )
 
-func (store *RealStore) ensureCacheIsReady() error {
-	store.instanceHeartbeatCacheMutex.Lock()
-	defer store.instanceHeartbeatCacheMutex.Unlock()
-
+func (store *RealStore) loadCache() error {
 	if time.Since(store.instanceHeartbeatCacheTimestamp) >= store.config.StoreHeartbeatCacheRefreshInterval() {
 		t := time.Now()
 		heartbeats, err := store.GetInstanceHeartbeats()
@@ -19,38 +18,57 @@ func (store *RealStore) ensureCacheIsReady() error {
 			return err
 		}
 
+		store.instanceHeartbeatCacheTimestamp = t
+		store.heartbeatCache = map[string]map[string]struct{}{}
 		store.instanceHeartbeatCache = map[string]models.InstanceHeartbeat{}
 		for _, heartbeat := range heartbeats {
 			store.instanceHeartbeatCache[heartbeat.InstanceGuid] = heartbeat
+			dea, found := store.heartbeatCache[heartbeat.DeaGuid]
+			if !found {
+				dea = map[string]struct{}{}
+				store.heartbeatCache[heartbeat.DeaGuid] = dea
+			}
+			dea[heartbeat.InstanceGuid] = struct{}{}
 		}
-		store.instanceHeartbeatCacheTimestamp = time.Now()
-		store.logger.Debug("Busting store cache", map[string]string{
+		store.logger.Debug("Rebuild store cache", lager.Data{
 			"Duration":                   time.Since(t).String(),
 			"Instance Heartbeats Loaded": fmt.Sprintf("%d", len(store.instanceHeartbeatCache)),
 		})
-
 	}
 
 	return nil
 }
 
-func (store *RealStore) SyncHeartbeats(incomingHeartbeats ...models.Heartbeat) error {
+func (store *RealStore) SyncHeartbeats(incomingHeartbeats ...*models.Heartbeat) ([]models.InstanceHeartbeat, error) {
 	t := time.Now()
 
-	err := store.ensureCacheIsReady()
+	store.instanceHeartbeatCacheMutex.Lock()
+	defer store.instanceHeartbeatCacheMutex.Unlock()
+
+	err := store.loadCache()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	nodesToSave := []storeadapter.StoreNode{}
+	heartbeatsToEvac := []models.InstanceHeartbeat{}
 	keysToDelete := []string{}
 	numberOfInstanceHeartbeats := 0
 
-	store.instanceHeartbeatCacheMutex.Lock()
+	latestHeartbeats := map[string]*models.Heartbeat{}
+	for _, heartbeat := range incomingHeartbeats {
+		latestHeartbeats[heartbeat.DeaGuid] = heartbeat
+	}
 
-	for _, incomingHeartbeat := range incomingHeartbeats {
+	for _, incomingHeartbeat := range latestHeartbeats {
 		numberOfInstanceHeartbeats += len(incomingHeartbeat.InstanceHeartbeats)
 		incomingInstanceGuids := map[string]bool{}
+		deaHeartbeat, found := store.heartbeatCache[incomingHeartbeat.DeaGuid]
+		if !found {
+			deaHeartbeat = map[string]struct{}{}
+			store.heartbeatCache[incomingHeartbeat.DeaGuid] = deaHeartbeat
+		}
+
 		nodesToSave = append(nodesToSave, store.deaPresenceNode(incomingHeartbeat.DeaGuid))
 		for _, incomingInstanceHeartbeat := range incomingHeartbeat.InstanceHeartbeats {
 			incomingInstanceGuids[incomingInstanceHeartbeat.InstanceGuid] = true
@@ -60,75 +78,87 @@ func (store *RealStore) SyncHeartbeats(incomingHeartbeats ...models.Heartbeat) e
 				continue
 			}
 
+			if incomingInstanceHeartbeat.State == models.InstanceStateEvacuating && existingInstanceHeartbeat.State != models.InstanceStateCrashed {
+				heartbeatsToEvac = append(heartbeatsToEvac, incomingInstanceHeartbeat)
+			}
+
 			nodesToSave = append(nodesToSave, store.storeNodeForInstanceHeartbeat(incomingInstanceHeartbeat))
 			store.instanceHeartbeatCache[incomingInstanceHeartbeat.InstanceGuid] = incomingInstanceHeartbeat
+			deaHeartbeat[incomingInstanceHeartbeat.InstanceGuid] = struct{}{}
 		}
 
 		cacheKeysToDelete := []string{}
-
-		for _, existingInstanceHeartbeat := range store.instanceHeartbeatCache {
-			if existingInstanceHeartbeat.DeaGuid == incomingHeartbeat.DeaGuid && !incomingInstanceGuids[existingInstanceHeartbeat.InstanceGuid] {
+		for instanceGuid, _ := range deaHeartbeat {
+			if !incomingInstanceGuids[instanceGuid] {
+				existingInstanceHeartbeat := store.instanceHeartbeatCache[instanceGuid]
 				key := store.instanceHeartbeatStoreKey(existingInstanceHeartbeat.AppGuid, existingInstanceHeartbeat.AppVersion, existingInstanceHeartbeat.InstanceGuid)
 				keysToDelete = append(keysToDelete, key)
 				cacheKeysToDelete = append(cacheKeysToDelete, existingInstanceHeartbeat.InstanceGuid)
 			}
 		}
 
-		for _, key := range cacheKeysToDelete {
-			delete(store.instanceHeartbeatCache, key)
+		for _, k := range cacheKeysToDelete {
+			delete(deaHeartbeat, k)
+			delete(store.instanceHeartbeatCache, k)
+		}
+
+		if len(deaHeartbeat) == 0 {
+			delete(store.heartbeatCache, incomingHeartbeat.DeaGuid)
 		}
 	}
-
-	store.instanceHeartbeatCacheMutex.Unlock()
 
 	tSave := time.Now()
 	err = store.adapter.SetMulti(nodesToSave)
 	dtSave := time.Since(tSave).Seconds()
 
 	if err != nil {
-		return err
+		return heartbeatsToEvac, err
 	}
 
 	tDelete := time.Now()
 	err = store.adapter.Delete(keysToDelete...)
 	dtDelete := time.Since(tDelete).Seconds()
 
-	if err == storeadapter.ErrorKeyNotFound {
-		store.logger.Debug("store.SyncHeartbeats Failed to delete a key, soldiering on...")
-	} else if err != nil {
-		return err
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			store.logger.Debug("store.SyncHeartbeats Failed to delete a key, soldiering on...")
+		} else {
+			return heartbeatsToEvac, err
+		}
 	}
 
-	store.logger.Debug(fmt.Sprintf("Save Duration Actual"), map[string]string{
-		"Number of Heartbeats":          fmt.Sprintf("%d", len(incomingHeartbeats)),
-		"Number of Instance Heartbeats": fmt.Sprintf("%d", numberOfInstanceHeartbeats),
-		"Number of Items Saved":         fmt.Sprintf("%d", len(nodesToSave)),
-		"Number of Items Deleted":       fmt.Sprintf("%d", len(keysToDelete)),
-		"Duration":                      fmt.Sprintf("%.4f seconds", time.Since(t).Seconds()),
-		"Save Duration":                 fmt.Sprintf("%.4f seconds", dtSave),
-		"Delete Duration":               fmt.Sprintf("%.4f seconds", dtDelete),
+	store.logger.Debug(fmt.Sprintf("Save Duration Actual"), lager.Data{
+		"Number of Received Heartbeats":  fmt.Sprintf("%d", len(incomingHeartbeats)),
+		"Number of Processed Heartbeats": fmt.Sprintf("%d", len(latestHeartbeats)),
+		"Number of Instance Heartbeats":  fmt.Sprintf("%d", numberOfInstanceHeartbeats),
+		"Number of Items Saved":          fmt.Sprintf("%d", len(nodesToSave)),
+		"Number of Items Deleted":        fmt.Sprintf("%d", len(keysToDelete)),
+		"Duration":                       fmt.Sprintf("%.4f seconds", time.Since(t).Seconds()),
+		"Save Duration":                  fmt.Sprintf("%.4f seconds", dtSave),
+		"Delete Duration":                fmt.Sprintf("%.4f seconds", dtDelete),
 	})
 
-	return nil
+	return heartbeatsToEvac, nil
 }
 
 func (store *RealStore) GetInstanceHeartbeats() (results []models.InstanceHeartbeat, err error) {
 	results = []models.InstanceHeartbeat{}
 	node, err := store.adapter.ListRecursively(store.SchemaRoot() + "/apps/actual")
-	if err == storeadapter.ErrorKeyNotFound {
-		return results, nil
-	} else if err != nil {
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			return results, nil
+		}
 		return results, err
 	}
 
-	unexpiredDeas, err := store.unexpiredDeas()
+	deaCache, err := store.GetDeaCache()
 	if err != nil {
 		return results, err
 	}
 
 	expiredKeys := []string{}
 	for _, actualNode := range node.ChildNodes {
-		heartbeats, toDelete, err := store.heartbeatsForNode(actualNode, unexpiredDeas)
+		heartbeats, toDelete, err := store.heartbeatsForNode(actualNode, deaCache)
 		if err != nil {
 			return []models.InstanceHeartbeat{}, nil
 		}
@@ -137,10 +167,12 @@ func (store *RealStore) GetInstanceHeartbeats() (results []models.InstanceHeartb
 	}
 
 	err = store.adapter.Delete(expiredKeys...)
-	if err == storeadapter.ErrorKeyNotFound {
-		store.logger.Debug("store.GetInstanceHeartbeats Failed to delete a key, soldiering on...")
-	} else if err != nil {
-		return []models.InstanceHeartbeat{}, err
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			store.logger.Debug("store.GetInstanceHeartbeats Failed to delete a key, soldiering on...")
+		} else {
+			return []models.InstanceHeartbeat{}, err
+		}
 	}
 
 	return results, nil
@@ -148,34 +180,38 @@ func (store *RealStore) GetInstanceHeartbeats() (results []models.InstanceHeartb
 
 func (store *RealStore) GetInstanceHeartbeatsForApp(appGuid string, appVersion string) (results []models.InstanceHeartbeat, err error) {
 	node, err := store.adapter.ListRecursively(store.SchemaRoot() + "/apps/actual/" + store.AppKey(appGuid, appVersion))
-	if err == storeadapter.ErrorKeyNotFound {
-		return []models.InstanceHeartbeat{}, nil
-	} else if err != nil {
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			return []models.InstanceHeartbeat{}, nil
+		}
 		return []models.InstanceHeartbeat{}, err
 	}
 
-	unexpiredDeas, err := store.unexpiredDeas()
+	deaCache, err := store.GetDeaCache()
 	if err != nil {
 		return results, err
 	}
 
-	results, expiredKeys, err := store.heartbeatsForNode(node, unexpiredDeas)
+	results, expiredKeys, err := store.heartbeatsForNode(node, deaCache)
 	if err != nil {
 		return []models.InstanceHeartbeat{}, err
 	}
 
 	err = store.adapter.Delete(expiredKeys...)
-	if err == storeadapter.ErrorKeyNotFound {
-		store.logger.Debug("store.GetInstanceHeartbeatsForApp Failed to delete a key, soldiering on...")
-	} else if err != nil {
-		return []models.InstanceHeartbeat{}, err
+	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			store.logger.Debug("store.GetInstanceHeartbeatsForApp Failed to delete a key, soldiering on...")
+		} else {
+			return []models.InstanceHeartbeat{}, err
+		}
 	}
 
 	return results, nil
 }
 
-func (store *RealStore) heartbeatsForNode(node storeadapter.StoreNode, unexpiredDeas map[string]bool) (results []models.InstanceHeartbeat, toDelete []string, err error) {
+func (store *RealStore) heartbeatsForNode(node storeadapter.StoreNode, deaCache map[string]struct{}) (results []models.InstanceHeartbeat, toDelete []string, err error) {
 	results = []models.InstanceHeartbeat{}
+
 	for _, heartbeatNode := range node.ChildNodes {
 		components := strings.Split(heartbeatNode.Key, "/")
 		instanceGuid := components[len(components)-1]
@@ -185,9 +221,7 @@ func (store *RealStore) heartbeatsForNode(node storeadapter.StoreNode, unexpired
 			return []models.InstanceHeartbeat{}, []string{}, err
 		}
 
-		_, deaIsPresent := unexpiredDeas[heartbeat.DeaGuid]
-
-		if deaIsPresent {
+		if _, ok := store.deaCache[heartbeat.DeaGuid]; ok {
 			results = append(results, heartbeat)
 		} else {
 			toDelete = append(toDelete, heartbeatNode.Key)
@@ -197,21 +231,30 @@ func (store *RealStore) heartbeatsForNode(node storeadapter.StoreNode, unexpired
 	return results, toDelete, nil
 }
 
-func (store *RealStore) unexpiredDeas() (results map[string]bool, err error) {
-	results = map[string]bool{}
+func (store *RealStore) GetDeaCache() (map[string]struct{}, error) {
+	store.deaLock.Lock()
+	defer store.deaLock.Unlock()
 
-	summaryNodes, err := store.adapter.ListRecursively(store.SchemaRoot() + "/dea-presence")
-	if err == storeadapter.ErrorKeyNotFound {
-		return results, nil
-	} else if err != nil {
-		return results, err
+	if time.Now().After(store.deaCacheExperationTimestamp) {
+		deaCache := map[string]struct{}{}
+
+		summaryNodes, err := store.adapter.ListRecursively(store.SchemaRoot() + "/dea-presence")
+		if err != nil {
+			if storeErr, ok := err.(storeadapter.Error); !ok || storeErr.Type() != storeadapter.ErrorKeyNotFound {
+				store.logger.Error("Error in updating Dea cache from the store", err)
+				return deaCache, err
+			}
+		}
+
+		for _, deaPresenceNode := range summaryNodes.ChildNodes {
+			deaCache[string(deaPresenceNode.Value)] = struct{}{}
+		}
+
+		store.deaCache = deaCache
+		store.deaCacheExperationTimestamp = time.Now().Add(time.Duration(store.config.HeartbeatPeriod) * time.Second)
 	}
 
-	for _, deaPresenceNode := range summaryNodes.ChildNodes {
-		results[string(deaPresenceNode.Value)] = true
-	}
-
-	return results, nil
+	return store.deaCache, nil
 }
 
 func (store *RealStore) instanceHeartbeatStoreKey(appGuid string, appVersion string, instanceGuid string) string {

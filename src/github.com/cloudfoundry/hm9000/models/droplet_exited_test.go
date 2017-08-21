@@ -2,6 +2,8 @@ package models_test
 
 import (
 	"encoding/json"
+
+	"code.cloudfoundry.org/lager"
 	. "github.com/cloudfoundry/hm9000/models"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -69,7 +71,7 @@ var _ = Describe("DropletExited", func() {
 
 	Describe("LogDescription", func() {
 		It("should return the correct message", func() {
-			Ω(dropletExited.LogDescription()).Should(Equal(map[string]string{
+			Ω(dropletExited.LogDescription()).Should(Equal(lager.Data{
 				"AppGuid":         "app_guid_abc",
 				"AppVersion":      "app_version_123",
 				"InstanceGuid":    "instance_guid_xyz",

@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"code.cloudfoundry.org/lager"
 )
 
 type PendingStartMessageReason string
@@ -59,8 +61,8 @@ func newPendingMessage(now time.Time, delayInSeconds int, keepAliveInSeconds int
 	}
 }
 
-func (message PendingMessage) pendingLogDescription() map[string]string {
-	return map[string]string{
+func (message PendingMessage) pendingLogDescription() lager.Data {
+	return lager.Data{
 		"SendOn":     time.Unix(message.SendOn, 0).String(),
 		"SentOn":     time.Unix(message.SentOn, 0).String(),
 		"KeepAlive":  strconv.Itoa(int(message.KeepAlive)),
@@ -113,17 +115,21 @@ type sortablePendingStartMessagesByPriority []PendingStartMessage
 func (s sortablePendingStartMessagesByPriority) Len() int      { return len(s) }
 func (s sortablePendingStartMessagesByPriority) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s sortablePendingStartMessagesByPriority) Less(i, j int) bool {
-	return s[i].Priority < s[j].Priority
+	diff := s[i].SendOn - s[j].SendOn
+	if diff == 0 {
+		return s[i].Priority > s[j].Priority
+	}
+	return diff < 0
 }
 
-func SortStartMessagesByPriority(messages map[string]PendingStartMessage) []PendingStartMessage {
+func SortStartMessagesByPriority(messages []PendingStartMessage) []PendingStartMessage {
 	sortedStartMessages := make(sortablePendingStartMessagesByPriority, len(messages))
 	i := 0
 	for _, message := range messages {
 		sortedStartMessages[i] = message
 		i++
 	}
-	sort.Sort(sort.Reverse(sortedStartMessages))
+	sort.Sort(sortedStartMessages)
 	return sortedStartMessages
 }
 
@@ -136,7 +142,7 @@ func (message PendingStartMessage) ToJSON() []byte {
 	return encoded
 }
 
-func (message PendingStartMessage) LogDescription() map[string]string {
+func (message PendingStartMessage) LogDescription() lager.Data {
 	base := message.pendingLogDescription()
 	base["IndexToStart"] = strconv.Itoa(message.IndexToStart)
 	base["SkipVerification"] = strconv.FormatBool(message.SkipVerification)
@@ -178,7 +184,7 @@ func (message PendingStopMessage) StoreKey() string {
 	return message.InstanceGuid
 }
 
-func (message PendingStopMessage) LogDescription() map[string]string {
+func (message PendingStopMessage) LogDescription() lager.Data {
 	base := message.pendingLogDescription()
 	base["InstanceGuid"] = message.InstanceGuid
 	base["StopReason"] = string(message.StopReason)

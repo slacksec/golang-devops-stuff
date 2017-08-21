@@ -15,6 +15,11 @@ var (
 	simulator         *Simulator
 	cliRunner         *CLIRunner
 	startStopListener *startstoplistener.StartStopListener
+	metronAgent       *Metron
+)
+
+const (
+	IterationTimeout = 20.0
 )
 
 func TestMCAT(t *testing.T) {
@@ -25,22 +30,26 @@ func TestMCAT(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	hm9000Binary, err := gexec.Build("github.com/cloudfoundry/hm9000")
-	Ω(err).ShouldNot(HaveOccurred())
+	Expect(err).ToNot(HaveOccurred())
 
 	coordinator = NewMCATCoordinator(hm9000Binary, ginkgoConfig.GinkgoConfig.ParallelNode, ginkgoConfig.DefaultReporterConfig.Verbose)
 
 	coordinator.StartNats()
 	coordinator.StartDesiredStateServer()
 	coordinator.StartStartStopListener()
+	coordinator.StartMetron()
 	coordinator.StartETCD()
+	coordinator.StartConsulRunner()
 })
 
 var _ = BeforeEach(func() {
-	cliRunner, simulator, startStopListener = coordinator.PrepForNextTest()
+	cliRunner, simulator, startStopListener, metronAgent = coordinator.PrepForNextTest()
+	coordinator.ResetConsulRunner()
 })
 
 var _ = AfterSuite(func() {
 	coordinator.StopETCD()
 	coordinator.StopAllExternalProcesses()
 	gexec.CleanupBuildArtifacts()
+	coordinator.StopConsulRunner()
 })

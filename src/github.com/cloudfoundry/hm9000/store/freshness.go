@@ -2,14 +2,11 @@ package store
 
 import (
 	"encoding/json"
+	"time"
+
 	"github.com/cloudfoundry/hm9000/models"
 	"github.com/cloudfoundry/storeadapter"
-	"time"
 )
-
-func (store *RealStore) BumpDesiredFreshness(timestamp time.Time) error {
-	return store.bumpFreshness(store.SchemaRoot()+store.config.DesiredFreshnessKey, store.config.DesiredFreshnessTTL(), timestamp)
-}
 
 func (store *RealStore) BumpActualFreshness(timestamp time.Time) error {
 	return store.bumpFreshness(store.SchemaRoot()+store.config.ActualFreshnessKey, store.config.ActualFreshnessTTL(), timestamp)
@@ -38,23 +35,12 @@ func (store *RealStore) bumpFreshness(key string, ttl uint64, timestamp time.Tim
 	})
 }
 
-func (store *RealStore) IsDesiredStateFresh() (bool, error) {
-	_, err := store.adapter.Get(store.SchemaRoot() + store.config.DesiredFreshnessKey)
-	if err == storeadapter.ErrorKeyNotFound {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 func (store *RealStore) IsActualStateFresh(currentTime time.Time) (bool, error) {
 	node, err := store.adapter.Get(store.SchemaRoot() + store.config.ActualFreshnessKey)
-	if err == storeadapter.ErrorKeyNotFound {
-		return false, nil
-	}
 	if err != nil {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
+			return false, nil
+		}
 		return false, err
 	}
 
@@ -69,22 +55,9 @@ func (store *RealStore) IsActualStateFresh(currentTime time.Time) (bool, error) 
 }
 
 func (store *RealStore) VerifyFreshness(time time.Time) error {
-	desiredFresh, err := store.IsDesiredStateFresh()
-	if err != nil {
-		return err
-	}
-
 	actualFresh, err := store.IsActualStateFresh(time)
 	if err != nil {
 		return err
-	}
-
-	if !desiredFresh && !actualFresh {
-		return ActualAndDesiredAreNotFreshError
-	}
-
-	if !desiredFresh {
-		return DesiredIsNotFreshError
 	}
 
 	if !actualFresh {
