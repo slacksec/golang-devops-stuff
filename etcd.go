@@ -10,11 +10,13 @@ import (
 
 type Response interface {
   Value() string
+  Node() *etcd.Node
 }
 
 type Client interface {
   Get(path string) (Response, error)
   WatchForChanges()
+  GetAll(path string) []*etcd.Node
 }
 
 type EtcdClient struct {
@@ -33,6 +35,10 @@ func NewEtcdClient(instanceUrl string) Client {
   }
 }
 
+func (r EtcdResponse) Node() *etcd.Node {
+  return r.Response.Node;
+}
+
 func (r EtcdResponse) Value() string {
   return r.Response.Node.Value;
 }
@@ -44,9 +50,23 @@ func validate(node *etcd.Node) (bool, string) {
       return net.ParseIP(node.Value) != nil, "Invalid ip"
     case "CNAME", "PTR":
       return dns.IsFqdn(node.Value), "Domain name not fully-qualified"
+    case "SOA":
+      return true, ""
     default:
       return false, "Record type not supported"
   }
+}
+
+func (c EtcdClient) GetAll(key string) []*etcd.Node {
+  response, _ := c.Client.Get(key, false, true)
+
+  nodes := []*etcd.Node{}
+
+  for _, node := range response.Node.Nodes {
+    nodes = append(nodes, node)
+  }
+
+  return nodes
 }
 
 func (c EtcdClient) WatchForChanges() {
