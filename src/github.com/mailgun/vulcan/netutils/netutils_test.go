@@ -1,10 +1,11 @@
 package netutils
 
 import (
-	. "gopkg.in/check.v1"
 	"net/http"
 	"net/url"
 	"testing"
+
+	. "gopkg.in/check.v1"
 )
 
 func TestUtils(t *testing.T) { TestingT(t) }
@@ -24,6 +25,31 @@ func (s *NetUtilsSuite) TestParseBadUrl(c *C) {
 		_, err := ParseUrl(badUrl)
 		c.Assert(err, NotNil)
 	}
+}
+
+// Make sure parseUrl is strict enough not to accept total garbage
+func (s *NetUtilsSuite) TestURLRawPath(c *C) {
+	vals := []struct {
+		URL      string
+		Expected string
+	}{
+		{"http://google.com/", "/"},
+		{"http://google.com/a?q=b", "/a"},
+		{"http://google.com/%2Fvalue/hello", "/%2Fvalue/hello"},
+		{"/home", "/home"},
+		{"/home?a=b", "/home"},
+		{"/home%2F", "/home%2F"},
+	}
+	for _, v := range vals {
+		out, err := RawPath(v.URL)
+		c.Assert(err, IsNil)
+		c.Assert(out, Equals, v.Expected)
+	}
+}
+
+func (s *NetUtilsSuite) TestRawURL(c *C) {
+	request := &http.Request{URL: &url.URL{Scheme: "http", Host: "localhost:8080"}, RequestURI: "/foo/bar"}
+	c.Assert("http://localhost:8080/foo/bar", Equals, RawURL(request))
 }
 
 //Just to make sure we don't panic, return err and not
