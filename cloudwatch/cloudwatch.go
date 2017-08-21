@@ -109,18 +109,20 @@ type AlarmAction struct {
 }
 
 type MetricAlarm struct {
-	AlarmActions       []AlarmAction
-	AlarmDescription   string
-	AlarmName          string
-	ComparisonOperator string
-	Dimensions         []Dimension
-	EvaluationPeriods  int
-	MetricName         string
-	Namespace          string
-	Period             int
-	Statistic          string
-	Threshold          float64
-	Unit               string
+	AlarmActions            []AlarmAction
+	AlarmDescription        string
+	AlarmName               string
+	ComparisonOperator      string
+	Dimensions              []Dimension
+	EvaluationPeriods       int
+	InsufficientDataActions []AlarmAction
+	MetricName              string
+	Namespace               string
+	OKActions               []AlarmAction
+	Period                  int
+	Statistic               string
+	Threshold               float64
+	Unit                    string
 }
 
 var attempts = aws.AttemptStrategy{
@@ -129,48 +131,98 @@ var attempts = aws.AttemptStrategy{
 	Delay: 200 * time.Millisecond,
 }
 
+const (
+	UnitSeconds            string = "Seconds"
+	UnitMicroseconds       string = "Microseconds"
+	UnitMilliseconds       string = "Milliseconds"
+	UnitBytes              string = "Bytes"
+	UnitKilobytes          string = "Kilobytes"
+	UnitMegabytes          string = "Megabytes"
+	UnitGigabytes          string = "Gigabytes"
+	UnitTerabytes          string = "Terabytes"
+	UnitBits               string = "Bits"
+	UnitKilobits           string = "Kilobits"
+	UnitMegabits           string = "Megabits"
+	UnitGigabits           string = "Gigabits"
+	UnitTerabits           string = "Terabits"
+	UnitPercent            string = "Percent"
+	UnitCount              string = "Count"
+	UnitBytesPerSecond     string = "Bytes/Second"
+	UnitKilobytesPerSecond string = "Kilobytes/Second"
+	UnitMegabytesPerSecond string = "Megabytes/Second"
+	UnitGigabytesPerSecond string = "Gigabytes/Second"
+	UnitTerabytesPerSecond string = "Terabytes/Second"
+	UnitBitsPerSecond      string = "Bits/Second"
+	UnitKilobitsPerSecond  string = "Kilobits/Second"
+	UnitMegabitsPerSecond  string = "Megabits/Second"
+	UnitGigabitsPerSecond  string = "Gigabits/Second"
+	UnitTerabitsPerSecond  string = "Terabits/Second"
+	UnitCountPerSecond     string = "Count/Second"
+	UnitNone               string = "None"
+)
+
 var validUnits = sets.SSet(
-	"Seconds",
-	"Microseconds",
-	"Milliseconds",
-	"Bytes",
-	"Kilobytes",
-	"Megabytes",
-	"Gigabytes",
-	"Terabytes",
-	"Bits",
-	"Kilobits",
-	"Megabits",
-	"Gigabits",
-	"Terabits",
-	"Percent",
-	"Count",
-	"Bytes/Second",
-	"Kilobytes/Second",
-	"Megabytes/Second",
-	"Gigabytes/Second",
-	"Terabytes/Second",
-	"Bits/Second",
-	"Kilobits/Second",
-	"Megabits/Second",
-	"Gigabits/Second",
-	"Terabits/Second",
-	"Count/Second",
+	UnitSeconds,
+	UnitMicroseconds,
+	UnitMilliseconds,
+	UnitBytes,
+	UnitKilobytes,
+	UnitMegabytes,
+	UnitGigabytes,
+	UnitTerabytes,
+	UnitBits,
+	UnitKilobits,
+	UnitMegabits,
+	UnitGigabits,
+	UnitTerabits,
+	UnitPercent,
+	UnitCount,
+	UnitBytesPerSecond,
+	UnitKilobytesPerSecond,
+	UnitMegabytesPerSecond,
+	UnitGigabytesPerSecond,
+	UnitTerabytesPerSecond,
+	UnitBitsPerSecond,
+	UnitKilobitsPerSecond,
+	UnitMegabitsPerSecond,
+	UnitGigabitsPerSecond,
+	UnitTerabitsPerSecond,
+	UnitCountPerSecond,
+	UnitNone,
+)
+
+const (
+	StatisticDatapointAverage     string = "Average"
+	StatisticDatapointSum         string = "Sum"
+	StatisticDatapointSampleCount string = "SampleCount"
+	StatisticDatapointMaximum     string = "Maximum"
+	StatisticDatapointMinimum     string = "Minimum"
 )
 
 var validMetricStatistics = sets.SSet(
-	"Average",
-	"Sum",
-	"SampleCount",
-	"Maximum",
-	"Minimum",
+	StatisticDatapointAverage,
+	StatisticDatapointSum,
+	StatisticDatapointSampleCount,
+	StatisticDatapointMaximum,
+	StatisticDatapointMinimum,
+)
+
+const (
+	ComparisonOperatorLessThanThreshold             string = "LessThanThreshold"
+	ComparisonOperatorLessThanOrEqualToThreshold    string = "LessThanOrEqualToThreshold"
+	ComparisonOperatorGreaterThanThreshold          string = "GreaterThanThreshold"
+	ComparisonOperatorGreaterThanOrEqualToThreshold string = "GreaterThanOrEqualToThreshold"
 )
 
 var validComparisonOperators = sets.SSet(
-	"LessThanThreshold",
-	"LessThanOrEqualToThreshold",
-	"GreaterThanThreshold",
-	"GreaterThanOrEqualToThreshold",
+	ComparisonOperatorLessThanThreshold,
+	ComparisonOperatorLessThanOrEqualToThreshold,
+	ComparisonOperatorGreaterThanThreshold,
+	ComparisonOperatorGreaterThanOrEqualToThreshold,
+)
+
+const (
+	MetricNameCPUUtilization = "CPUUtilization"
 )
 
 // Create a new CloudWatch object for a given namespace
@@ -283,9 +335,9 @@ func (c *CloudWatch) ListMetrics(req *ListMetricsRequest) (result *ListMetricsRe
 	err = c.query("GET", "/", params, &result)
 	metrics := result.ListMetricsResult.Metrics
 	if result.ListMetricsResult.NextToken != "" {
-		params = aws.MakeParams("ListMetrics")
-		params["NextToken"] = result.ListMetricsResult.NextToken
 		for result.ListMetricsResult.NextToken != "" && err == nil {
+			params = aws.MakeParams("ListMetrics")
+			params["NextToken"] = result.ListMetricsResult.NextToken
 			result = new(ListMetricsResponse)
 			err = c.query("GET", "/", params, &result)
 			if err == nil {
@@ -322,6 +374,8 @@ func (c *CloudWatch) PutMetricDataNamespace(metrics []MetricDatum, namespace str
 		}
 		if metric.Value != 0 {
 			params[prefix+".Value"] = strconv.FormatFloat(metric.Value, 'E', 10, 64)
+		} else {
+			params[prefix+".Value"] = "0"
 		}
 		if !metric.Timestamp.IsZero() {
 			params[prefix+".Timestamp"] = metric.Timestamp.UTC().Format(time.RFC3339)
@@ -375,11 +429,15 @@ func (c *CloudWatch) PutMetricAlarm(alarm *MetricAlarm) (result *aws.BaseRespons
 	for i, action := range alarm.AlarmActions {
 		params["AlarmActions.member."+strconv.Itoa(i+1)] = action.ARN
 	}
+	for i, action := range alarm.InsufficientDataActions {
+		params["InsufficientDataActions.member."+strconv.Itoa(i+1)] = action.ARN
+	}
+	for i, action := range alarm.OKActions {
+		params["OKActions.member."+strconv.Itoa(i+1)] = action.ARN
+	}
 	if alarm.AlarmDescription != "" {
 		params["AlarmDescription"] = alarm.AlarmDescription
-		return
 	}
-	params["AlarmDescription"] = alarm.AlarmDescription
 	params["AlarmName"] = alarm.AlarmName
 	params["ComparisonOperator"] = alarm.ComparisonOperator
 	for i, dim := range alarm.Dimensions {

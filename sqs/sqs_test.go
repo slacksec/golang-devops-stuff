@@ -6,6 +6,7 @@ import (
 	"github.com/crowdmob/goamz/aws"
 	"gopkg.in/check.v1"
 	"hash"
+	"reflect"
 )
 
 var _ = check.Suite(&S{})
@@ -60,10 +61,17 @@ func (s *S) TestCreateQueueWithAttributes(c *check.C) {
 	req := testServer.WaitRequest()
 
 	// TestCreateQueue() tests the core functionality, just check the timeout in this test
-	c.Assert(req.Form["Attribute.1.Name"], check.DeepEquals, []string{"ReceiveMessageWaitTimeSeconds"})
-	c.Assert(req.Form["Attribute.1.Value"], check.DeepEquals, []string{"20"})
-	c.Assert(req.Form["Attribute.2.Name"], check.DeepEquals, []string{"MessageRetentionPeriod"})
-	c.Assert(req.Form["Attribute.2.Value"], check.DeepEquals, []string{"60"})
+
+	// Since attributes is a map the order is random,
+	// So I modified the test so that it will not be sensitive to the order of the two attributes,
+	c.Assert((reflect.DeepEqual(req.Form["Attribute.1.Name"], []string{"ReceiveMessageWaitTimeSeconds"}) ||
+		reflect.DeepEqual(req.Form["Attribute.2.Name"], []string{"ReceiveMessageWaitTimeSeconds"})), check.Equals, true)
+	c.Assert((reflect.DeepEqual(req.Form["Attribute.1.Value"], []string{"20"}) ||
+		reflect.DeepEqual(req.Form["Attribute.2.Value"], []string{"20"})), check.Equals, true)
+	c.Assert((reflect.DeepEqual(req.Form["Attribute.1.Name"], []string{"MessageRetentionPeriod"}) ||
+		reflect.DeepEqual(req.Form["Attribute.2.Name"], []string{"MessageRetentionPeriod"})), check.Equals, true)
+	c.Assert((reflect.DeepEqual(req.Form["Attribute.1.Value"], []string{"60"}) ||
+		reflect.DeepEqual(req.Form["Attribute.2.Value"], []string{"60"})), check.Equals, true)
 }
 
 func (s *S) TestListQueues(c *check.C) {
@@ -191,6 +199,21 @@ func (s *S) TestDeleteMessageBatch(c *check.C) {
 	for idx, _ := range msgList {
 		c.Assert(resp.DeleteMessageBatchResult[idx].Id, check.Equals, fmt.Sprintf("msg%d", idx+1))
 	}
+}
+
+func (s *S) TestPurgeQueue(c *check.C) {
+	testServer.PrepareResponse(200, nil, TestPurgeQueueXmlOK)
+
+	q := &Queue{s.sqs, testServer.URL + "/123456789012/testQueue/"}
+	resp, err := q.PurgeQueue()
+	req := testServer.WaitRequest()
+
+	c.Assert(req.Method, check.Equals, "POST")
+	c.Assert(req.URL.Path, check.Equals, "/123456789012/testQueue/")
+	c.Assert(req.Header["Date"], check.Not(check.Equals), "")
+
+	c.Assert(resp.ResponseMetadata.RequestId, check.Equals, "6fde8d1e-52cd-4581-8cd9-c512f4c64223")
+	c.Assert(err, check.IsNil)
 }
 
 func (s *S) TestReceiveMessage(c *check.C) {
