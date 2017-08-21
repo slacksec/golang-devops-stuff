@@ -5,206 +5,190 @@
 package models
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
+	"html"
+	"html/template"
 	"io"
-	"os"
-	"os/exec"
-	"strings"
 
-	"github.com/gogits/git"
+	"github.com/sergi/go-diff/diffmatchpatch"
+	"golang.org/x/net/html/charset"
+	"golang.org/x/text/transform"
 
-	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/process"
+	"github.com/gogits/git-module"
+
+	"github.com/gogits/gogs/pkg/tool"
+	"github.com/gogits/gogs/pkg/setting"
+	"github.com/gogits/gogs/pkg/template/highlight"
 )
-
-// Diff line types.
-const (
-	DIFF_LINE_PLAIN = iota + 1
-	DIFF_LINE_ADD
-	DIFF_LINE_DEL
-	DIFF_LINE_SECTION
-)
-
-const (
-	DIFF_FILE_ADD = iota + 1
-	DIFF_FILE_CHANGE
-	DIFF_FILE_DEL
-)
-
-type DiffLine struct {
-	LeftIdx  int
-	RightIdx int
-	Type     int
-	Content  string
-}
-
-func (d DiffLine) GetType() int {
-	return d.Type
-}
 
 type DiffSection struct {
-	Name  string
-	Lines []*DiffLine
+	*git.DiffSection
+}
+
+var (
+	addedCodePrefix   = []byte("<span class=\"added-code\">")
+	removedCodePrefix = []byte("<span class=\"removed-code\">")
+	codeTagSuffix     = []byte("</span>")
+)
+
+func diffToHTML(diffs []diffmatchpatch.Diff, lineType git.DiffLineType) template.HTML {
+	buf := bytes.NewBuffer(nil)
+
+	// Reproduce signs which are cutted for inline diff before.
+	switch lineType {
+	case git.DIFF_LINE_ADD:
+		buf.WriteByte('+')
+	case git.DIFF_LINE_DEL:
+		buf.WriteByte('-')
+	}
+
+	for i := range diffs {
+		switch {
+		case diffs[i].Type == diffmatchpatch.DiffInsert && lineType == git.DIFF_LINE_ADD:
+			buf.Write(addedCodePrefix)
+			buf.WriteString(html.EscapeString(diffs[i].Text))
+			buf.Write(codeTagSuffix)
+		case diffs[i].Type == diffmatchpatch.DiffDelete && lineType == git.DIFF_LINE_DEL:
+			buf.Write(removedCodePrefix)
+			buf.WriteString(html.EscapeString(diffs[i].Text))
+			buf.Write(codeTagSuffix)
+		case diffs[i].Type == diffmatchpatch.DiffEqual:
+			buf.WriteString(html.EscapeString(diffs[i].Text))
+		}
+	}
+
+	return template.HTML(buf.Bytes())
+}
+
+var diffMatchPatch = diffmatchpatch.New()
+
+func init() {
+	diffMatchPatch.DiffEditCost = 100
+}
+
+// ComputedInlineDiffFor computes inline diff for the given line.
+func (diffSection *DiffSection) ComputedInlineDiffFor(diffLine *git.DiffLine) template.HTML {
+	if setting.Git.DisableDiffHighlight {
+		return template.HTML(html.EscapeString(diffLine.Content[1:]))
+	}
+	var (
+		compareDiffLine *git.DiffLine
+		diff1           string
+		diff2           string
+	)
+
+	// try to find equivalent diff line. ignore, otherwise
+	switch diffLine.Type {
+	case git.DIFF_LINE_ADD:
+		compareDiffLine = diffSection.Line(git.DIFF_LINE_DEL, diffLine.RightIdx)
+		if compareDiffLine == nil {
+			return template.HTML(html.EscapeString(diffLine.Content))
+		}
+		diff1 = compareDiffLine.Content
+		diff2 = diffLine.Content
+	case git.DIFF_LINE_DEL:
+		compareDiffLine = diffSection.Line(git.DIFF_LINE_ADD, diffLine.LeftIdx)
+		if compareDiffLine == nil {
+			return template.HTML(html.EscapeString(diffLine.Content))
+		}
+		diff1 = diffLine.Content
+		diff2 = compareDiffLine.Content
+	default:
+		return template.HTML(html.EscapeString(diffLine.Content))
+	}
+
+	diffRecord := diffMatchPatch.DiffMain(diff1[1:], diff2[1:], true)
+	diffRecord = diffMatchPatch.DiffCleanupEfficiency(diffRecord)
+
+	return diffToHTML(diffRecord, diffLine.Type)
 }
 
 type DiffFile struct {
-	Name               string
-	Index              int
-	Addition, Deletion int
-	Type               int
-	IsBin              bool
-	Sections           []*DiffSection
+	*git.DiffFile
+	Sections []*DiffSection
+}
+
+func (diffFile *DiffFile) HighlightClass() string {
+	return highlight.FileNameToHighlightClass(diffFile.Name)
 }
 
 type Diff struct {
-	TotalAddition, TotalDeletion int
-	Files                        []*DiffFile
+	*git.Diff
+	Files []*DiffFile
 }
 
-func (diff *Diff) NumFiles() int {
-	return len(diff.Files)
-}
+func NewDiff(gitDiff *git.Diff) *Diff {
+	diff := &Diff{
+		Diff:  gitDiff,
+		Files: make([]*DiffFile, gitDiff.NumFiles()),
+	}
 
-const DIFF_HEAD = "diff --git "
+	// FIXME: detect encoding while parsing.
+	var buf bytes.Buffer
+	for i := range gitDiff.Files {
+		buf.Reset()
 
-func ParsePatch(pid int64, cmd *exec.Cmd, reader io.Reader) (*Diff, error) {
-	scanner := bufio.NewScanner(reader)
-	var (
-		curFile    *DiffFile
-		curSection = &DiffSection{
-			Lines: make([]*DiffLine, 0, 10),
+		diff.Files[i] = &DiffFile{
+			DiffFile: gitDiff.Files[i],
+			Sections: make([]*DiffSection, gitDiff.Files[i].NumSections()),
 		}
 
-		leftLine, rightLine int
-	)
-
-	diff := &Diff{Files: make([]*DiffFile, 0)}
-	var i int
-	for scanner.Scan() {
-		line := scanner.Text()
-		// fmt.Println(i, line)
-		if strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "--- ") {
-			continue
-		}
-
-		i = i + 1
-
-		// Diff data too large.
-		if i == 5000 {
-			log.Warn("Diff data too large")
-			return &Diff{}, nil
-		}
-
-		if line == "" {
-			continue
-		}
-
-		switch {
-		case line[0] == ' ':
-			diffLine := &DiffLine{Type: DIFF_LINE_PLAIN, Content: line, LeftIdx: leftLine, RightIdx: rightLine}
-			leftLine++
-			rightLine++
-			curSection.Lines = append(curSection.Lines, diffLine)
-			continue
-		case line[0] == '@':
-			curSection = &DiffSection{}
-			curFile.Sections = append(curFile.Sections, curSection)
-			ss := strings.Split(line, "@@")
-			diffLine := &DiffLine{Type: DIFF_LINE_SECTION, Content: line}
-			curSection.Lines = append(curSection.Lines, diffLine)
-
-			// Parse line number.
-			ranges := strings.Split(ss[len(ss)-2][1:], " ")
-			leftLine, _ = base.StrTo(strings.Split(ranges[0], ",")[0][1:]).Int()
-			rightLine, _ = base.StrTo(strings.Split(ranges[1], ",")[0]).Int()
-			continue
-		case line[0] == '+':
-			curFile.Addition++
-			diff.TotalAddition++
-			diffLine := &DiffLine{Type: DIFF_LINE_ADD, Content: line, RightIdx: rightLine}
-			rightLine++
-			curSection.Lines = append(curSection.Lines, diffLine)
-			continue
-		case line[0] == '-':
-			curFile.Deletion++
-			diff.TotalDeletion++
-			diffLine := &DiffLine{Type: DIFF_LINE_DEL, Content: line, LeftIdx: leftLine}
-			if leftLine > 0 {
-				leftLine++
+		for j := range gitDiff.Files[i].Sections {
+			diff.Files[i].Sections[j] = &DiffSection{
+				DiffSection: gitDiff.Files[i].Sections[j],
 			}
-			curSection.Lines = append(curSection.Lines, diffLine)
-		case strings.HasPrefix(line, "Binary"):
-			curFile.IsBin = true
-			continue
+
+			for k := range diff.Files[i].Sections[j].Lines {
+				buf.WriteString(diff.Files[i].Sections[j].Lines[k].Content)
+				buf.WriteString("\n")
+			}
 		}
 
-		// Get new file.
-		if strings.HasPrefix(line, DIFF_HEAD) {
-			fs := strings.Split(line[len(DIFF_HEAD):], " ")
-			a := fs[0]
-
-			curFile = &DiffFile{
-				Name:     a[strings.Index(a, "/")+1:],
-				Index:    len(diff.Files) + 1,
-				Type:     DIFF_FILE_CHANGE,
-				Sections: make([]*DiffSection, 0, 10),
-			}
-			diff.Files = append(diff.Files, curFile)
-
-			// Check file diff type.
-			for scanner.Scan() {
-				switch {
-				case strings.HasPrefix(scanner.Text(), "new file"):
-					curFile.Type = DIFF_FILE_ADD
-				case strings.HasPrefix(scanner.Text(), "deleted"):
-					curFile.Type = DIFF_FILE_DEL
-				case strings.HasPrefix(scanner.Text(), "index"):
-					curFile.Type = DIFF_FILE_CHANGE
-				}
-				if curFile.Type > 0 {
-					break
+		charsetLabel, err := tool.DetectEncoding(buf.Bytes())
+		if charsetLabel != "UTF-8" && err == nil {
+			encoding, _ := charset.Lookup(charsetLabel)
+			if encoding != nil {
+				d := encoding.NewDecoder()
+				for j := range diff.Files[i].Sections {
+					for k := range diff.Files[i].Sections[j].Lines {
+						if c, _, err := transform.String(d, diff.Files[i].Sections[j].Lines[k].Content); err == nil {
+							diff.Files[i].Sections[j].Lines[k].Content = c
+						}
+					}
 				}
 			}
 		}
 	}
 
-	// In case process became zombie.
-	if err := process.Kill(pid); err != nil {
-		log.Error("git_diff.ParsePatch(Kill): %v", err)
-	}
-	return diff, nil
+	return diff
 }
 
-func GetDiff(repoPath, commitid string) (*Diff, error) {
-	repo, err := git.OpenRepository(repoPath)
-	if err != nil {
-		return nil, err
-	}
-
-	commit, err := repo.GetCommit(commitid)
-	if err != nil {
-		return nil, err
-	}
-
-	rd, wr := io.Pipe()
-	var cmd *exec.Cmd
-	// First commit of repository.
-	if commit.ParentCount() == 0 {
-		cmd = exec.Command("git", "show", commitid)
-	} else {
-		c, _ := commit.Parent(0)
-		cmd = exec.Command("git", "diff", c.Id.String(), commitid)
-	}
-	cmd.Dir = repoPath
-	cmd.Stdout = wr
-	cmd.Stdin = os.Stdin
-	cmd.Stderr = os.Stderr
+func ParsePatch(maxLines, maxLineCharacteres, maxFiles int, reader io.Reader) (*Diff, error) {
+	done := make(chan error)
+	var gitDiff *git.Diff
 	go func() {
-		cmd.Run()
-		wr.Close()
+		gitDiff = git.ParsePatch(done, maxLines, maxLineCharacteres, maxFiles, reader)
 	}()
-	defer rd.Close()
-	return ParsePatch(process.Add(fmt.Sprintf("GetDiff(%s)", repoPath), cmd), cmd, rd)
+
+	if err := <-done; err != nil {
+		return nil, fmt.Errorf("ParsePatch: %v", err)
+	}
+	return NewDiff(gitDiff), nil
+}
+
+func GetDiffRange(repoPath, beforeCommitID, afterCommitID string, maxLines, maxLineCharacteres, maxFiles int) (*Diff, error) {
+	gitDiff, err := git.GetDiffRange(repoPath, beforeCommitID, afterCommitID, maxLines, maxLineCharacteres, maxFiles)
+	if err != nil {
+		return nil, fmt.Errorf("GetDiffRange: %v", err)
+	}
+	return NewDiff(gitDiff), nil
+}
+
+func GetDiffCommit(repoPath, commitID string, maxLines, maxLineCharacteres, maxFiles int) (*Diff, error) {
+	gitDiff, err := git.GetDiffCommit(repoPath, commitID, maxLines, maxLineCharacteres, maxFiles)
+	if err != nil {
+		return nil, fmt.Errorf("GetDiffCommit: %v", err)
+	}
+	return NewDiff(gitDiff), nil
 }

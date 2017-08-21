@@ -10,153 +10,133 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/gogits/git"
-
-	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
+	git "github.com/gogits/git-module"
 )
 
-type UpdateTask struct {
-	Id          int64
-	Uuid        string `xorm:"index"`
-	RefName     string
-	OldCommitId string
-	NewCommitId string
+// CommitToPushCommit transforms a git.Commit to PushCommit type.
+func CommitToPushCommit(commit *git.Commit) *PushCommit {
+	return &PushCommit{
+		Sha1:           commit.ID.String(),
+		Message:        commit.Message(),
+		AuthorEmail:    commit.Author.Email,
+		AuthorName:     commit.Author.Name,
+		CommitterEmail: commit.Committer.Email,
+		CommitterName:  commit.Committer.Name,
+		Timestamp:      commit.Committer.When,
+	}
 }
 
-func AddUpdateTask(task *UpdateTask) error {
-	_, err := x.Insert(task)
-	return err
-}
-
-func GetUpdateTasksByUuid(uuid string) ([]*UpdateTask, error) {
-	task := &UpdateTask{
-		Uuid: uuid,
-	}
-	tasks := make([]*UpdateTask, 0)
-	err := x.Find(&tasks, task)
-	if err != nil {
-		return nil, err
-	}
-	return tasks, nil
-}
-
-func DelUpdateTasksByUuid(uuid string) error {
-	_, err := x.Delete(&UpdateTask{Uuid: uuid})
-	return err
-}
-
-func Update(refName, oldCommitId, newCommitId, userName, repoUserName, repoName string, userId int64) error {
-	//fmt.Println(refName, oldCommitId, newCommitId)
-	//fmt.Println(userName, repoUserName, repoName)
-	isNew := strings.HasPrefix(oldCommitId, "0000000")
-	if isNew &&
-		strings.HasPrefix(newCommitId, "0000000") {
-		return fmt.Errorf("old rev and new rev both 000000")
+func ListToPushCommits(l *list.List) *PushCommits {
+	if l == nil {
+		return &PushCommits{}
 	}
 
-	f := RepoPath(repoUserName, repoName)
-
-	gitUpdate := exec.Command("git", "update-server-info")
-	gitUpdate.Dir = f
-	gitUpdate.Run()
-
-	isDel := strings.HasPrefix(newCommitId, "0000000")
-	if isDel {
-		log.GitLogger.Info("del rev", refName, "from", userName+"/"+repoName+".git", "by", userId)
-		return nil
-	}
-
-	repo, err := git.OpenRepository(f)
-	if err != nil {
-		return fmt.Errorf("runUpdate.Open repoId: %v", err)
-	}
-
-	ru, err := GetUserByName(repoUserName)
-	if err != nil {
-		return fmt.Errorf("runUpdate.GetUserByName: %v", err)
-	}
-
-	repos, err := GetRepositoryByName(ru.Id, repoName)
-	if err != nil {
-		return fmt.Errorf("runUpdate.GetRepositoryByName userId: %v", err)
-	}
-
-	// if tags push
-	if strings.HasPrefix(refName, "refs/tags/") {
-		tagName := git.RefEndName(refName)
-		tag, err := repo.GetTag(tagName)
-		if err != nil {
-			log.GitLogger.Fatal("runUpdate.GetTag: %v", err)
-		}
-
-		var actEmail string
-		if tag.Tagger != nil {
-			actEmail = tag.Tagger.Email
-		} else {
-			cmt, err := tag.Commit()
-			if err != nil {
-				log.GitLogger.Fatal("runUpdate.GetTag Commit: %v", err)
-			}
-			actEmail = cmt.Committer.Email
-		}
-
-		commit := &base.PushCommits{}
-
-		if err = CommitRepoAction(userId, ru.Id, userName, actEmail,
-			repos.Id, repoUserName, repoName, refName, commit); err != nil {
-			log.GitLogger.Fatal("runUpdate.models.CommitRepoAction: %s/%s:%v", repoUserName, repoName, err)
-		}
-		return err
-	}
-
-	newCommit, err := repo.GetCommit(newCommitId)
-	if err != nil {
-		return fmt.Errorf("runUpdate GetCommit of newCommitId: %v", err)
-	}
-
-	var l *list.List
-	// if a new branch
-	if isNew {
-		l, err = newCommit.CommitsBefore()
-		if err != nil {
-			return fmt.Errorf("Find CommitsBefore erro: %v", err)
-		}
-	} else {
-		l, err = newCommit.CommitsBeforeUntil(oldCommitId)
-		if err != nil {
-			return fmt.Errorf("Find CommitsBeforeUntil erro: %v", err)
-		}
-	}
-
-	if err != nil {
-		return fmt.Errorf("runUpdate.Commit repoId: %v", err)
-	}
-
-	// if commits push
-	commits := make([]*base.PushCommit, 0)
-	var maxCommits = 3
+	commits := make([]*PushCommit, 0)
 	var actEmail string
 	for e := l.Front(); e != nil; e = e.Next() {
 		commit := e.Value.(*git.Commit)
-
 		if actEmail == "" {
 			actEmail = commit.Committer.Email
 		}
-		commits = append(commits,
-			&base.PushCommit{commit.Id.String(),
-				commit.Message(),
-				commit.Author.Email,
-				commit.Author.Name})
-		if len(commits) >= maxCommits {
-			break
+		commits = append(commits, CommitToPushCommit(commit))
+	}
+	return &PushCommits{l.Len(), commits, "", nil}
+}
+
+type PushUpdateOptions struct {
+	OldCommitID  string
+	NewCommitID  string
+	RefFullName  string
+	PusherID     int64
+	PusherName   string
+	RepoUserName string
+	RepoName     string
+}
+
+// PushUpdate must be called for any push actions in order to
+// generates necessary push action history feeds.
+func PushUpdate(opts PushUpdateOptions) (err error) {
+	isNewRef := opts.OldCommitID == git.EMPTY_SHA
+	isDelRef := opts.NewCommitID == git.EMPTY_SHA
+	if isNewRef && isDelRef {
+		return fmt.Errorf("Old and new revisions are both %s", git.EMPTY_SHA)
+	}
+
+	repoPath := RepoPath(opts.RepoUserName, opts.RepoName)
+
+	gitUpdate := exec.Command("git", "update-server-info")
+	gitUpdate.Dir = repoPath
+	if err = gitUpdate.Run(); err != nil {
+		return fmt.Errorf("Fail to call 'git update-server-info': %v", err)
+	}
+
+	gitRepo, err := git.OpenRepository(repoPath)
+	if err != nil {
+		return fmt.Errorf("OpenRepository: %v", err)
+	}
+
+	owner, err := GetUserByName(opts.RepoUserName)
+	if err != nil {
+		return fmt.Errorf("GetUserByName: %v", err)
+	}
+
+	repo, err := GetRepositoryByName(owner.ID, opts.RepoName)
+	if err != nil {
+		return fmt.Errorf("GetRepositoryByName: %v", err)
+	}
+
+	if err = repo.UpdateSize(); err != nil {
+		return fmt.Errorf("UpdateSize: %v", err)
+	}
+
+	// Push tags
+	if strings.HasPrefix(opts.RefFullName, git.TAG_PREFIX) {
+		if err := CommitRepoAction(CommitRepoActionOptions{
+			PusherName:  opts.PusherName,
+			RepoOwnerID: owner.ID,
+			RepoName:    repo.Name,
+			RefFullName: opts.RefFullName,
+			OldCommitID: opts.OldCommitID,
+			NewCommitID: opts.NewCommitID,
+			Commits:     &PushCommits{},
+		}); err != nil {
+			return fmt.Errorf("CommitRepoAction.(tag): %v", err)
+		}
+		return nil
+	}
+
+	var l *list.List
+	// Skip read parent commits when delete branch
+	if !isDelRef {
+		// Push new branch
+		newCommit, err := gitRepo.GetCommit(opts.NewCommitID)
+		if err != nil {
+			return fmt.Errorf("GetCommit [commit_id: %s]: %v", opts.NewCommitID, err)
+		}
+
+		if isNewRef {
+			l, err = newCommit.CommitsBeforeLimit(10)
+			if err != nil {
+				return fmt.Errorf("CommitsBeforeLimit [commit_id: %s]: %v", newCommit.ID, err)
+			}
+		} else {
+			l, err = newCommit.CommitsBeforeUntil(opts.OldCommitID)
+			if err != nil {
+				return fmt.Errorf("CommitsBeforeUntil [commit_id: %s]: %v", opts.OldCommitID, err)
+			}
 		}
 	}
 
-	//commits = append(commits, []string{lastCommit.Id().String(), lastCommit.Message()})
-	if err = CommitRepoAction(userId, ru.Id, userName, actEmail,
-		repos.Id, repoUserName, repoName, refName, &base.PushCommits{l.Len(), commits}); err != nil {
-		return fmt.Errorf("runUpdate.models.CommitRepoAction: %s/%s:%v", repoUserName, repoName, err)
+	if err := CommitRepoAction(CommitRepoActionOptions{
+		PusherName:  opts.PusherName,
+		RepoOwnerID: owner.ID,
+		RepoName:    repo.Name,
+		RefFullName: opts.RefFullName,
+		OldCommitID: opts.OldCommitID,
+		NewCommitID: opts.NewCommitID,
+		Commits:     ListToPushCommits(l),
+	}); err != nil {
+		return fmt.Errorf("CommitRepoAction.(branch): %v", err)
 	}
 	return nil
 }

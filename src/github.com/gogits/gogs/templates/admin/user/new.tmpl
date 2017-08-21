@@ -1,94 +1,66 @@
 {{template "base/head" .}}
-{{template "base/navbar" .}}
-<div id="body" class="container" data-page="admin">
-    {{template "admin/nav" .}}
-    <div id="admin-container" class="col-md-9">
-        <div class="panel panel-default">
-            <div class="panel-heading">
-                New Account
-            </div>
-
-            <div class="panel-body">
-            	<br/>
-				<form action="/admin/users/new" method="post" class="form-horizontal">
-					{{.CsrfTokenHtml}}
-				    {{template "base/alert" .}}
-				    <div class="form-group">
-					    <label class="col-md-3 control-label">Auth Source: </label>
-					    <div class="col-md-7">
-						    <select name="logintype" class="form-control" id="login-type">
-							    <option value="0-0">Local</option>
-							    {{range $key, $val := .LoginSources}}
-			  					<option value="{{$val.Type}}-{{$val.Id}}">{{$val.Name}}</option>
-			  					{{end}}
-							</select>
+<div class="admin new user">
+	<div class="ui container">
+		<div class="ui grid">
+			{{template "admin/navbar" .}}
+			<div class="twelve wide column content">
+				{{template "base/alert" .}}
+				<h4 class="ui top attached header">
+					{{.i18n.Tr "admin.users.new_account"}}
+				</h4>
+				<div class="ui attached segment">
+					<form class="ui form" action="{{.Link}}" method="post">
+						{{.CSRFTokenHTML}}
+						<!-- Types and name -->
+						<div class="inline required field {{if .Err_LoginType}}error{{end}}">
+							<label>{{.i18n.Tr "admin.users.auth_source"}}</label>
+							<div class="ui selection type dropdown">
+								<input type="hidden" id="login_type" name="login_type" value="{{.login_type}}" data-password="required" required>
+								<div class="text">{{.i18n.Tr "admin.users.local"}}</div>
+								<i class="dropdown icon"></i>
+								<div class="menu">
+									<div class="item" data-value="0-0">{{.i18n.Tr "admin.users.local"}}</div>
+									{{range .Sources}}
+										<div class="item" data-value="{{.Type}}-{{.ID}}">{{.Name}}</div>
+									{{end}}
+								</div>
+							</div>
 						</div>
-					</div>
-
-					<div class="auth-name hidden">
-                        <div class="form-group">
-                            <label class="col-md-3 control-label">Auth Login Name: </label>
-                            <div class="col-md-7">
-                                <input name="loginname" class="form-control" placeholder="Type auth login's username" value="{{.loginname}}">
-                            </div>
-                        </div>
-					</div>
-					
-					<div class="form-group {{if .Err_UserName}}has-error has-feedback{{end}}">
-						<label class="col-md-3 control-label">Username: </label>
-						<div class="col-md-7">
-							<input name="username" class="form-control" placeholder="Type account's username" value="{{.username}}" required="required">
+						<div class="required non-local field {{if .Err_LoginName}}error{{end}} {{if eq .login_type "0-0"}}hide{{end}}">
+							<label for="login_name">{{.i18n.Tr "admin.users.auth_login_name"}}</label>
+							<input id="login_name" name="login_name" value="{{.login_name}}">
 						</div>
-					</div>
-
-					<div class="form-group {{if .Err_Email}}has-error has-feedback{{end}}">
-						<label class="col-md-3 control-label">Email: </label>
-						<div class="col-md-7">
-							<input name="email" class="form-control" placeholder="Type account's e-mail address" value="{{.email}}" required="required" title="Email is not valid">
+						<div class="required field {{if .Err_UserName}}error{{end}}">
+							<label for="user_name">{{.i18n.Tr "username"}}</label>
+							<input id="user_name" name="user_name" value="{{.user_name}}" autofocus required>
 						</div>
-					</div>
+						<div class="required field {{if .Err_Email}}error{{end}}">
+							<label for="email">{{.i18n.Tr "email"}}</label>
+							<input id="email" name="email" type="email" value="{{.email}}" required>
+						</div>
+						<input class="fake" type="password">
+						<div class="required local field {{if .Err_Password}}error{{end}} {{if not (eq .login_type "0-0")}}hide{{end}}">
+							<label for="password">{{.i18n.Tr "password"}}</label>
+							<input id="password" name="password" type="password" value="{{.password}}" {{if eq .login_type "0-0"}}required{{end}}>
+						</div>
 
-					<div class="pwd">
-                        <div class="form-group {{if .Err_Password}}has-error has-feedback{{end}}">
-                            <label class="col-md-3 control-label">Password: </label>
-                            <div class="col-md-7">
-                                <input name="passwd" type="password" class="form-control" placeholder="Type account's password" required="required" title="Password must contain at least 6 characters">
-                            </div>
-                        </div>
+						<!-- Send register notify e-mail -->
+						{{if .CanSendEmail}}
+							<div class="inline field">
+								<div class="ui checkbox">
+									<label><strong>{{.i18n.Tr "admin.users.send_register_notify"}}</strong></label>
+									<input name="send_notify" type="checkbox" {{if .send_notify}}checked{{end}}>
+								</div>
+							</div>
+						{{end}}
 
-                        <div class="form-group {{if .Err_RetypePasswd}}has-error has-feedback{{end}}">
-                            <label class="col-md-3 control-label">Re-type: </label>
-                            <div class="col-md-7">
-                                <input name="retypepasswd" type="password" class="form-control" placeholder="Re-type account's password" required="required" title="Re-type Password must be same to Password">
-                            </div>
-                        </div>
-					</div>
-                    <hr/>
-                    <div class="form-group">
-                        <div class="col-md-offset-3 col-md-7">
-                            <button type="submit" class="btn btn-lg btn-primary">Create new account</button>
-                        </div>
-                    </div>
-				</form>
-            </div>
-        </div>
-
+						<div class="field">
+							<button class="ui green button">{{.i18n.Tr "admin.users.new_account"}}</button>
+						</div>
+					</form>
+				</div>
+			</div>
+		</div>
 	</div>
 </div>
-<script>
-    $(function(){
-        $('#login-type').on("change",function(){
-            var v = $(this).val();
-            if(v.indexOf("0-")+1){
-                $('.auth-name').toggleHide();
-                $(".pwd").find("input").attr("required","required")
-                        .end().toggleShow();
-            }else{
-                $(".pwd").find("input").removeAttr("required")
-                        .end().toggleHide();
-                $('.auth-name').toggleShow();
-            }
-        });
-    });
-</script>
 {{template "base/footer" .}}
