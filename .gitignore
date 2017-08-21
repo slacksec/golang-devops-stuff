@@ -1,7 +1,9 @@
-build
+.godeps
+./build
+.cover/
 apps/nsqlookupd/nsqlookupd
 apps/nsqd/nsqd
-nsqadmin/nsqadmin
+apps/nsqadmin/nsqadmin
 bench/bench_reader/bench_reader
 bench/bench_writer/bench_writer
 bench/bench_channels/bench_channels
@@ -12,6 +14,7 @@ apps/nsq_to_http/nsq_to_http
 apps/nsq_tail/nsq_tail
 apps/nsq_stat/nsq_stat
 apps/to_nsq/to_nsq
+nsqadmin/static/build
 dist
 _site
 _posts
