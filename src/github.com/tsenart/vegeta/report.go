@@ -2,7 +2,10 @@ package main
 
 import (
 	"flag"
-	"log"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
 	"strings"
 
 	vegeta "github.com/tsenart/vegeta/lib"
@@ -10,68 +13,91 @@ import (
 
 func reportCmd() command {
 	fs := flag.NewFlagSet("vegeta report", flag.ExitOnError)
-	opts := &reportOpts{}
-
-	fs.StringVar(&opts.reporter, "reporter", "text", "Reporter [text, json, plot]")
-	fs.StringVar(&opts.inputf, "input", "stdin", "Input files (comma separated)")
-	fs.StringVar(&opts.outputf, "output", "stdout", "Output file")
-
+	reporter := fs.String("reporter", "text", "Reporter [text, json, plot, hist[buckets]]")
+	inputs := fs.String("inputs", "stdin", "Input files (comma separated)")
+	output := fs.String("output", "stdout", "Output file")
 	return command{fs, func(args []string) error {
 		fs.Parse(args)
-		return report(opts)
+		return report(*reporter, *inputs, *output)
 	}}
-}
-
-// reportOpts aggregates the report function command options
-type reportOpts struct {
-	reporter string
-	inputf   string
-	outputf  string
 }
 
 // report validates the report arguments, sets up the required resources
 // and writes the report
-func report(opts *reportOpts) error {
-	rep, ok := reporters[opts.reporter]
-	if !ok {
-		log.Println("Reporter provided is not supported. Using text")
-		rep = vegeta.ReportText
+func report(reporter, inputs, output string) error {
+	if len(reporter) < 4 {
+		return fmt.Errorf("bad reporter: %s", reporter)
 	}
 
-	var all vegeta.Results
-	for _, input := range strings.Split(opts.inputf, ",") {
-		in, err := file(input, false)
+	files := strings.Split(inputs, ",")
+	srcs := make([]io.Reader, len(files))
+	for i, f := range files {
+		in, err := file(f, false)
 		if err != nil {
 			return err
 		}
-
-		var results vegeta.Results
-		if err = results.Decode(in); err != nil {
-			return err
-		}
-		in.Close()
-
-		all = append(all, results...)
+		defer in.Close()
+		srcs[i] = in
 	}
-	all.Sort()
+	dec := vegeta.NewDecoder(srcs...)
 
-	out, err := file(opts.outputf, true)
+	out, err := file(output, true)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	data, err := rep(all)
-	if err != nil {
-		return err
+	var (
+		rep    vegeta.Reporter
+		report vegeta.Report
+	)
+
+	switch reporter[:4] {
+	case "text":
+		var m vegeta.Metrics
+		rep, report = vegeta.NewTextReporter(&m), &m
+	case "json":
+		var m vegeta.Metrics
+		rep, report = vegeta.NewJSONReporter(&m), &m
+	case "plot":
+		var rs vegeta.Results
+		rep, report = vegeta.NewPlotReporter("Vegeta Plot", &rs), &rs
+	case "hist":
+		if len(reporter) < 6 {
+			return fmt.Errorf("bad buckets: '%s'", reporter[4:])
+		}
+		var hist vegeta.Histogram
+		if err := hist.Buckets.UnmarshalText([]byte(reporter[4:])); err != nil {
+			return err
+		}
+		rep, report = vegeta.NewHistogramReporter(&hist), &hist
+	default:
+		return fmt.Errorf("unknown reporter: %q", reporter)
 	}
-	_, err = out.Write(data)
 
-	return err
-}
+	sigch := make(chan os.Signal, 1)
+	signal.Notify(sigch, os.Interrupt)
 
-var reporters = map[string]vegeta.Reporter{
-	"text": vegeta.ReportText,
-	"json": vegeta.ReportJSON,
-	"plot": vegeta.ReportPlot,
+decode:
+	for {
+		select {
+		case <-sigch:
+			break decode
+		default:
+			var r vegeta.Result
+			if err = dec.Decode(&r); err != nil {
+				if err == io.EOF {
+					break decode
+				}
+				return err
+			}
+			report.Add(&r)
+		}
+	}
+
+	if c, ok := report.(vegeta.Closer); ok {
+		c.Close()
+	}
+
+	return rep.Report(out)
 }
