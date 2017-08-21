@@ -2,8 +2,10 @@ package yagnats
 
 import (
 	"bytes"
-	. "launchpad.net/gocheck"
+	"sync"
 	"time"
+
+	. "gopkg.in/check.v1"
 )
 
 type CSuite struct {
@@ -74,11 +76,31 @@ func (s *CSuite) TestConnectionDisconnect(c *C) {
 
 	// fill in a fake connection
 	s.Connection.conn = conn
-	go s.Connection.receivePackets()
+	c.Assert(conn.Closed, Equals, false)
 
 	s.Connection.Disconnect()
 
 	c.Assert(conn.Closed, Equals, true)
+}
+
+func (s *CSuite) TestConnectionDisconnectsOnParseErr(c *C) {
+	conn := &fakeConn{
+		ReadBuffer:  bytes.NewBuffer([]byte("!BAD\r\n")),
+		WriteBuffer: bytes.NewBuffer([]byte{}),
+		WriteChan:   make(chan []byte),
+		Closed:      false,
+	}
+
+	// fill in a fake connection
+	s.Connection.conn = conn
+	go s.Connection.receivePackets()
+
+	select {
+	case <-s.Connection.Disconnected:
+		c.Assert(conn.Closed, Equals, true)
+	case <-time.After(1 * time.Second):
+		c.Error("Connection never disconnected.")
+	}
 }
 
 func (s *CSuite) TestConnectionErrOrOKReturnsErrorOnDisconnect(c *C) {
@@ -141,39 +163,73 @@ func (s *CSuite) TestConnectionOnMessageCallback(c *C) {
 	}
 }
 
-func (s *CSuite) TestConnectionClusterReconnectsToRandomNode(c *C) {
+func (s *CSuite) TestConnectionClusterReconnectsAnother(c *C) {
+	lock := sync.Mutex{}
+	waitGroup := sync.WaitGroup{}
 	hellos := 0
+	thanks := 0
 	goodbyes := 0
+	errs := 0
 
-	for i := 0; i < 100; i++ {
-		node1 := &FakeConnectionProvider{
-			ReadBuffer:  "+OK\r\nMSG foo 1 5\r\nhello\r\n",
-			WriteBuffer: []byte{},
-		}
-
-		node2 := &FakeConnectionProvider{
-			ReadBuffer:  "+OK\r\nMSG foo 1 7\r\ngoodbye\r\n",
-			WriteBuffer: []byte{},
-		}
-
-		cluster := &ConnectionCluster{[]ConnectionProvider{node1, node2}}
-
-		conn, err := cluster.ProvideConnection()
-		c.Assert(err, IsNil)
-
-		conn.OnMessage(func(msg *MsgPacket) {
-			if string(msg.Payload) == "hello" {
-				hellos += 1
-			}
-
-			if string(msg.Payload) == "goodbye" {
-				goodbyes += 1
-			}
-		})
-
-		conn.ErrOrOK()
+	nodes := [](*FakeConnectionProvider){
+		&FakeConnectionProvider{
+			ReadBuffer:   "+OK\r\nMSG foo 1 5\r\nhello\r\n",
+			WriteBuffer:  []byte{},
+			ReturnsError: false,
+		},
+		&FakeConnectionProvider{
+			ReadBuffer:   "+OK\r\nMSG foo 1 5\r\nthank\r\n",
+			WriteBuffer:  []byte{},
+			ReturnsError: false,
+		},
+		&FakeConnectionProvider{
+			ReadBuffer:   "+OK\r\nMSG foo 1 7\r\ngoodbye\r\n",
+			WriteBuffer:  []byte{},
+			ReturnsError: false,
+		},
 	}
 
-	c.Assert(hellos, Not(Equals), 0)
-	c.Assert(goodbyes, Not(Equals), 0)
+	for i := 0; i < 4; i++ {
+		if i > 0 {
+			nodes[i-1].ReturnsError = true
+		}
+
+		cluster := &ConnectionCluster{[]ConnectionProvider{nodes[0], nodes[1], nodes[2]}}
+
+		conn, err := cluster.ProvideConnection()
+
+		if err != nil {
+			c.Assert(err.Error(), Equals, "error on dialing")
+			errs += 1
+		} else {
+			waitGroup.Add(1)
+			conn.OnMessage(func(msg *MsgPacket) {
+				lock.Lock()
+				defer lock.Unlock()
+
+				if string(msg.Payload) == "hello" {
+					hellos++
+				}
+				if string(msg.Payload) == "thank" {
+					thanks++
+				}
+				if string(msg.Payload) == "goodbye" {
+					goodbyes++
+				}
+				waitGroup.Done()
+			})
+
+			conn.ErrOrOK()
+		}
+	}
+
+	waitGroup.Wait()
+
+	lock.Lock()
+	defer lock.Unlock()
+
+	c.Assert(hellos, Equals, 1)
+	c.Assert(thanks, Equals, 1)
+	c.Assert(goodbyes, Equals, 1)
+	c.Assert(errs, Equals, 1)
 }
