@@ -2,8 +2,8 @@ variable "foo" {
   default = "bar"
 }
 
-variable "foo" {
+variable "foo2" {
   default = {
-    "foo" = "bar"
+    foo = "bar"
   }
 }

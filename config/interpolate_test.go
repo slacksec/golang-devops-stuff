@@ -4,13 +4,15 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/hil"
 )
 
 func TestNewInterpolatedVariable(t *testing.T) {
-	cases := []struct {
-		Input  string
-		Result InterpolatedVariable
-		Error  bool
+	tests := []struct {
+		Input string
+		Want  InterpolatedVariable
+		Error bool
 	}{
 		{
 			"var.foo",
@@ -20,16 +22,82 @@ func TestNewInterpolatedVariable(t *testing.T) {
 			},
 			false,
 		},
+		{
+			"local.foo",
+			&LocalVariable{
+				Name: "foo",
+			},
+			false,
+		},
+		{
+			"local.foo.nope",
+			nil,
+			true,
+		},
+		{
+			"module.foo.bar",
+			&ModuleVariable{
+				Name:  "foo",
+				Field: "bar",
+				key:   "module.foo.bar",
+			},
+			false,
+		},
+		{
+			"count.index",
+			&CountVariable{
+				Type: CountValueIndex,
+				key:  "count.index",
+			},
+			false,
+		},
+		{
+			"count.nope",
+			&CountVariable{
+				Type: CountValueInvalid,
+				key:  "count.nope",
+			},
+			false,
+		},
+		{
+			"path.module",
+			&PathVariable{
+				Type: PathValueModule,
+				key:  "path.module",
+			},
+			false,
+		},
+		{
+			"self.address",
+			&SelfVariable{
+				Field: "address",
+				key:   "self.address",
+			},
+			false,
+		},
+		{
+			"terraform.env",
+			&TerraformVariable{
+				Field: "env",
+				key:   "terraform.env",
+			},
+			false,
+		},
 	}
 
-	for i, tc := range cases {
-		actual, err := NewInterpolatedVariable(tc.Input)
-		if (err != nil) != tc.Error {
-			t.Fatalf("%d. Error: %s", i, err)
-		}
-		if !reflect.DeepEqual(actual, tc.Result) {
-			t.Fatalf("%d bad: %#v", i, actual)
-		}
+	for i, test := range tests {
+		t.Run(test.Input, func(t *testing.T) {
+			got, err := NewInterpolatedVariable(test.Input)
+			if err != nil != test.Error {
+				t.Errorf("%d. Error: %s", i, err)
+			}
+			if !test.Error && !reflect.DeepEqual(got, test.Want) {
+				t.Errorf(
+					"wrong result\ninput: %s\ngot:   %#v\nwant:  %#v",
+					test.Input, got, test.Want,
+				)
+			}
+		})
 	}
 }
 
@@ -39,6 +107,9 @@ func TestNewResourceVariable(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
+	if v.Mode != ManagedResourceMode {
+		t.Fatalf("bad: %#v", v)
+	}
 	if v.Type != "foo" {
 		t.Fatalf("bad: %#v", v)
 	}
@@ -57,6 +128,33 @@ func TestNewResourceVariable(t *testing.T) {
 	}
 }
 
+func TestNewResourceVariableData(t *testing.T) {
+	v, err := NewResourceVariable("data.foo.bar.baz")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if v.Mode != DataResourceMode {
+		t.Fatalf("bad: %#v", v)
+	}
+	if v.Type != "foo" {
+		t.Fatalf("bad: %#v", v)
+	}
+	if v.Name != "bar" {
+		t.Fatalf("bad: %#v", v)
+	}
+	if v.Field != "baz" {
+		t.Fatalf("bad: %#v", v)
+	}
+	if v.Multi {
+		t.Fatal("should not be multi")
+	}
+
+	if v.FullKey() != "data.foo.bar.baz" {
+		t.Fatalf("bad: %#v", v)
+	}
+}
+
 func TestNewUserVariable(t *testing.T) {
 	v, err := NewUserVariable("var.bar")
 	if err != nil {
@@ -71,91 +169,10 @@ func TestNewUserVariable(t *testing.T) {
 	}
 }
 
-func TestNewUserVariable_map(t *testing.T) {
-	v, err := NewUserVariable("var.bar.baz")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if v.Name != "bar" {
-		t.Fatalf("bad: %#v", v.Name)
-	}
-	if v.Elem != "baz" {
-		t.Fatalf("bad: %#v", v.Elem)
-	}
-	if v.FullKey() != "var.bar.baz" {
-		t.Fatalf("bad: %#v", v)
-	}
-}
-
-func TestFunctionInterpolation_impl(t *testing.T) {
-	var _ Interpolation = new(FunctionInterpolation)
-}
-
-func TestFunctionInterpolation(t *testing.T) {
-	v1, err := NewInterpolatedVariable("var.foo")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	v2, err := NewInterpolatedVariable("var.bar")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	fn := func(vs map[string]string, args ...string) (string, error) {
-		return strings.Join(args, " "), nil
-	}
-
-	i := &FunctionInterpolation{
-		Func: fn,
-		Args: []Interpolation{
-			&VariableInterpolation{Variable: v1},
-			&VariableInterpolation{Variable: v2},
-		},
-	}
-
-	expected := map[string]InterpolatedVariable{
-		"var.foo": v1,
-		"var.bar": v2,
-	}
-	if !reflect.DeepEqual(i.Variables(), expected) {
-		t.Fatalf("bad: %#v", i.Variables())
-	}
-
-	actual, err := i.Interpolate(map[string]string{
-		"var.foo": "bar",
-		"var.bar": "baz",
-	})
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if actual != "bar baz" {
-		t.Fatalf("bad: %#v", actual)
-	}
-}
-
-func TestLiteralInterpolation_impl(t *testing.T) {
-	var _ Interpolation = new(LiteralInterpolation)
-}
-
-func TestLiteralInterpolation(t *testing.T) {
-	i := &LiteralInterpolation{
-		Literal: "bar",
-	}
-
-	if i.Variables() != nil {
-		t.Fatalf("bad: %#v", i.Variables())
-	}
-
-	actual, err := i.Interpolate(nil)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if actual != "bar" {
-		t.Fatalf("bad: %#v", actual)
+func TestNewUserVariable_oldMapDotIndexErr(t *testing.T) {
+	_, err := NewUserVariable("var.bar.baz")
+	if err == nil || !strings.Contains(err.Error(), "Invalid dot index") {
+		t.Fatalf("Expected dot index err, got: %#v", err)
 	}
 }
 
@@ -215,46 +232,69 @@ func TestUserVariable_impl(t *testing.T) {
 	var _ InterpolatedVariable = new(UserVariable)
 }
 
-func TestVariableInterpolation_impl(t *testing.T) {
-	var _ Interpolation = new(VariableInterpolation)
-}
+func TestDetectVariables(t *testing.T) {
+	cases := []struct {
+		Input  string
+		Result []InterpolatedVariable
+	}{
+		{
+			"foo $${var.foo}",
+			nil,
+		},
 
-func TestVariableInterpolation(t *testing.T) {
-	uv, err := NewUserVariable("var.foo")
-	if err != nil {
-		t.Fatalf("err: %s", err)
+		{
+			"foo ${var.foo}",
+			[]InterpolatedVariable{
+				&UserVariable{
+					Name: "foo",
+					key:  "var.foo",
+				},
+			},
+		},
+
+		{
+			"foo ${var.foo} ${var.bar}",
+			[]InterpolatedVariable{
+				&UserVariable{
+					Name: "foo",
+					key:  "var.foo",
+				},
+				&UserVariable{
+					Name: "bar",
+					key:  "var.bar",
+				},
+			},
+		},
+
+		{
+			`foo ${module.foo.output["key"]}`,
+			[]InterpolatedVariable{
+				&ModuleVariable{
+					Name:  "foo",
+					Field: "output",
+					key:   "module.foo.output",
+				},
+				&ModuleVariable{
+					Name:  "foo",
+					Field: "output",
+					key:   "module.foo.output",
+				},
+			},
+		},
 	}
 
-	i := &VariableInterpolation{Variable: uv}
+	for _, tc := range cases {
+		ast, err := hil.Parse(tc.Input)
+		if err != nil {
+			t.Fatalf("%s\n\nInput: %s", err, tc.Input)
+		}
 
-	expected := map[string]InterpolatedVariable{"var.foo": uv}
-	if !reflect.DeepEqual(i.Variables(), expected) {
-		t.Fatalf("bad: %#v", i.Variables())
-	}
-
-	actual, err := i.Interpolate(map[string]string{
-		"var.foo": "bar",
-	})
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	if actual != "bar" {
-		t.Fatalf("bad: %#v", actual)
-	}
-}
-
-func TestVariableInterpolation_missing(t *testing.T) {
-	uv, err := NewUserVariable("var.foo")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	i := &VariableInterpolation{Variable: uv}
-	_, err = i.Interpolate(map[string]string{
-		"var.bar": "bar",
-	})
-	if err == nil {
-		t.Fatal("should error")
+		actual, err := DetectVariables(ast)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		if !reflect.DeepEqual(actual, tc.Result) {
+			t.Fatalf("bad: %#v\n\nInput: %s", actual, tc.Input)
+		}
 	}
 }

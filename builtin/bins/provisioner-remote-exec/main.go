@@ -6,5 +6,7 @@ import (
 )
 
 func main() {
-	plugin.Serve(new(remoteexec.ResourceProvisioner))
+	plugin.Serve(&plugin.ServeOpts{
+		ProvisionerFunc: remoteexec.Provisioner,
+	})
 }

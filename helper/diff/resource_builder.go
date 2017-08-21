@@ -3,6 +3,7 @@ package diff
 import (
 	"strings"
 
+	"github.com/hashicorp/terraform/config"
 	"github.com/hashicorp/terraform/flatmap"
 	"github.com/hashicorp/terraform/terraform"
 )
@@ -61,8 +62,8 @@ type PreProcessFunc func(string) string
 // Diff returns the ResourceDiff for a resource given its state and
 // configuration.
 func (b *ResourceBuilder) Diff(
-	s *terraform.ResourceState,
-	c *terraform.ResourceConfig) (*terraform.ResourceDiff, error) {
+	s *terraform.InstanceState,
+	c *terraform.ResourceConfig) (*terraform.InstanceDiff, error) {
 	attrs := make(map[string]*terraform.ResourceAttrDiff)
 
 	// We require a new resource if the ID is empty. Or, later, we set
@@ -94,7 +95,7 @@ func (b *ResourceBuilder) Diff(
 
 			// If this key is in the cleaned config, then use that value
 			// because it'll have its variables properly interpolated
-			if cleanV, ok := flatConfig[k]; ok {
+			if cleanV, ok := flatConfig[k]; ok && cleanV != config.UnknownVariableValue {
 				v = cleanV
 				originalV = v
 
@@ -207,9 +208,9 @@ func (b *ResourceBuilder) Diff(
 	}
 
 	// Build our resulting diff if we had attributes change
-	var result *terraform.ResourceDiff
+	var result *terraform.InstanceDiff
 	if len(attrs) > 0 {
-		result = &terraform.ResourceDiff{
+		result = &terraform.InstanceDiff{
 			Attributes: attrs,
 		}
 	}

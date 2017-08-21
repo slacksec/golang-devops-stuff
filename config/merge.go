@@ -25,6 +25,23 @@ func Merge(c1, c2 *Config) (*Config, error) {
 		}
 	}
 
+	// Merge Atlas configuration. This is a dumb one overrides the other
+	// sort of merge.
+	c.Atlas = c1.Atlas
+	if c2.Atlas != nil {
+		c.Atlas = c2.Atlas
+	}
+
+	// Merge the Terraform configuration
+	if c1.Terraform != nil {
+		c.Terraform = c1.Terraform
+		if c2.Terraform != nil {
+			c.Terraform.Merge(c2.Terraform)
+		}
+	} else {
+		c.Terraform = c2.Terraform
+	}
+
 	// NOTE: Everything below is pretty gross. Due to the lack of generics
 	// in Go, there is some hoop-jumping involved to make this merging a
 	// little more test-friendly and less repetitive. Ironically, making it
@@ -34,6 +51,23 @@ func Merge(c1, c2 *Config) (*Config, error) {
 	// are pretty low-error.
 
 	var m1, m2, mresult []merger
+
+	// Modules
+	m1 = make([]merger, 0, len(c1.Modules))
+	m2 = make([]merger, 0, len(c2.Modules))
+	for _, v := range c1.Modules {
+		m1 = append(m1, v)
+	}
+	for _, v := range c2.Modules {
+		m2 = append(m2, v)
+	}
+	mresult = mergeSlice(m1, m2)
+	if len(mresult) > 0 {
+		c.Modules = make([]*Module, len(mresult))
+		for i, v := range mresult {
+			c.Modules[i] = v.(*Module)
+		}
+	}
 
 	// Outputs
 	m1 = make([]merger, 0, len(c1.Outputs))

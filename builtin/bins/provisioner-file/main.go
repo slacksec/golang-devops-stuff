@@ -6,5 +6,7 @@ import (
 )
 
 func main() {
-	plugin.Serve(new(file.ResourceProvisioner))
+	plugin.Serve(&plugin.ServeOpts{
+		ProvisionerFunc: file.Provisioner,
+	})
 }
