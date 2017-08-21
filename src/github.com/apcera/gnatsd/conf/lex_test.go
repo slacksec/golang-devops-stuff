@@ -1,23 +1,32 @@
 package conf
 
-import (
-	"testing"
-)
+import "testing"
 
 // Test to make sure we get what we expect.
 func expect(t *testing.T, lx *lexer, items []item) {
 	for i := 0; i < len(items); i++ {
 		item := lx.nextItem()
+		_ = item.String()
 		if item.typ == itemEOF {
 			break
-		} else if item.typ == itemError {
-			t.Fatal(item.val)
 		}
 		if item != items[i] {
 			t.Fatalf("Testing: '%s'\nExpected %q, received %q\n",
 				lx.input, items[i], item)
 		}
+		if item.typ == itemError {
+			break
+		}
 	}
+}
+
+func TestPlainValue(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo")
+	expect(t, lx, expectedItems)
 }
 
 func TestSimpleKeyStringValues(t *testing.T) {
@@ -38,6 +47,39 @@ func TestSimpleKeyStringValues(t *testing.T) {
 	// NL
 	lx = lex("foo='bar'\r\n")
 	expect(t, lx, expectedItems)
+	lx = lex("foo=\t'bar'\t")
+	expect(t, lx, expectedItems)
+}
+
+func TestComplexStringValues(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "bar\\r\\n  \\t", 1},
+		{itemEOF, "", 2},
+	}
+
+	lx := lex("foo = 'bar\\r\\n  \\t'")
+	expect(t, lx, expectedItems)
+}
+
+func TestBinaryString(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "e", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = \\x65")
+	expect(t, lx, expectedItems)
+}
+
+func TestBinaryStringLatin1(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "\xe9", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = \\xe9")
+	expect(t, lx, expectedItems)
 }
 
 func TestSimpleKeyIntegerValues(t *testing.T) {
@@ -54,6 +96,103 @@ func TestSimpleKeyIntegerValues(t *testing.T) {
 	expect(t, lx, expectedItems)
 }
 
+func TestSimpleKeyNegativeIntegerValues(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "-123", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = -123")
+	expect(t, lx, expectedItems)
+	lx = lex("foo=-123")
+	expect(t, lx, expectedItems)
+	lx = lex("foo=-123\r\n")
+	expect(t, lx, expectedItems)
+}
+
+func TestConvenientIntegerValues(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1k", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = 1k")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1K", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1K")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1m", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1m")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1M", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1M")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1g", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1g")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1G", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1G")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1MB", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1MB")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "1Gb", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = 1Gb")
+	expect(t, lx, expectedItems)
+
+	// Negative versions
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "-1m", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = -1m")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "-1GB", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("foo = -1GB ")
+	expect(t, lx, expectedItems)
+}
+
 func TestSimpleKeyFloatValues(t *testing.T) {
 	expectedItems := []item{
 		{itemKey, "foo", 1},
@@ -65,6 +204,65 @@ func TestSimpleKeyFloatValues(t *testing.T) {
 	lx = lex("foo=22.2")
 	expect(t, lx, expectedItems)
 	lx = lex("foo=22.2\r\n")
+	expect(t, lx, expectedItems)
+}
+
+func TestBadBinaryStringEndingAfterZeroHexChars(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemError, "Expected two hexadecimal digits after '\\x', but hit end of line", 2},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = xyz\\x\n")
+	expect(t, lx, expectedItems)
+}
+
+func TestBadBinaryStringEndingAfterOneHexChar(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemError, "Expected two hexadecimal digits after '\\x', but hit end of line", 2},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = xyz\\xF\n")
+	expect(t, lx, expectedItems)
+}
+
+func TestBadBinaryStringWithZeroHexChars(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemError, "Expected two hexadecimal digits after '\\x', but got ']\"'", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex(`foo = "[\x]"`)
+	expect(t, lx, expectedItems)
+}
+
+func TestBadBinaryStringWithOneHexChar(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemError, "Expected two hexadecimal digits after '\\x', but got 'e]'", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex(`foo = "[\xe]"`)
+	expect(t, lx, expectedItems)
+}
+
+func TestBadFloatValues(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemError, "Floats must start with a digit", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = .2")
+	expect(t, lx, expectedItems)
+}
+
+func TestBadKey(t *testing.T) {
+	expectedItems := []item{
+		{itemError, "Unexpected key separator ':'", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex(" :foo = 22")
 	expect(t, lx, expectedItems)
 }
 
@@ -96,6 +294,60 @@ func TestComments(t *testing.T) {
 	expect(t, lx, expectedItems)
 }
 
+func TestTopValuesWithComments(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemInteger, "123", 1},
+		{itemCommentStart, "", 1},
+		{itemText, " This is a comment", 1},
+		{itemEOF, "", 1},
+	}
+
+	lx := lex("foo = 123 // This is a comment")
+	expect(t, lx, expectedItems)
+	lx = lex("foo=123    # This is a comment")
+	expect(t, lx, expectedItems)
+}
+
+func TestRawString(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "bar", 1},
+		{itemEOF, "", 1},
+	}
+
+	lx := lex("foo = bar")
+	expect(t, lx, expectedItems)
+
+	lx = lex(`foo = bar' `) //'single-quote for emacs TODO: Remove me
+	expect(t, lx, expectedItems)
+}
+
+func TestDateValues(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemDatetime, "2016-05-04T18:53:41Z", 1},
+		{itemEOF, "", 1},
+	}
+
+	lx := lex("foo = 2016-05-04T18:53:41Z")
+	expect(t, lx, expectedItems)
+}
+
+func TestVariableValues(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemVariable, "bar", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("foo = $bar")
+	expect(t, lx, expectedItems)
+	lx = lex("foo =$bar")
+	expect(t, lx, expectedItems)
+	lx = lex("foo $bar")
+	expect(t, lx, expectedItems)
+}
+
 func TestArrays(t *testing.T) {
 	expectedItems := []item{
 		{itemKey, "foo", 1},
@@ -120,7 +372,7 @@ var mlArray = `
 foo = [
  1, # One
  2, // Two
- 3 , // Three
+ 3 # Three
  'bar'     ,
  "bar"
 ]
@@ -153,7 +405,7 @@ func TestMultilineArrays(t *testing.T) {
 var mlArrayNoSep = `
 # top level comment
 foo = [
- 1
+ 1 // foo
  2
  3
  'bar'
@@ -168,6 +420,8 @@ func TestMultilineArraysNoSep(t *testing.T) {
 		{itemKey, "foo", 3},
 		{itemArrayStart, "", 3},
 		{itemInteger, "1", 4},
+		{itemCommentStart, "", 4},
+		{itemText, " foo", 4},
 		{itemInteger, "2", 5},
 		{itemInteger, "3", 6},
 		{itemString, "bar", 7},
@@ -197,8 +451,8 @@ func TestSimpleMap(t *testing.T) {
 
 var mlMap = `
 foo = {
-  ip = '127.0.0.1'
-  port= 4242
+  ip = '127.0.0.1' # the IP
+  port= 4242 // the port
 }
 `
 
@@ -208,8 +462,12 @@ func TestMultilineMap(t *testing.T) {
 		{itemMapStart, "", 2},
 		{itemKey, "ip", 3},
 		{itemString, "127.0.0.1", 3},
+		{itemCommentStart, "", 3},
+		{itemText, " the IP", 3},
 		{itemKey, "port", 4},
 		{itemInteger, "4242", 4},
+		{itemCommentStart, "", 4},
+		{itemText, " the port", 4},
 		{itemMapEnd, "", 5},
 		{itemEOF, "", 5},
 	}
@@ -301,6 +559,152 @@ func TestWhitespaceKeySep(t *testing.T) {
 	lx = lex("foo\t123")
 	expect(t, lx, expectedItems)
 	lx = lex("foo\t\t123\r\n")
+	expect(t, lx, expectedItems)
+}
+
+var escString = `
+foo  = \t
+bar  = \r
+baz  = \n
+q    = \"
+bs   = \\
+`
+
+func TestEscapedString(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 2},
+		{itemString, "\t", 2},
+		{itemKey, "bar", 3},
+		{itemString, "\r", 3},
+		{itemKey, "baz", 4},
+		{itemString, "\n", 4},
+		{itemKey, "q", 5},
+		{itemString, "\"", 5},
+		{itemKey, "bs", 6},
+		{itemString, "\\", 6},
+		{itemEOF, "", 6},
+	}
+	lx := lex(escString)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringES(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "\\end", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = "\\end"`)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringSE(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "start\\", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = "start\\"`)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringEE(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "Eq", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = \x45\x71`)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringSEE(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "startEq", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = start\x45\x71`)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringSES(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "start|end", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = start\x7Cend`)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringEES(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "<>end", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = \x3c\x3eend`)
+	expect(t, lx, expectedItems)
+}
+
+func TestCompoundStringESE(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "<middle>", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = \x3cmiddle\x3E`)
+	expect(t, lx, expectedItems)
+}
+
+func TestBadStringEscape(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemError, "Invalid escape character 'y'. Only the following escape characters are allowed: \\xXX, \\t, \\n, \\r, \\\", \\\\.", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = \y`)
+	expect(t, lx, expectedItems)
+}
+
+func TestNonBool(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "\\true", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = \\true`)
+	expect(t, lx, expectedItems)
+}
+
+func TestNonVariable(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "\\$var", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = \\$var`)
+	expect(t, lx, expectedItems)
+}
+
+func TestEmptyStringDQ(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = ""`)
+	expect(t, lx, expectedItems)
+}
+
+func TestEmptyStringSQ(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemString, "", 1},
+		{itemEOF, "", 2},
+	}
+	lx := lex(`foo = ''`)
 	expect(t, lx, expectedItems)
 }
 
@@ -523,5 +927,125 @@ func TestBlockStringMultiLine(t *testing.T) {
 		{itemString, "\n  12(34)56\n  (\n    7890\n  )\n", 7},
 	}
 	lx := lex(mlblockexample)
+	expect(t, lx, expectedItems)
+}
+
+func TestUnquotedIPAddr(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "listen", 1},
+		{itemString, "127.0.0.1:4222", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("listen: 127.0.0.1:4222")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "listen", 1},
+		{itemString, "127.0.0.1", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("listen: 127.0.0.1")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "listen", 1},
+		{itemString, "apcera.me:80", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("listen: apcera.me:80")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "listen", 1},
+		{itemString, ":80", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("listen = :80")
+	expect(t, lx, expectedItems)
+
+	expectedItems = []item{
+		{itemKey, "listen", 1},
+		{itemArrayStart, "", 1},
+		{itemString, "localhost:4222", 1},
+		{itemString, "localhost:4333", 1},
+		{itemArrayEnd, "", 1},
+		{itemEOF, "", 1},
+	}
+	lx = lex("listen = [localhost:4222, localhost:4333]")
+	expect(t, lx, expectedItems)
+}
+
+var arrayOfMaps = `
+authorization {
+    users = [
+      {user: alice, password: foo}
+      {user: bob,   password: bar}
+    ]
+    timeout: 0.5
+}
+`
+
+func TestArrayOfMaps(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "authorization", 2},
+		{itemMapStart, "", 2},
+		{itemKey, "users", 3},
+		{itemArrayStart, "", 3},
+		{itemMapStart, "", 4},
+		{itemKey, "user", 4},
+		{itemString, "alice", 4},
+		{itemKey, "password", 4},
+		{itemString, "foo", 4},
+		{itemMapEnd, "", 4},
+		{itemMapStart, "", 5},
+		{itemKey, "user", 5},
+		{itemString, "bob", 5},
+		{itemKey, "password", 5},
+		{itemString, "bar", 5},
+		{itemMapEnd, "", 5},
+		{itemArrayEnd, "", 6},
+		{itemKey, "timeout", 7},
+		{itemFloat, "0.5", 7},
+		{itemMapEnd, "", 8},
+		{itemEOF, "", 9},
+	}
+	lx := lex(arrayOfMaps)
+	expect(t, lx, expectedItems)
+}
+
+func TestInclude(t *testing.T) {
+	expectedItems := []item{
+		{itemInclude, "users.conf", 1},
+		{itemEOF, "", 1},
+	}
+	lx := lex("include \"users.conf\"")
+	expect(t, lx, expectedItems)
+
+	lx = lex("include 'users.conf'")
+	expect(t, lx, expectedItems)
+
+	lx = lex("include users.conf")
+	expect(t, lx, expectedItems)
+}
+
+func TestMapInclude(t *testing.T) {
+	expectedItems := []item{
+		{itemKey, "foo", 1},
+		{itemMapStart, "", 1},
+		{itemInclude, "users.conf", 1},
+		{itemMapEnd, "", 1},
+		{itemEOF, "", 1},
+	}
+
+	lx := lex("foo { include users.conf }")
+	expect(t, lx, expectedItems)
+
+	lx = lex("foo {include users.conf}")
+	expect(t, lx, expectedItems)
+
+	lx = lex("foo { include 'users.conf' }")
+	expect(t, lx, expectedItems)
+
+	lx = lex("foo { include \"users.conf\"}")
 	expect(t, lx, expectedItems)
 }

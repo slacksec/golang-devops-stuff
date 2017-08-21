@@ -1,15 +1,19 @@
-// Copyright 2012-2013 Apcera Inc. All rights reserved.
+// Copyright 2012-2014 Apcera Inc. All rights reserved.
 
 package test
 
 import (
 	"testing"
 
-	"github.com/apcera/gnatsd/server"
+	"github.com/nats-io/gnatsd/server"
 )
 
 func runPedanticServer() *server.Server {
 	opts := DefaultTestOptions
+
+	opts.NoLog = false
+	opts.Trace = true
+
 	opts.Port = PROTO_TEST_PORT
 	return RunServer(&opts)
 }
@@ -17,12 +21,13 @@ func runPedanticServer() *server.Server {
 func TestPedanticSub(t *testing.T) {
 	s := runPedanticServer()
 	defer s.Shutdown()
+
 	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
 	defer c.Close()
+
 	send := sendCommand(t, c)
 	expect := expectCommand(t, c)
-	doConnect(t, c, true, true, false)
-	expect(okRe)
+	doConnect(t, c, false, true, false)
 
 	// Ping should still be same
 	send("PING\r\n")
@@ -56,18 +61,18 @@ func TestPedanticSub(t *testing.T) {
 	if string(matches[0][1]) != "'Invalid Subject'" {
 		t.Fatalf("Expected 'Invalid Subject', got %s", string(matches[0][1]))
 	}
-
 }
 
 func TestPedanticPub(t *testing.T) {
 	s := runPedanticServer()
 	defer s.Shutdown()
+
 	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
 	defer c.Close()
+
 	send := sendCommand(t, c)
 	expect := expectCommand(t, c)
-	doConnect(t, c, true, true, false)
-	expect(okRe)
+	doConnect(t, c, false, true, false)
 
 	// Ping should still be same
 	send("PING\r\n")

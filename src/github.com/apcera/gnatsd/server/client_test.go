@@ -1,15 +1,23 @@
+// Copyright 2012-2016 Apcera Inc. All rights reserved.
+
 package server
 
 import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"crypto/tls"
+
+	"github.com/nats-io/go-nats"
 )
 
 type serverInfo struct {
@@ -18,7 +26,7 @@ type serverInfo struct {
 	Port         uint   `json:"port"`
 	Version      string `json:"version"`
 	AuthRequired bool   `json:"auth_required"`
-	SslRequired  bool   `json:"ssl_required"`
+	TLSRequired  bool   `json:"ssl_required"`
 	MaxPayload   int64  `json:"max_payload"`
 }
 
@@ -38,12 +46,14 @@ var defaultServerOptions = Options{
 	NoSigs: true,
 }
 
-func rawSetup() (*Server, *client, *bufio.Reader, string) {
+func rawSetup(serverOptions Options) (*Server, *client, *bufio.Reader, string) {
 	cli, srv := net.Pipe()
-	cr := bufio.NewReaderSize(cli, defaultBufSize)
-	s := New(&defaultServerOptions)
+	cr := bufio.NewReaderSize(cli, maxBufSize)
+	s := New(&serverOptions)
+
 	ch := make(chan *client)
 	createClientAsync(ch, s, srv)
+
 	l, _ := cr.ReadString('\n')
 
 	// Grab client
@@ -52,12 +62,12 @@ func rawSetup() (*Server, *client, *bufio.Reader, string) {
 }
 
 func setUpClientWithResponse() (*client, string) {
-	_, c, _, l := rawSetup()
+	_, c, _, l := rawSetup(defaultServerOptions)
 	return c, l
 }
 
 func setupClient() (*Server, *client, *bufio.Reader) {
-	s, c, cr, _ := rawSetup()
+	s, c, cr, _ := rawSetup(defaultServerOptions)
 	return s, c, cr
 }
 
@@ -82,9 +92,17 @@ func TestClientCreateAndInfo(t *testing.T) {
 	}
 	// Sanity checks
 	if info.MaxPayload != MAX_PAYLOAD_SIZE ||
-		info.AuthRequired || info.SslRequired ||
+		info.AuthRequired || info.TLSRequired ||
 		info.Port != DEFAULT_PORT {
 		t.Fatalf("INFO inconsistent: %+v\n", info)
+	}
+}
+
+func TestNonTLSConnectionState(t *testing.T) {
+	_, c, _ := setupClient()
+	state := c.GetTLSConnectionState()
+	if state != nil {
+		t.Error("GetTLSConnectionState() returned non-nil")
 	}
 }
 
@@ -147,6 +165,63 @@ func TestClientConnect(t *testing.T) {
 	if !reflect.DeepEqual(c.opts, clientOpts{Verbose: true, Pedantic: true, Authorization: "YZZ222", Name: "router"}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
+}
+
+func TestClientConnectProto(t *testing.T) {
+	_, c, r := setupClient()
+
+	// Basic Connect setting flags, proto should be zero (original proto)
+	connectOp := []byte("CONNECT {\"verbose\":true,\"pedantic\":true,\"ssl_required\":false}\r\n")
+	err := c.parse(connectOp)
+	if err != nil {
+		t.Fatalf("Received error: %v\n", err)
+	}
+	if c.state != OP_START {
+		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
+	}
+	if !reflect.DeepEqual(c.opts, clientOpts{Verbose: true, Pedantic: true, Protocol: ClientProtoZero}) {
+		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
+	}
+
+	// ProtoInfo
+	connectOp = []byte(fmt.Sprintf("CONNECT {\"verbose\":true,\"pedantic\":true,\"ssl_required\":false,\"protocol\":%d}\r\n", ClientProtoInfo))
+	err = c.parse(connectOp)
+	if err != nil {
+		t.Fatalf("Received error: %v\n", err)
+	}
+	if c.state != OP_START {
+		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
+	}
+	if !reflect.DeepEqual(c.opts, clientOpts{Verbose: true, Pedantic: true, Protocol: ClientProtoInfo}) {
+		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
+	}
+	if c.opts.Protocol != ClientProtoInfo {
+		t.Fatalf("Protocol should have been set to %v, but is set to %v", ClientProtoInfo, c.opts.Protocol)
+	}
+
+	// Illegal Option
+	connectOp = []byte("CONNECT {\"protocol\":22}\r\n")
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	// The client here is using a pipe, we need to be dequeuing
+	// data otherwise the server would be blocked trying to send
+	// the error back to it.
+	go func() {
+		defer wg.Done()
+		for {
+			if _, _, err := r.ReadLine(); err != nil {
+				return
+			}
+		}
+	}()
+	err = c.parse(connectOp)
+	if err == nil {
+		t.Fatalf("Expected to receive an error\n")
+	}
+	if err != ErrBadClientProtocol {
+		t.Fatalf("Expected err of %q, got  %q\n", ErrBadClientProtocol, err)
+	}
+	wg.Wait()
 }
 
 func TestClientPing(t *testing.T) {
@@ -269,7 +344,7 @@ func TestClientNoBodyPubSubWithReply(t *testing.T) {
 func TestClientPubWithQueueSub(t *testing.T) {
 	_, c, cr := setupClient()
 
-	num := 10
+	num := 100
 
 	// Queue SUB/PUB
 	subs := []byte("SUB foo g1 1\r\nSUB foo g1 2\r\n")
@@ -289,7 +364,7 @@ func TestClientPubWithQueueSub(t *testing.T) {
 	}()
 
 	var n1, n2, received int
-	for ; ; received += 1 {
+	for ; ; received++ {
 		l, err := cr.ReadString('\n')
 		if err != nil {
 			break
@@ -309,7 +384,7 @@ func TestClientPubWithQueueSub(t *testing.T) {
 		t.Fatalf("Received wrong # of msgs: %d vs %d\n", received, num)
 	}
 	// Threshold for randomness for now
-	if n1 < 2 || n2 < 2 {
+	if n1 < 20 || n2 < 20 {
 		t.Fatalf("Received wrong # of msgs per subscriber: %d - %d\n", n1, n2)
 	}
 }
@@ -338,7 +413,7 @@ func TestClientUnSub(t *testing.T) {
 	}()
 
 	var received int
-	for ; ; received += 1 {
+	for ; ; received++ {
 		l, err := cr.ReadString('\n')
 		if err != nil {
 			break
@@ -381,7 +456,7 @@ func TestClientUnSubMax(t *testing.T) {
 	}()
 
 	var received int
-	for ; ; received += 1 {
+	for ; ; received++ {
 		l, err := cr.ReadString('\n')
 		if err != nil {
 			break
@@ -421,9 +496,8 @@ func TestClientAutoUnsubExactReceived(t *testing.T) {
 	<-ch
 
 	// We should not have any subscriptions in place here.
-	if c.subs.Count() != 0 {
-		t.Fatalf("Wrong number of subscriptions: expected 0, got %d\n",
-			c.subs.Count())
+	if len(c.subs) != 0 {
+		t.Fatalf("Wrong number of subscriptions: expected 0, got %d\n", len(c.subs))
 	}
 }
 
@@ -451,9 +525,8 @@ func TestClientUnsubAfterAutoUnsub(t *testing.T) {
 	<-ch
 
 	// We should not have any subscriptions in place here.
-	if c.subs.Count() != 0 {
-		t.Fatalf("Wrong number of subscriptions: expected 0, got %d\n",
-			c.subs.Count())
+	if len(c.subs) != 0 {
+		t.Fatalf("Wrong number of subscriptions: expected 0, got %d\n", len(c.subs))
 	}
 }
 
@@ -472,6 +545,23 @@ func TestClientRemoveSubsOnDisconnect(t *testing.T) {
 		t.Fatalf("Should have 2 subscriptions, got %d\n", s.sl.Count())
 	}
 	c.closeConnection()
+	if s.sl.Count() != 0 {
+		t.Fatalf("Should have no subscriptions after close, got %d\n", s.sl.Count())
+	}
+}
+
+func TestClientDoesNotAddSubscriptionsWhenConnectionClosed(t *testing.T) {
+	s, c, _ := setupClient()
+	c.closeConnection()
+	subs := []byte("SUB foo 1\r\nSUB bar 2\r\n")
+
+	ch := make(chan bool)
+	go func() {
+		c.parse(subs)
+		ch <- true
+	}()
+	<-ch
+
 	if s.sl.Count() != 0 {
 		t.Fatalf("Should have no subscriptions after close, got %d\n", s.sl.Count())
 	}
@@ -498,6 +588,32 @@ func TestClientMapRemoval(t *testing.T) {
 	}
 }
 
+func TestAuthorizationTimeout(t *testing.T) {
+	serverOptions := DefaultOptions()
+	serverOptions.Authorization = "my_token"
+	serverOptions.AuthTimeout = 0.4
+	s := RunServer(serverOptions)
+	defer s.Shutdown()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", serverOptions.Host, serverOptions.Port))
+	if err != nil {
+		t.Fatalf("Error dialing server: %v\n", err)
+	}
+	defer conn.Close()
+	client := bufio.NewReaderSize(conn, maxBufSize)
+	if _, err := client.ReadString('\n'); err != nil {
+		t.Fatalf("Error receiving info from server: %v\n", err)
+	}
+	time.Sleep(3 * secondsToDuration(serverOptions.AuthTimeout))
+	l, err := client.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Error receiving info from server: %v\n", err)
+	}
+	if !strings.Contains(l, "Authorization Timeout") {
+		t.Fatalf("Authorization Timeout response incorrect: %q\n", l)
+	}
+}
+
 // This is from bug report #18
 func TestTwoTokenPubMatchSingleTokenSub(t *testing.T) {
 	_, c, cr := setupClient()
@@ -511,8 +627,143 @@ func TestTwoTokenPubMatchSingleTokenSub(t *testing.T) {
 		t.Fatalf("PONG response incorrect: %q\n", l)
 	}
 	// Expect just a pong, no match should exist here..
-	l, err = cr.ReadString('\n')
+	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "PONG\r\n") {
 		t.Fatalf("PONG response was expected, got: %q\n", l)
 	}
+}
+
+func TestUnsubRace(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("nats://%s:%d",
+		s.getOpts().Host,
+		s.Addr().(*net.TCPAddr).Port,
+	)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error creating client to %s: %v\n", url, err)
+	}
+	defer nc.Close()
+
+	ncp, err := nats.Connect(fmt.Sprintf("nats://%s:%d",
+		s.getOpts().Host,
+		s.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatalf("Error creating client: %v\n", err)
+	}
+	defer ncp.Close()
+
+	sub, _ := nc.Subscribe("foo", func(m *nats.Msg) {
+		// Just eat it..
+	})
+
+	nc.Flush()
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+		for i := 0; i < 10000; i++ {
+			ncp.Publish("foo", []byte("hello"))
+		}
+		wg.Done()
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+
+	sub.Unsubscribe()
+
+	wg.Wait()
+}
+
+func TestTLSCloseClientConnection(t *testing.T) {
+	opts, err := ProcessConfigFile("./configs/tls.conf")
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	opts.TLSTimeout = 100
+	opts.NoLog = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	endpoint := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
+	conn, err := net.DialTimeout("tcp", endpoint, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error on dial: %v", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReaderSize(conn, 100)
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("Unexpected error reading INFO: %v", err)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	defer tlsConn.Close()
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("Unexpected error during handshake: %v", err)
+	}
+	br = bufio.NewReaderSize(tlsConn, 100)
+	connectOp := []byte("CONNECT {\"user\":\"derek\",\"pass\":\"foo\",\"verbose\":false,\"pedantic\":false,\"tls_required\":true}\r\n")
+	if _, err := tlsConn.Write(connectOp); err != nil {
+		t.Fatalf("Unexpected error writing CONNECT: %v", err)
+	}
+	if _, err := tlsConn.Write([]byte("PING\r\n")); err != nil {
+		t.Fatalf("Unexpected error writing PING: %v", err)
+	}
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("Unexpected error reading PONG: %v", err)
+	}
+
+	getClient := func() *client {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, c := range s.clients {
+			return c
+		}
+		return nil
+	}
+	// Wait for client to be registered.
+	timeout := time.Now().Add(5 * time.Second)
+	var cli *client
+	for time.Now().Before(timeout) {
+		cli = getClient()
+		if cli != nil {
+			break
+		}
+	}
+	if cli == nil {
+		t.Fatal("Did not register client on time")
+	}
+	// Test GetTLSConnectionState
+	state := cli.GetTLSConnectionState()
+	if state == nil {
+		t.Error("GetTLSConnectionState() returned nil")
+	}
+	// Fill the buffer. Need to send 1 byte at a time so that we timeout here
+	// the nc.Close() would block due to a write that can not complete.
+	done := false
+	for !done {
+		cli.nc.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := cli.nc.Write([]byte("a")); err != nil {
+			done = true
+		}
+		cli.nc.SetWriteDeadline(time.Time{})
+	}
+	ch := make(chan bool)
+	go func() {
+		select {
+		case <-ch:
+			return
+		case <-time.After(3 * time.Second):
+			fmt.Println("!!!! closeConnection is blocked, test will hang !!!")
+			return
+		}
+	}()
+	// Close the client
+	cli.closeConnection()
+	ch <- true
 }

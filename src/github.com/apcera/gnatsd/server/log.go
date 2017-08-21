@@ -1,119 +1,163 @@
-// Copyright 2012-2013 Apcera Inc. All rights reserved.
+// Copyright 2012-2017 Apcera Inc. All rights reserved.
 
 package server
 
 import (
-	"fmt"
-	"log"
 	"os"
-	"strings"
 	"sync/atomic"
+
+	"github.com/nats-io/gnatsd/logger"
 )
 
-// logging functionality, compatible with the original nats-server.
+// Logger interface of the NATS Server
+type Logger interface {
 
-var trace int32
-var debug int32
-var nolog int32
+	// Log a notice statement
+	Noticef(format string, v ...interface{})
 
-// LogSetup will properly setup logging and the logging flags.
-func LogSetup() {
-	log.SetFlags(0)
-	atomic.StoreInt32(&nolog, 0)
-	atomic.StoreInt32(&debug, 0)
-	atomic.StoreInt32(&trace, 0)
+	// Log a fatal error
+	Fatalf(format string, v ...interface{})
+
+	// Log an error
+	Errorf(format string, v ...interface{})
+
+	// Log a debug statement
+	Debugf(format string, v ...interface{})
+
+	// Log a trace statement
+	Tracef(format string, v ...interface{})
 }
 
-// LogInit parses option flags and sets up logging.
-func (s *Server) LogInit() {
-	// Reset
-	LogSetup()
+// ConfigureLogger configures and sets the logger for the server.
+func (s *Server) ConfigureLogger() {
+	var (
+		log Logger
 
-	if s.opts.Logtime {
-		log.SetFlags(log.LstdFlags)
+		// Snapshot server options.
+		opts = s.getOpts()
+	)
+
+	syslog := opts.Syslog
+	if isWindowsService() && opts.LogFile == "" {
+		// Enable syslog if no log file is specified and we're running as a
+		// Windows service so that logs are written to the Windows event log.
+		syslog = true
 	}
-	if s.opts.NoLog {
-		atomic.StoreInt32(&nolog, 1)
-	}
-	if s.opts.LogFile != "" {
-		flags := os.O_WRONLY | os.O_APPEND | os.O_CREATE
-		file, err := os.OpenFile(s.opts.LogFile, flags, 0660)
-		if err != nil {
-			PrintAndDie(fmt.Sprintf("Error opening logfile: %q", s.opts.LogFile))
+
+	if opts.LogFile != "" {
+		log = logger.NewFileLogger(opts.LogFile, opts.Logtime, opts.Debug, opts.Trace, true)
+	} else if opts.RemoteSyslog != "" {
+		log = logger.NewRemoteSysLogger(opts.RemoteSyslog, opts.Debug, opts.Trace)
+	} else if syslog {
+		log = logger.NewSysLogger(opts.Debug, opts.Trace)
+	} else {
+		colors := true
+		// Check to see if stderr is being redirected and if so turn off color
+		// Also turn off colors if we're running on Windows where os.Stderr.Stat() returns an invalid handle-error
+		stat, err := os.Stderr.Stat()
+		if err != nil || (stat.Mode()&os.ModeCharDevice) == 0 {
+			colors = false
 		}
-		log.SetOutput(file)
+		log = logger.NewStdLogger(opts.Logtime, opts.Debug, opts.Trace, colors, true)
 	}
-	if s.opts.Debug {
-		Log(s.opts)
-		atomic.StoreInt32(&debug, 1)
-		Log("DEBUG is on")
+
+	s.SetLogger(log, opts.Debug, opts.Trace)
+}
+
+// SetLogger sets the logger of the server
+func (s *Server) SetLogger(logger Logger, debugFlag, traceFlag bool) {
+	if debugFlag {
+		atomic.StoreInt32(&s.logging.debug, 1)
+	} else {
+		atomic.StoreInt32(&s.logging.debug, 0)
 	}
-	if s.opts.Trace {
-		atomic.StoreInt32(&trace, 1)
-		Log("TRACE is on")
+	if traceFlag {
+		atomic.StoreInt32(&s.logging.trace, 1)
+	} else {
+		atomic.StoreInt32(&s.logging.trace, 0)
 	}
+
+	s.logging.Lock()
+	s.logging.logger = logger
+	s.logging.Unlock()
 }
 
-func alreadyFormatted(s string) bool {
-	return strings.HasPrefix(s, "[")
-}
+// If the logger is a file based logger, close and re-open the file.
+// This allows for file rotation by 'mv'ing the file then signaling
+// the process to trigger this function.
+func (s *Server) ReOpenLogFile() {
+	// Check to make sure this is a file logger.
+	s.logging.RLock()
+	ll := s.logging.logger
+	s.logging.RUnlock()
 
-func logStr(v []interface{}) string {
-	args := make([]string, 0, len(v))
-	for _, vt := range v {
-		switch t := vt.(type) {
-		case string:
-			if alreadyFormatted(t) {
-				args = append(args, t)
-			} else {
-				t = strings.Replace(t, "\"", "\\\"", -1)
-				args = append(args, fmt.Sprintf("\"%s\"", t))
-			}
-		default:
-			args = append(args, fmt.Sprintf("%+v", vt))
-		}
+	if ll == nil {
+		s.Noticef("File log re-open ignored, no logger")
+		return
 	}
-	return fmt.Sprintf("[%s]", strings.Join(args, ", "))
-}
 
-func Log(v ...interface{}) {
-	if nolog == 0 {
-		log.Print(logStr(v))
-	}
-}
+	// Snapshot server options.
+	opts := s.getOpts()
 
-func Logf(format string, v ...interface{}) {
-	Log(fmt.Sprintf(format, v...))
-}
-
-func Fatal(v ...interface{}) {
-	log.Fatalf(logStr(v))
-}
-
-func Fatalf(format string, v ...interface{}) {
-	Fatal(fmt.Sprintf(format, v...))
-}
-
-func Debug(v ...interface{}) {
-	if debug > 0 {
-		Log(v...)
+	if opts.LogFile == "" {
+		s.Noticef("File log re-open ignored, not a file logger")
+	} else {
+		fileLog := logger.NewFileLogger(opts.LogFile,
+			opts.Logtime, opts.Debug, opts.Trace, true)
+		s.SetLogger(fileLog, opts.Debug, opts.Trace)
+		s.Noticef("File log re-opened")
 	}
 }
 
-func Debugf(format string, v ...interface{}) {
-	if debug > 0 {
-		Debug(fmt.Sprintf(format, v...))
-	}
+// Noticef logs a notice statement
+func (s *Server) Noticef(format string, v ...interface{}) {
+	s.executeLogCall(func(logger Logger, format string, v ...interface{}) {
+		logger.Noticef(format, v...)
+	}, format, v...)
 }
 
-func Trace(v ...interface{}) {
-	if trace > 0 {
-		Log(v...)
-	}
+// Errorf logs an error
+func (s *Server) Errorf(format string, v ...interface{}) {
+	s.executeLogCall(func(logger Logger, format string, v ...interface{}) {
+		logger.Errorf(format, v...)
+	}, format, v...)
 }
 
-func Tracef(format string, v ...interface{}) {
-	if trace > 0 {
-		Trace(fmt.Sprintf(format, v...))
+// Fatalf logs a fatal error
+func (s *Server) Fatalf(format string, v ...interface{}) {
+	s.executeLogCall(func(logger Logger, format string, v ...interface{}) {
+		logger.Fatalf(format, v...)
+	}, format, v...)
+}
+
+// Debugf logs a debug statement
+func (s *Server) Debugf(format string, v ...interface{}) {
+	if atomic.LoadInt32(&s.logging.debug) == 0 {
+		return
 	}
+
+	s.executeLogCall(func(logger Logger, format string, v ...interface{}) {
+		logger.Debugf(format, v...)
+	}, format, v...)
+}
+
+// Tracef logs a trace statement
+func (s *Server) Tracef(format string, v ...interface{}) {
+	if atomic.LoadInt32(&s.logging.trace) == 0 {
+		return
+	}
+
+	s.executeLogCall(func(logger Logger, format string, v ...interface{}) {
+		logger.Tracef(format, v...)
+	}, format, v...)
+}
+
+func (s *Server) executeLogCall(f func(logger Logger, format string, v ...interface{}), format string, args ...interface{}) {
+	s.logging.RLock()
+	defer s.logging.RUnlock()
+	if s.logging.logger == nil {
+		return
+	}
+
+	f(s.logging.logger, format, args...)
 }

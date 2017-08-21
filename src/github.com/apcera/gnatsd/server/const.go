@@ -1,4 +1,4 @@
-// Copyright 2012-2014 Apcera Inc. All rights reserved.
+// Copyright 2012-2016 Apcera Inc. All rights reserved.
 
 package server
 
@@ -6,11 +6,22 @@ import (
 	"time"
 )
 
+// Command is a signal used to control a running gnatsd process.
+type Command string
+
+// Valid Command values.
+const (
+	CommandStop   = Command("stop")
+	CommandQuit   = Command("quit")
+	CommandReopen = Command("reopen")
+	CommandReload = Command("reload")
+)
+
 const (
 	// VERSION is the current version for the server.
-	VERSION = "0.5.4"
+	VERSION = "1.0.2"
 
-	// DEFAULT_PORT is the deault port for client connections.
+	// DEFAULT_PORT is the default port for client connections.
 	DEFAULT_PORT = 4222
 
 	// RANDOM_PORT is the value for port that, when supplied, will cause the
@@ -29,17 +40,14 @@ const (
 	// something different if > 1MB payloads are needed.
 	MAX_PAYLOAD_SIZE = (1024 * 1024)
 
-	// MAX_PENDING_SIZE is the maximum outbound size (in bytes) per client.
-	MAX_PENDING_SIZE = (10 * 1024 * 1024)
-
 	// DEFAULT_MAX_CONNECTIONS is the default maximum connections allowed.
 	DEFAULT_MAX_CONNECTIONS = (64 * 1024)
 
-	// SSL_TIMEOUT is the TLS/SSL wait time.
-	SSL_TIMEOUT = 500 * time.Millisecond
+	// TLS_TIMEOUT is the TLS wait time.
+	TLS_TIMEOUT = 500 * time.Millisecond
 
 	// AUTH_TIMEOUT is the authorization wait time.
-	AUTH_TIMEOUT = 2 * SSL_TIMEOUT
+	AUTH_TIMEOUT = 2 * TLS_TIMEOUT
 
 	// DEFAULT_PING_INTERVAL is how often pings are sent to clients and routes.
 	DEFAULT_PING_INTERVAL = 2 * time.Minute
@@ -47,7 +55,7 @@ const (
 	// DEFAULT_PING_MAX_OUT is maximum allowed pings outstanding before disconnect.
 	DEFAULT_PING_MAX_OUT = 2
 
-	// CRLF string
+	// CR_LF string
 	CR_LF = "\r\n"
 
 	// LEN_CR_LF hold onto the computed size.
@@ -57,7 +65,7 @@ const (
 	DEFAULT_FLUSH_DEADLINE = 2 * time.Second
 
 	// DEFAULT_HTTP_PORT is the default monitoring port.
-	DEFAULT_HTTP_PORT = 8333
+	DEFAULT_HTTP_PORT = 8222
 
 	// ACCEPT_MIN_SLEEP is the minimum acceptable sleep times on temporary errors.
 	ACCEPT_MIN_SLEEP = 10 * time.Millisecond

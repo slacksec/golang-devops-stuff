@@ -1,23 +1,24 @@
 language: go
 go:
-- 1.3
-branches:
-  only:
-  - master
+- 1.6.x
+- 1.7.x
+- 1.8.x
 install:
-- DST=~/gopath/src/github.com/apcera
-- mkdir -p "$DST"
-- git clone --depth=1 --quiet https://github.com/apcera/nats.git "$DST"/nats
-- go get code.google.com/p/go.tools/cmd/vet
-- go get code.google.com/p/go.tools/cmd/cover
+- go get github.com/nats-io/go-nats
 - go get github.com/mattn/goveralls
-script:
+- go get github.com/wadey/gocovmerge
+- go get -u honnef.co/go/tools/cmd/megacheck
+- go get -u github.com/client9/misspell/cmd/misspell
+before_script:
+- EXCLUDE_VENDOR=$(go list ./... | grep -v "/vendor/")
 - go build
-- go fmt ./...
-- go vet ./...
-- go test -i -race ./...
-- go test -v -race ./...
-- ./travis/coveralls-script.sh
-env:
-  global:
-    secure: fi/zxSp5eF6Mt8yrgJakBVinDpCDFy3zPZ4Jy7jsyoKWgF7CdSFmh0WBcN932KOLCRaVm7ZqD2RwO9SifIsBcDtZqML4RKg3Q+T+Uqt4LpskVobMYkPKDcA5i3c3ifhJu/wzl7Y/jnysvjxCwQrH/nGAc4+AwyH6x2TjKF7UFoY=
+- $(exit $(go fmt $EXCLUDE_VENDOR | wc -l))
+- go vet $EXCLUDE_VENDOR
+- misspell -error -locale US .
+- megacheck $EXCLUDE_VENDOR
+- if [[ "$TRAVIS_GO_VERSION" == 1.7.* ]]; then ./scripts/cross_compile.sh $TRAVIS_TAG; fi
+script:
+- go test -i -race $EXCLUDE_VENDOR
+- if [[ "$TRAVIS_GO_VERSION" == 1.7.* ]]; then ./scripts/cov.sh TRAVIS; else go test -v -race $EXCLUDE_VENDOR; fi
+after_success:
+- if [[ "$TRAVIS_GO_VERSION" == 1.7.* ]] && [ "$TRAVIS_TAG" != "" ]; then ghr --owner nats-io --token $GITHUB_TOKEN --draft --replace $TRAVIS_TAG pkg/; fi

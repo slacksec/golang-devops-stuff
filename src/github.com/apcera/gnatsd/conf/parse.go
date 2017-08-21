@@ -1,6 +1,6 @@
-// Copyright 2013 Apcera Inc. All rights reserved.
+// Copyright 2013-2016 Apcera Inc. All rights reserved.
 
-// Conf is a configuration file format used by gnatsd. It is
+// Package conf supports a configuration file format used by gnatsd. It is
 // a flexible format that combines the best of traditional
 // configuration formats and newer styles such as JSON and YAML.
 package conf
@@ -16,13 +16,15 @@ package conf
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 )
 
-// Parser will return a map of keys to interface{}, although concrete types
-// underly them. The values supported are string, bool, int64, float64, DateTime.
-// Arrays and nested Maps are also supported.
 type parser struct {
 	mapping map[string]interface{}
 	lx      *lexer
@@ -35,23 +37,43 @@ type parser struct {
 
 	// Keys stack
 	keys []string
+
+	// The config file path, empty by default.
+	fp string
 }
 
+// Parse will return a map of keys to interface{}, although concrete types
+// underly them. The values supported are string, bool, int64, float64, DateTime.
+// Arrays and nested Maps are also supported.
 func Parse(data string) (map[string]interface{}, error) {
-	p, err := parse(data)
+	p, err := parse(data, "")
 	if err != nil {
 		return nil, err
 	}
 	return p.mapping, nil
 }
 
-func parse(data string) (p *parser, err error) {
+// ParseFile is a helper to open file, etc. and parse the contents.
+func ParseFile(fp string) (map[string]interface{}, error) {
+	data, err := ioutil.ReadFile(fp)
+	if err != nil {
+		return nil, fmt.Errorf("error opening config file: %v", err)
+	}
 
+	p, err := parse(string(data), filepath.Dir(fp))
+	if err != nil {
+		return nil, err
+	}
+	return p.mapping, nil
+}
+
+func parse(data, fp string) (p *parser, err error) {
 	p = &parser{
 		mapping: make(map[string]interface{}),
 		lx:      lex(data),
 		ctxs:    make([]interface{}, 0, 4),
 		keys:    make([]string, 0, 4),
+		fp:      fp,
 	}
 	p.pushContext(p.mapping)
 
@@ -116,32 +138,55 @@ func (p *parser) processItem(it item) error {
 	case itemString:
 		p.setValue(it.val) // FIXME(dlc) sanitize string?
 	case itemInteger:
-		num, err := strconv.ParseInt(it.val, 10, 64)
+		lastDigit := 0
+		for _, r := range it.val {
+			if !unicode.IsDigit(r) && r != '-' {
+				break
+			}
+			lastDigit++
+		}
+		numStr := it.val[:lastDigit]
+		num, err := strconv.ParseInt(numStr, 10, 64)
 		if err != nil {
 			if e, ok := err.(*strconv.NumError); ok &&
 				e.Err == strconv.ErrRange {
 				return fmt.Errorf("Integer '%s' is out of the range.", it.val)
-			} else {
-				return fmt.Errorf("Expected integer, but got '%s'.", it.val)
 			}
+			return fmt.Errorf("Expected integer, but got '%s'.", it.val)
 		}
-		p.setValue(num)
+		// Process a suffix
+		suffix := strings.ToLower(strings.TrimSpace(it.val[lastDigit:]))
+		switch suffix {
+		case "":
+			p.setValue(num)
+		case "k":
+			p.setValue(num * 1000)
+		case "kb":
+			p.setValue(num * 1024)
+		case "m":
+			p.setValue(num * 1000 * 1000)
+		case "mb":
+			p.setValue(num * 1024 * 1024)
+		case "g":
+			p.setValue(num * 1000 * 1000 * 1000)
+		case "gb":
+			p.setValue(num * 1024 * 1024 * 1024)
+		}
 	case itemFloat:
 		num, err := strconv.ParseFloat(it.val, 64)
 		if err != nil {
 			if e, ok := err.(*strconv.NumError); ok &&
 				e.Err == strconv.ErrRange {
 				return fmt.Errorf("Float '%s' is out of the range.", it.val)
-			} else {
-				return fmt.Errorf("Expected float, but got '%s'.", it.val)
 			}
+			return fmt.Errorf("Expected float, but got '%s'.", it.val)
 		}
 		p.setValue(num)
 	case itemBool:
-		switch it.val {
-		case "true":
+		switch strings.ToLower(it.val) {
+		case "true", "yes", "on":
 			p.setValue(true)
-		case "false":
+		case "false", "no", "off":
 			p.setValue(false)
 		default:
 			return fmt.Errorf("Expected boolean value, but got '%s'.", it.val)
@@ -154,15 +199,71 @@ func (p *parser) processItem(it item) error {
 		}
 		p.setValue(dt)
 	case itemArrayStart:
-		array := make([]interface{}, 0)
+		var array = make([]interface{}, 0)
 		p.pushContext(array)
 	case itemArrayEnd:
 		array := p.ctx
 		p.popContext()
 		p.setValue(array)
+	case itemVariable:
+		if value, ok := p.lookupVariable(it.val); ok {
+			p.setValue(value)
+		} else {
+			return fmt.Errorf("Variable reference for '%s' on line %d can not be found.",
+				it.val, it.line)
+		}
+	case itemInclude:
+		m, err := ParseFile(filepath.Join(p.fp, it.val))
+		if err != nil {
+			return fmt.Errorf("Error parsing include file '%s', %v.", it.val, err)
+		}
+		for k, v := range m {
+			p.pushKey(k)
+			p.setValue(v)
+		}
 	}
 
 	return nil
+}
+
+// Used to map an environment value into a temporary map to pass to secondary Parse call.
+const pkey = "pk"
+
+// We special case raw strings here that are bcrypt'd. This allows us not to force quoting the strings
+const bcryptPrefix = "2a$"
+
+// lookupVariable will lookup a variable reference. It will use block scoping on keys
+// it has seen before, with the top level scoping being the environment variables. We
+// ignore array contexts and only process the map contexts..
+//
+// Returns true for ok if it finds something, similar to map.
+func (p *parser) lookupVariable(varReference string) (interface{}, bool) {
+	// Do special check to see if it is a raw bcrypt string.
+	if strings.HasPrefix(varReference, bcryptPrefix) {
+		return "$" + varReference, true
+	}
+
+	// Loop through contexts currently on the stack.
+	for i := len(p.ctxs) - 1; i >= 0; i -= 1 {
+		ctx := p.ctxs[i]
+		// Process if it is a map context
+		if m, ok := ctx.(map[string]interface{}); ok {
+			if v, ok := m[varReference]; ok {
+				return v, ok
+			}
+		}
+	}
+
+	// If we are here, we have exhausted our context maps and still not found anything.
+	// Parse from the environment.
+	if vStr, ok := os.LookupEnv(varReference); ok {
+		// Everything we get here will be a string value, so we need to process as a parser would.
+		if vmap, err := Parse(fmt.Sprintf("%s=%s", pkey, vStr)); err == nil {
+			v, ok := vmap[pkey]
+			return v, ok
+		}
+	}
+	return nil, false
 }
 
 func (p *parser) setValue(val interface{}) {

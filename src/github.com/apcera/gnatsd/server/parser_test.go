@@ -1,4 +1,4 @@
-// Copyright 2012-2014 Apcera Inc. All rights reserved.
+// Copyright 2012-2015 Apcera Inc. All rights reserved.
 
 package server
 
@@ -8,7 +8,11 @@ import (
 )
 
 func dummyClient() *client {
-	return &client{}
+	return &client{srv: New(&defaultServerOptions)}
+}
+
+func dummyRouteClient() *client {
+	return &client{srv: New(&defaultServerOptions), typ: ROUTER}
 }
 
 func TestParsePing(t *testing.T) {
@@ -89,9 +93,15 @@ func TestParsePong(t *testing.T) {
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
+	if c.pout != 0 {
+		t.Fatalf("Unexpected pout value: %d vs 0\n", c.pout)
+	}
 	err = c.parse(pong)
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
+	}
+	if c.pout != 0 {
+		t.Fatalf("Unexpected pout value: %d vs 0\n", c.pout)
 	}
 	// Should tolerate spaces
 	pong = []byte("PONG  \r")
@@ -105,8 +115,11 @@ func TestParsePong(t *testing.T) {
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
+	if c.pout != 0 {
+		t.Fatalf("Unexpected pout value: %d vs 0\n", c.pout)
+	}
 
-	// Should be adjusting c.pout, Pings Outstanding
+	// Should be adjusting c.pout (Pings Outstanding): reset to 0
 	c.state = OP_START
 	c.pout = 10
 	pong = []byte("PONG\r\n")
@@ -114,8 +127,8 @@ func TestParsePong(t *testing.T) {
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	if c.pout != 9 {
-		t.Fatalf("Unexpected pout: %d vs %d\n", c.pout, 9)
+	if c.pout != 0 {
+		t.Fatalf("Unexpected pout: %d vs 0\n", c.pout)
 	}
 }
 
@@ -223,8 +236,17 @@ func TestParsePubArg(t *testing.T) {
 	testPubArg(c, t)
 }
 
-func TestParseMsg(t *testing.T) {
+func TestParsePubBadSize(t *testing.T) {
 	c := dummyClient()
+	// Setup localized max payload
+	c.mpay = 32768
+	if err := c.processPub([]byte("foo 2222222222222222\r")); err == nil {
+		t.Fatalf("Expected parse error for size too large")
+	}
+}
+
+func TestParseMsg(t *testing.T) {
+	c := dummyRouteClient()
 
 	pub := []byte("MSG foo RSID:1:2 5\r\nhello\r")
 	err := c.parse(pub)
@@ -301,54 +323,153 @@ func TestParseMsgArg(t *testing.T) {
 	testMsgArg(c, t)
 }
 
-func TestShouldFail(t *testing.T) {
-	c := dummyClient()
+func TestParseMsgSpace(t *testing.T) {
+	c := dummyRouteClient()
 
-	if err := c.parse([]byte(" PING")); err == nil {
-		t.Fatal("Should have received a parse error")
+	// Ivan bug he found
+	if err := c.parse([]byte("MSG \r\n")); err == nil {
+		t.Fatalf("Expected parse error for MSG <SPC>")
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("CONNECT \r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+
+	c = dummyClient()
+
+	// Anything with an M from a client should parse error
+	if err := c.parse([]byte("M")); err == nil {
+		t.Fatalf("Expected parse error for M* from a client")
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("POO")); err == nil {
-		t.Fatal("Should have received a parse error")
+}
+
+func TestShouldFail(t *testing.T) {
+	wrongProtos := []string{
+		"xxx",
+		"Px", "PIx", "PINx", " PING",
+		"POx", "PONx",
+		"+x", "+Ox",
+		"-x", "-Ex", "-ERx", "-ERRx",
+		"Cx", "COx", "CONx", "CONNx", "CONNEx", "CONNECx", "CONNECx", "CONNECT \r\n",
+		"PUx", "PUB foo\r\n", "PUB  \r\n", "PUB foo bar       \r\n",
+		"PUB foo 2\r\nok \r\n", "PUB foo 2\r\nok\r \n",
+		"Sx", "SUx", "SUB\r\n", "SUB  \r\n", "SUB foo\r\n",
+		"SUB foo bar baz 22\r\n",
+		"Ux", "UNx", "UNSx", "UNSUx", "UNSUBx", "UNSUBUNSUB 1\r\n", "UNSUB_2\r\n",
+		"UNSUB_UNSUB_UNSUB 2\r\n", "UNSUB_\t2\r\n", "UNSUB\r\n", "UNSUB \r\n",
+		"UNSUB          \t       \r\n",
+		"Ix", "INx", "INFx", "INFO  \r\n",
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("PUB foo\r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+	for _, proto := range wrongProtos {
+		c := dummyClient()
+		if err := c.parse([]byte(proto)); err == nil {
+			t.Fatalf("Should have received a parse error for: %v", proto)
+		}
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("PUB \r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+
+	// Special case for MSG, type needs to not be client.
+	wrongProtos = []string{"Mx", "MSx", "MSGx", "MSG  \r\n"}
+	for _, proto := range wrongProtos {
+		c := dummyClient()
+		c.typ = ROUTER
+		if err := c.parse([]byte(proto)); err == nil {
+			t.Fatalf("Should have received a parse error for: %v", proto)
+		}
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("PUB foo bar       \r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+}
+
+func TestProtoSnippet(t *testing.T) {
+	sample := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+	tests := []struct {
+		input    int
+		expected string
+	}{
+		{0, `"abcdefghijklmnopqrstuvwxyzABCDEF"`},
+		{1, `"bcdefghijklmnopqrstuvwxyzABCDEFG"`},
+		{2, `"cdefghijklmnopqrstuvwxyzABCDEFGH"`},
+		{3, `"defghijklmnopqrstuvwxyzABCDEFGHI"`},
+		{4, `"efghijklmnopqrstuvwxyzABCDEFGHIJ"`},
+		{5, `"fghijklmnopqrstuvwxyzABCDEFGHIJK"`},
+		{6, `"ghijklmnopqrstuvwxyzABCDEFGHIJKL"`},
+		{7, `"hijklmnopqrstuvwxyzABCDEFGHIJKLM"`},
+		{8, `"ijklmnopqrstuvwxyzABCDEFGHIJKLMN"`},
+		{9, `"jklmnopqrstuvwxyzABCDEFGHIJKLMNO"`},
+		{10, `"klmnopqrstuvwxyzABCDEFGHIJKLMNOP"`},
+		{11, `"lmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"`},
+		{12, `"mnopqrstuvwxyzABCDEFGHIJKLMNOPQR"`},
+		{13, `"nopqrstuvwxyzABCDEFGHIJKLMNOPQRS"`},
+		{14, `"opqrstuvwxyzABCDEFGHIJKLMNOPQRST"`},
+		{15, `"pqrstuvwxyzABCDEFGHIJKLMNOPQRSTU"`},
+		{16, `"qrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"`},
+		{17, `"rstuvwxyzABCDEFGHIJKLMNOPQRSTUVW"`},
+		{18, `"stuvwxyzABCDEFGHIJKLMNOPQRSTUVWX"`},
+		{19, `"tuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{20, `"uvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"`},
+		{21, `"vwxyzABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{22, `"wxyzABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{23, `"xyzABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{24, `"yzABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{25, `"zABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{26, `"ABCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{27, `"BCDEFGHIJKLMNOPQRSTUVWXY"`},
+		{28, `"CDEFGHIJKLMNOPQRSTUVWXY"`},
+		{29, `"DEFGHIJKLMNOPQRSTUVWXY"`},
+		{30, `"EFGHIJKLMNOPQRSTUVWXY"`},
+		{31, `"FGHIJKLMNOPQRSTUVWXY"`},
+		{32, `"GHIJKLMNOPQRSTUVWXY"`},
+		{33, `"HIJKLMNOPQRSTUVWXY"`},
+		{34, `"IJKLMNOPQRSTUVWXY"`},
+		{35, `"JKLMNOPQRSTUVWXY"`},
+		{36, `"KLMNOPQRSTUVWXY"`},
+		{37, `"LMNOPQRSTUVWXY"`},
+		{38, `"MNOPQRSTUVWXY"`},
+		{39, `"NOPQRSTUVWXY"`},
+		{40, `"OPQRSTUVWXY"`},
+		{41, `"PQRSTUVWXY"`},
+		{42, `"QRSTUVWXY"`},
+		{43, `"RSTUVWXY"`},
+		{44, `"STUVWXY"`},
+		{45, `"TUVWXY"`},
+		{46, `"UVWXY"`},
+		{47, `"VWXY"`},
+		{48, `"WXY"`},
+		{49, `"XY"`},
+		{50, `"Y"`},
+		{51, `""`},
+		{52, `""`},
+		{53, `""`},
+		{54, `""`},
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("SUB\r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+
+	for _, tt := range tests {
+		got := protoSnippet(tt.input, sample)
+		if tt.expected != got {
+			t.Errorf("Expected protocol snippet to be %s when start=%d but got %s\n", tt.expected, tt.input, got)
+		}
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("SUB \r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+}
+
+func TestParseOK(t *testing.T) {
+	c := dummyClient()
+	if c.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.state)
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("SUB foo\r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+	okProto := []byte("+OK\r\n")
+	err := c.parse(okProto[:1])
+	if err != nil || c.state != OP_PLUS {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("SUB foo bar baz 22\r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+	err = c.parse(okProto[1:2])
+	if err != nil || c.state != OP_PLUS_O {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("PUB foo 2\r\nok \r\n")); err == nil {
-		t.Fatal("Should have received a parse error")
+	err = c.parse(okProto[2:3])
+	if err != nil || c.state != OP_PLUS_OK {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	c.state = OP_START
-	if err := c.parse([]byte("PUB foo 2\r\nok\r \n")); err == nil {
-		t.Fatal("Should have received a parse error")
+	err = c.parse(okProto[3:4])
+	if err != nil || c.state != OP_PLUS_OK {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
+	}
+	err = c.parse(okProto[4:5])
+	if err != nil || c.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
 }
