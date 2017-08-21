@@ -1,3 +1,17 @@
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package store
 
 import (
@@ -6,15 +20,15 @@ import (
 	"time"
 
 	etcdErr "github.com/coreos/etcd/error"
-	ustrings "github.com/coreos/etcd/pkg/strings"
+	"github.com/jonboulle/clockwork"
 )
 
 // explanations of Compare function result
 const (
-	CompareMatch         = 0
-	CompareIndexNotMatch = 1
-	CompareValueNotMatch = 2
-	CompareNotMatch      = 3
+	CompareMatch = iota
+	CompareIndexNotMatch
+	CompareValueNotMatch
+	CompareNotMatch
 )
 
 var Permanent time.Time
@@ -31,7 +45,6 @@ type node struct {
 	Parent *node `json:"-"` // should not encode this field! avoid circular dependency.
 
 	ExpireTime time.Time
-	ACL        string
 	Value      string           // for key-value pair
 	Children   map[string]*node // for directory
 
@@ -40,15 +53,12 @@ type node struct {
 }
 
 // newKV creates a Key-Value pair
-func newKV(store *store, nodePath string, value string, createdIndex uint64,
-	parent *node, ACL string, expireTime time.Time) *node {
-
+func newKV(store *store, nodePath string, value string, createdIndex uint64, parent *node, expireTime time.Time) *node {
 	return &node{
 		Path:          nodePath,
 		CreatedIndex:  createdIndex,
 		ModifiedIndex: createdIndex,
 		Parent:        parent,
-		ACL:           ACL,
 		store:         store,
 		ExpireTime:    expireTime,
 		Value:         value,
@@ -56,15 +66,12 @@ func newKV(store *store, nodePath string, value string, createdIndex uint64,
 }
 
 // newDir creates a directory
-func newDir(store *store, nodePath string, createdIndex uint64, parent *node,
-	ACL string, expireTime time.Time) *node {
-
+func newDir(store *store, nodePath string, createdIndex uint64, parent *node, expireTime time.Time) *node {
 	return &node{
 		Path:          nodePath,
 		CreatedIndex:  createdIndex,
 		ModifiedIndex: createdIndex,
 		Parent:        parent,
-		ACL:           ACL,
 		ExpireTime:    expireTime,
 		Children:      make(map[string]*node),
 		store:         store,
@@ -94,14 +101,14 @@ func (n *node) IsPermanent() bool {
 // If the node is a directory, the function will return true.
 // Otherwise the function will return false.
 func (n *node) IsDir() bool {
-	return !(n.Children == nil)
+	return n.Children != nil
 }
 
 // Read function gets the value of the node.
 // If the receiver node is not a key-value pair, a "Not A File" error will be returned.
 func (n *node) Read() (string, *etcdErr.Error) {
 	if n.IsDir() {
-		return "", etcdErr.NewError(etcdErr.EcodeNotFile, "", n.store.Index())
+		return "", etcdErr.NewError(etcdErr.EcodeNotFile, "", n.store.CurrentIndex)
 	}
 
 	return n.Value, nil
@@ -111,7 +118,7 @@ func (n *node) Read() (string, *etcdErr.Error) {
 // If the receiver node is a directory, a "Not A File" error will be returned.
 func (n *node) Write(value string, index uint64) *etcdErr.Error {
 	if n.IsDir() {
-		return etcdErr.NewError(etcdErr.EcodeNotFile, "", n.store.Index())
+		return etcdErr.NewError(etcdErr.EcodeNotFile, "", n.store.CurrentIndex)
 	}
 
 	n.Value = value
@@ -120,7 +127,7 @@ func (n *node) Write(value string, index uint64) *etcdErr.Error {
 	return nil
 }
 
-func (n *node) ExpirationAndTTL() (*time.Time, int64) {
+func (n *node) expirationAndTTL(clock clockwork.Clock) (*time.Time, int64) {
 	if !n.IsPermanent() {
 		/* compute ttl as:
 		   ceiling( (expireTime - timeNow) / nanosecondsPerSecond )
@@ -129,12 +136,13 @@ func (n *node) ExpirationAndTTL() (*time.Time, int64) {
 		   ( (expireTime - timeNow) / nanosecondsPerSecond ) + 1
 		   which ranges 1..n+1
 		*/
-		ttlN := n.ExpireTime.Sub(time.Now())
+		ttlN := n.ExpireTime.Sub(clock.Now())
 		ttl := ttlN / time.Second
 		if (ttlN % time.Second) > 0 {
 			ttl++
 		}
-		return &n.ExpireTime, int64(ttl)
+		t := n.ExpireTime.UTC()
+		return &t, int64(ttl)
 	}
 	return nil, 0
 }
@@ -143,7 +151,7 @@ func (n *node) ExpirationAndTTL() (*time.Time, int64) {
 // If the receiver node is not a directory, a "Not A Directory" error will be returned.
 func (n *node) List() ([]*node, *etcdErr.Error) {
 	if !n.IsDir() {
-		return nil, etcdErr.NewError(etcdErr.EcodeNotDir, "", n.store.Index())
+		return nil, etcdErr.NewError(etcdErr.EcodeNotDir, "", n.store.CurrentIndex)
 	}
 
 	nodes := make([]*node, len(n.Children))
@@ -161,7 +169,7 @@ func (n *node) List() ([]*node, *etcdErr.Error) {
 // On success, it returns the file node
 func (n *node) GetChild(name string) (*node, *etcdErr.Error) {
 	if !n.IsDir() {
-		return nil, etcdErr.NewError(etcdErr.EcodeNotDir, n.Path, n.store.Index())
+		return nil, etcdErr.NewError(etcdErr.EcodeNotDir, n.Path, n.store.CurrentIndex)
 	}
 
 	child, ok := n.Children[name]
@@ -175,19 +183,17 @@ func (n *node) GetChild(name string) (*node, *etcdErr.Error) {
 
 // Add function adds a node to the receiver node.
 // If the receiver is not a directory, a "Not A Directory" error will be returned.
-// If there is a existing node with the same name under the directory, a "Already Exist"
+// If there is an existing node with the same name under the directory, a "Already Exist"
 // error will be returned
 func (n *node) Add(child *node) *etcdErr.Error {
 	if !n.IsDir() {
-		return etcdErr.NewError(etcdErr.EcodeNotDir, "", n.store.Index())
+		return etcdErr.NewError(etcdErr.EcodeNotDir, "", n.store.CurrentIndex)
 	}
 
 	_, name := path.Split(child.Path)
 
-	_, ok := n.Children[name]
-
-	if ok {
-		return etcdErr.NewError(etcdErr.EcodeNodeExist, "", n.store.Index())
+	if _, ok := n.Children[name]; ok {
+		return etcdErr.NewError(etcdErr.EcodeNodeExist, "", n.store.CurrentIndex)
 	}
 
 	n.Children[name] = child
@@ -197,20 +203,6 @@ func (n *node) Add(child *node) *etcdErr.Error {
 
 // Remove function remove the node.
 func (n *node) Remove(dir, recursive bool, callback func(path string)) *etcdErr.Error {
-
-	if n.IsDir() {
-		if !dir {
-			// cannot delete a directory without recursive set to true
-			return etcdErr.NewError(etcdErr.EcodeNotFile, n.Path, n.store.Index())
-		}
-
-		if len(n.Children) != 0 && !recursive {
-			// cannot delete a directory if it is not empty and the operation
-			// is not recursive
-			return etcdErr.NewError(etcdErr.EcodeDirNotEmpty, n.Path, n.store.Index())
-		}
-	}
-
 	if !n.IsDir() { // key-value pair
 		_, name := path.Split(n.Path)
 
@@ -230,6 +222,17 @@ func (n *node) Remove(dir, recursive bool, callback func(path string)) *etcdErr.
 		return nil
 	}
 
+	if !dir {
+		// cannot delete a directory without dir set to true
+		return etcdErr.NewError(etcdErr.EcodeNotFile, n.Path, n.store.CurrentIndex)
+	}
+
+	if len(n.Children) != 0 && !recursive {
+		// cannot delete a directory if it is not empty and the operation
+		// is not recursive
+		return etcdErr.NewError(etcdErr.EcodeDirNotEmpty, n.Path, n.store.CurrentIndex)
+	}
+
 	for _, child := range n.Children { // delete all children
 		child.Remove(true, true, callback)
 	}
@@ -246,13 +249,12 @@ func (n *node) Remove(dir, recursive bool, callback func(path string)) *etcdErr.
 		if !n.IsPermanent() {
 			n.store.ttlKeyHeap.remove(n)
 		}
-
 	}
 
 	return nil
 }
 
-func (n *node) Repr(recurisive, sorted bool) *NodeExtern {
+func (n *node) Repr(recursive, sorted bool, clock clockwork.Clock) *NodeExtern {
 	if n.IsDir() {
 		node := &NodeExtern{
 			Key:           n.Path,
@@ -260,9 +262,9 @@ func (n *node) Repr(recurisive, sorted bool) *NodeExtern {
 			ModifiedIndex: n.ModifiedIndex,
 			CreatedIndex:  n.CreatedIndex,
 		}
-		node.Expiration, node.TTL = n.ExpirationAndTTL()
+		node.Expiration, node.TTL = n.expirationAndTTL(clock)
 
-		if !recurisive {
+		if !recursive {
 			return node
 		}
 
@@ -279,7 +281,7 @@ func (n *node) Repr(recurisive, sorted bool) *NodeExtern {
 				continue
 			}
 
-			node.Nodes[i] = child.Repr(recurisive, sorted)
+			node.Nodes[i] = child.Repr(recursive, sorted, clock)
 
 			i++
 		}
@@ -294,40 +296,42 @@ func (n *node) Repr(recurisive, sorted bool) *NodeExtern {
 	}
 
 	// since n.Value could be changed later, so we need to copy the value out
-	value := ustrings.Clone(n.Value)
+	value := n.Value
 	node := &NodeExtern{
 		Key:           n.Path,
 		Value:         &value,
 		ModifiedIndex: n.ModifiedIndex,
 		CreatedIndex:  n.CreatedIndex,
 	}
-	node.Expiration, node.TTL = n.ExpirationAndTTL()
+	node.Expiration, node.TTL = n.expirationAndTTL(clock)
 	return node
 }
 
 func (n *node) UpdateTTL(expireTime time.Time) {
-
 	if !n.IsPermanent() {
 		if expireTime.IsZero() {
 			// from ttl to permanent
 			n.ExpireTime = expireTime
 			// remove from ttl heap
 			n.store.ttlKeyHeap.remove(n)
-		} else {
-			// update ttl
-			n.ExpireTime = expireTime
-			// update ttl heap
-			n.store.ttlKeyHeap.update(n)
+			return
 		}
 
-	} else {
-		if !expireTime.IsZero() {
-			// from permanent to ttl
-			n.ExpireTime = expireTime
-			// push into ttl heap
-			n.store.ttlKeyHeap.push(n)
-		}
+		// update ttl
+		n.ExpireTime = expireTime
+		// update ttl heap
+		n.store.ttlKeyHeap.update(n)
+		return
 	}
+
+	if expireTime.IsZero() {
+		return
+	}
+
+	// from permanent to ttl
+	n.ExpireTime = expireTime
+	// push into ttl heap
+	n.store.ttlKeyHeap.push(n)
 }
 
 // Compare function compares node index and value with provided ones.
@@ -354,10 +358,13 @@ func (n *node) Compare(prevValue string, prevIndex uint64) (ok bool, which int) 
 // If the node is a key-value pair, it will clone the pair.
 func (n *node) Clone() *node {
 	if !n.IsDir() {
-		return newKV(n.store, n.Path, n.Value, n.CreatedIndex, n.Parent, n.ACL, n.ExpireTime)
+		newkv := newKV(n.store, n.Path, n.Value, n.CreatedIndex, n.Parent, n.ExpireTime)
+		newkv.ModifiedIndex = n.ModifiedIndex
+		return newkv
 	}
 
-	clone := newDir(n.store, n.Path, n.CreatedIndex, n.Parent, n.ACL, n.ExpireTime)
+	clone := newDir(n.store, n.Path, n.CreatedIndex, n.Parent, n.ExpireTime)
+	clone.ModifiedIndex = n.ModifiedIndex
 
 	for key, child := range n.Children {
 		clone.Children[key] = child.Clone()
@@ -368,7 +375,7 @@ func (n *node) Clone() *node {
 
 // recoverAndclean function help to do recovery.
 // Two things need to be done: 1. recovery structure; 2. delete expired nodes
-
+//
 // If the node is a directory, it will help recover children's parent pointer and recursively
 // call this function on its children.
 // We check the expire last since we need to recover the whole structure first and add all the
@@ -385,5 +392,4 @@ func (n *node) recoverAndclean() {
 	if !n.ExpireTime.IsZero() {
 		n.store.ttlKeyHeap.push(n)
 	}
-
 }

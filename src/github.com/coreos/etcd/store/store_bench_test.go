@@ -1,18 +1,16 @@
-/*
-Copyright 2014 CoreOS Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package store
 
@@ -58,7 +56,7 @@ func BenchmarkStoreDelete(b *testing.B) {
 	runtime.ReadMemStats(memStats)
 
 	for i := 0; i < b.N; i++ {
-		_, err := s.Set(kvs[i][0], false, kvs[i][1], Permanent)
+		_, err := s.Set(kvs[i][0], false, kvs[i][1], TTLOptionSet{ExpireTime: Permanent})
 		if err != nil {
 			panic(err)
 		}
@@ -113,7 +111,7 @@ func BenchmarkWatch(b *testing.B) {
 
 		e := newEvent("set", kvs[i][0], uint64(i+1), uint64(i+1))
 		s.WatcherHub.notify(e)
-		<-w.EventChan
+		<-w.EventChan()
 		s.CurrentIndex++
 	}
 
@@ -134,8 +132,8 @@ func BenchmarkWatchWithSet(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		w, _ := s.Watch(kvs[i][0], false, false, 0)
 
-		s.Set(kvs[i][0], false, "test", Permanent)
-		<-w.EventChan
+		s.Set(kvs[i][0], false, "test", TTLOptionSet{ExpireTime: Permanent})
+		<-w.EventChan()
 	}
 }
 
@@ -145,34 +143,34 @@ func BenchmarkWatchWithSetBatch(b *testing.B) {
 	kvs, _ := generateNRandomKV(b.N, 128)
 	b.StartTimer()
 
-	watchers := make([]*Watcher, b.N)
+	watchers := make([]Watcher, b.N)
 
 	for i := 0; i < b.N; i++ {
 		watchers[i], _ = s.Watch(kvs[i][0], false, false, 0)
 	}
 
 	for i := 0; i < b.N; i++ {
-		s.Set(kvs[i][0], false, "test", Permanent)
+		s.Set(kvs[i][0], false, "test", TTLOptionSet{ExpireTime: Permanent})
 	}
 
 	for i := 0; i < b.N; i++ {
-		<-watchers[i].EventChan
+		<-watchers[i].EventChan()
 	}
 
 }
 
 func BenchmarkWatchOneKey(b *testing.B) {
 	s := newStore()
-	watchers := make([]*Watcher, b.N)
+	watchers := make([]Watcher, b.N)
 
 	for i := 0; i < b.N; i++ {
 		watchers[i], _ = s.Watch("/foo", false, false, 0)
 	}
 
-	s.Set("/foo", false, "", Permanent)
+	s.Set("/foo", false, "", TTLOptionSet{ExpireTime: Permanent})
 
 	for i := 0; i < b.N; i++ {
-		<-watchers[i].EventChan
+		<-watchers[i].EventChan()
 	}
 }
 
@@ -183,7 +181,7 @@ func benchStoreSet(b *testing.B, valueSize int, process func(interface{}) ([]byt
 	b.StartTimer()
 
 	for i := 0; i < b.N; i++ {
-		resp, err := s.Set(kvs[i][0], false, kvs[i][1], Permanent)
+		resp, err := s.Set(kvs[i][0], false, kvs[i][1], TTLOptionSet{ExpireTime: Permanent})
 		if err != nil {
 			panic(err)
 		}

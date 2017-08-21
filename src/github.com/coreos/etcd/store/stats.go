@@ -1,18 +1,16 @@
-/*
-Copyright 2013 CoreOS Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package store
 
@@ -42,30 +40,37 @@ const (
 type Stats struct {
 
 	// Number of get requests
+
 	GetSuccess uint64 `json:"getsSuccess"`
 	GetFail    uint64 `json:"getsFail"`
 
 	// Number of sets requests
+
 	SetSuccess uint64 `json:"setsSuccess"`
 	SetFail    uint64 `json:"setsFail"`
 
 	// Number of delete requests
+
 	DeleteSuccess uint64 `json:"deleteSuccess"`
 	DeleteFail    uint64 `json:"deleteFail"`
 
 	// Number of update requests
+
 	UpdateSuccess uint64 `json:"updateSuccess"`
 	UpdateFail    uint64 `json:"updateFail"`
 
 	// Number of create requests
+
 	CreateSuccess uint64 `json:"createSuccess"`
 	CreateFail    uint64 `json:"createFail"`
 
 	// Number of testAndSet requests
+
 	CompareAndSwapSuccess uint64 `json:"compareAndSwapSuccess"`
 	CompareAndSwapFail    uint64 `json:"compareAndSwapFail"`
 
 	// Number of compareAndDelete requests
+
 	CompareAndDeleteSuccess uint64 `json:"compareAndDeleteSuccess"`
 	CompareAndDeleteFail    uint64 `json:"compareAndDeleteFail"`
 
@@ -80,28 +85,29 @@ func newStats() *Stats {
 }
 
 func (s *Stats) clone() *Stats {
-	return &Stats{s.GetSuccess, s.GetFail, s.SetSuccess, s.SetFail,
-		s.DeleteSuccess, s.DeleteFail, s.UpdateSuccess, s.UpdateFail, s.CreateSuccess,
-		s.CreateFail, s.CompareAndSwapSuccess, s.CompareAndSwapFail,
-		s.CompareAndDeleteSuccess, s.CompareAndDeleteFail, s.Watchers, s.ExpireCount}
+	return &Stats{
+		GetSuccess:              s.GetSuccess,
+		GetFail:                 s.GetFail,
+		SetSuccess:              s.SetSuccess,
+		SetFail:                 s.SetFail,
+		DeleteSuccess:           s.DeleteSuccess,
+		DeleteFail:              s.DeleteFail,
+		UpdateSuccess:           s.UpdateSuccess,
+		UpdateFail:              s.UpdateFail,
+		CreateSuccess:           s.CreateSuccess,
+		CreateFail:              s.CreateFail,
+		CompareAndSwapSuccess:   s.CompareAndSwapSuccess,
+		CompareAndSwapFail:      s.CompareAndSwapFail,
+		CompareAndDeleteSuccess: s.CompareAndDeleteSuccess,
+		CompareAndDeleteFail:    s.CompareAndDeleteFail,
+		ExpireCount:             s.ExpireCount,
+		Watchers:                s.Watchers,
+	}
 }
 
-// Status() return the statistics info of etcd storage its recent start
 func (s *Stats) toJson() []byte {
 	b, _ := json.Marshal(s)
 	return b
-}
-
-func (s *Stats) TotalReads() uint64 {
-	return s.GetSuccess + s.GetFail
-}
-
-func (s *Stats) TotalTranscations() uint64 {
-	return s.SetSuccess + s.SetFail +
-		s.DeleteSuccess + s.DeleteFail +
-		s.CompareAndSwapSuccess + s.CompareAndSwapFail +
-		s.CompareAndDeleteSuccess + s.CompareAndDeleteFail +
-		s.UpdateSuccess + s.UpdateFail
 }
 
 func (s *Stats) Inc(field int) {
