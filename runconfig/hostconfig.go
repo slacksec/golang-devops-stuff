@@ -1,77 +1,79 @@
 package runconfig
 
 import (
+	"encoding/json"
+	"io"
 	"strings"
 
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/nat"
-	"github.com/docker/docker/utils"
+	"github.com/docker/docker/api/types/container"
 )
 
-type NetworkMode string
+// DecodeHostConfig creates a HostConfig based on the specified Reader.
+// It assumes the content of the reader will be JSON, and decodes it.
+func decodeHostConfig(src io.Reader) (*container.HostConfig, error) {
+	decoder := json.NewDecoder(src)
 
-func (n NetworkMode) IsHost() bool {
-	return n == "host"
+	var w ContainerConfigWrapper
+	if err := decoder.Decode(&w); err != nil {
+		return nil, err
+	}
+
+	hc := w.getHostConfig()
+	return hc, nil
 }
 
-func (n NetworkMode) IsContainer() bool {
-	parts := strings.SplitN(string(n), ":", 2)
-	return len(parts) > 1 && parts[0] == "container"
+// SetDefaultNetModeIfBlank changes the NetworkMode in a HostConfig structure
+// to default if it is not populated. This ensures backwards compatibility after
+// the validation of the network mode was moved from the docker CLI to the
+// docker daemon.
+func SetDefaultNetModeIfBlank(hc *container.HostConfig) {
+	if hc != nil {
+		if hc.NetworkMode == container.NetworkMode("") {
+			hc.NetworkMode = container.NetworkMode("default")
+		}
+	}
 }
 
-type DeviceMapping struct {
-	PathOnHost        string
-	PathInContainer   string
-	CgroupPermissions string
-}
+// validateNetContainerMode ensures that the various combinations of requested
+// network settings wrt container mode are valid.
+func validateNetContainerMode(c *container.Config, hc *container.HostConfig) error {
+	// We may not be passed a host config, such as in the case of docker commit
+	if hc == nil {
+		return nil
+	}
+	parts := strings.Split(string(hc.NetworkMode), ":")
+	if parts[0] == "container" {
+		if len(parts) < 2 || parts[1] == "" {
+			return validationError("Invalid network mode: invalid container format container:<name|id>")
+		}
+	}
 
-type HostConfig struct {
-	Binds           []string
-	ContainerIDFile string
-	LxcConf         []utils.KeyValuePair
-	Privileged      bool
-	PortBindings    nat.PortMap
-	Links           []string
-	PublishAllPorts bool
-	Dns             []string
-	DnsSearch       []string
-	VolumesFrom     []string
-	Devices         []DeviceMapping
-	NetworkMode     NetworkMode
-	CapAdd          []string
-	CapDrop         []string
-}
+	if hc.NetworkMode.IsContainer() && c.Hostname != "" {
+		return ErrConflictNetworkHostname
+	}
 
-func ContainerHostConfigFromJob(job *engine.Job) *HostConfig {
-	hostConfig := &HostConfig{
-		ContainerIDFile: job.Getenv("ContainerIDFile"),
-		Privileged:      job.GetenvBool("Privileged"),
-		PublishAllPorts: job.GetenvBool("PublishAllPorts"),
-		NetworkMode:     NetworkMode(job.Getenv("NetworkMode")),
+	if hc.NetworkMode.IsContainer() && len(hc.Links) > 0 {
+		return ErrConflictContainerNetworkAndLinks
 	}
-	job.GetenvJson("LxcConf", &hostConfig.LxcConf)
-	job.GetenvJson("PortBindings", &hostConfig.PortBindings)
-	job.GetenvJson("Devices", &hostConfig.Devices)
-	if Binds := job.GetenvList("Binds"); Binds != nil {
-		hostConfig.Binds = Binds
+
+	if hc.NetworkMode.IsContainer() && len(hc.DNS) > 0 {
+		return ErrConflictNetworkAndDNS
 	}
-	if Links := job.GetenvList("Links"); Links != nil {
-		hostConfig.Links = Links
+
+	if hc.NetworkMode.IsContainer() && len(hc.ExtraHosts) > 0 {
+		return ErrConflictNetworkHosts
 	}
-	if Dns := job.GetenvList("Dns"); Dns != nil {
-		hostConfig.Dns = Dns
+
+	if (hc.NetworkMode.IsContainer() || hc.NetworkMode.IsHost()) && c.MacAddress != "" {
+		return ErrConflictContainerNetworkAndMac
 	}
-	if DnsSearch := job.GetenvList("DnsSearch"); DnsSearch != nil {
-		hostConfig.DnsSearch = DnsSearch
+
+	if hc.NetworkMode.IsContainer() && (len(hc.PortBindings) > 0 || hc.PublishAllPorts == true) {
+		return ErrConflictNetworkPublishPorts
 	}
-	if VolumesFrom := job.GetenvList("VolumesFrom"); VolumesFrom != nil {
-		hostConfig.VolumesFrom = VolumesFrom
+
+	if hc.NetworkMode.IsContainer() && len(c.ExposedPorts) > 0 {
+		return ErrConflictNetworkExposePorts
 	}
-	if CapAdd := job.GetenvList("CapAdd"); CapAdd != nil {
-		hostConfig.CapAdd = CapAdd
-	}
-	if CapDrop := job.GetenvList("CapDrop"); CapDrop != nil {
-		hostConfig.CapDrop = CapDrop
-	}
-	return hostConfig
+	return nil
 }

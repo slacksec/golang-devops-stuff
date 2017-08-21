@@ -1,50 +1,51 @@
 package main
 
 import (
-	"fmt"
 	"os"
-	"os/exec"
-	"testing"
+	"strings"
+
+	"github.com/docker/docker/integration-cli/checker"
+	icmd "github.com/docker/docker/pkg/testutil/cmd"
+	"github.com/go-check/check"
 )
 
 // export an image and try to import it into a new one
-func TestExportContainerAndImportImage(t *testing.T) {
-	runCmd := exec.Command(dockerBinary, "run", "-d", "busybox", "true")
-	out, _, err := runCommandWithOutput(runCmd)
-	if err != nil {
-		t.Fatal("failed to create a container", out, err)
-	}
+func (s *DockerSuite) TestExportContainerAndImportImage(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	containerID := "testexportcontainerandimportimage"
 
-	cleanedContainerID := stripTrailingCharacters(out)
+	dockerCmd(c, "run", "--name", containerID, "busybox", "true")
 
-	inspectCmd := exec.Command(dockerBinary, "inspect", cleanedContainerID)
-	out, _, err = runCommandWithOutput(inspectCmd)
-	if err != nil {
-		t.Fatalf("output should've been a container id: %s %s ", cleanedContainerID, err)
-	}
+	out, _ := dockerCmd(c, "export", containerID)
 
-	exportCmdTemplate := `%v export %v > /tmp/testexp.tar`
-	exportCmdFinal := fmt.Sprintf(exportCmdTemplate, dockerBinary, cleanedContainerID)
-	exportCmd := exec.Command("bash", "-c", exportCmdFinal)
-	out, _, err = runCommandWithOutput(exportCmd)
-	errorOut(err, t, fmt.Sprintf("failed to export container: %v %v", out, err))
+	result := icmd.RunCmd(icmd.Cmd{
+		Command: []string{dockerBinary, "import", "-", "repo/testexp:v1"},
+		Stdin:   strings.NewReader(out),
+	})
+	result.Assert(c, icmd.Success)
 
-	importCmdFinal := `cat /tmp/testexp.tar | docker import - testexp`
-	importCmd := exec.Command("bash", "-c", importCmdFinal)
-	out, _, err = runCommandWithOutput(importCmd)
-	errorOut(err, t, fmt.Sprintf("failed to import image: %v %v", out, err))
+	cleanedImageID := strings.TrimSpace(result.Combined())
+	c.Assert(cleanedImageID, checker.Not(checker.Equals), "", check.Commentf("output should have been an image id"))
+}
 
-	cleanedImageID := stripTrailingCharacters(out)
+// Used to test output flag in the export command
+func (s *DockerSuite) TestExportContainerWithOutputAndImportImage(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	containerID := "testexportcontainerwithoutputandimportimage"
 
-	inspectCmd = exec.Command(dockerBinary, "inspect", cleanedImageID)
-	out, _, err = runCommandWithOutput(inspectCmd)
-	errorOut(err, t, fmt.Sprintf("output should've been an image id: %v %v", out, err))
+	dockerCmd(c, "run", "--name", containerID, "busybox", "true")
+	dockerCmd(c, "export", "--output=testexp.tar", containerID)
+	defer os.Remove("testexp.tar")
 
-	deleteContainer(cleanedContainerID)
-	deleteImages("testexp")
+	resultCat := icmd.RunCommand("cat", "testexp.tar")
+	resultCat.Assert(c, icmd.Success)
 
-	os.Remove("/tmp/testexp.tar")
+	result := icmd.RunCmd(icmd.Cmd{
+		Command: []string{dockerBinary, "import", "-", "repo/testexp:v1"},
+		Stdin:   strings.NewReader(resultCat.Combined()),
+	})
+	result.Assert(c, icmd.Success)
 
-	logDone("export - export a container")
-	logDone("import - import an image")
+	cleanedImageID := strings.TrimSpace(result.Combined())
+	c.Assert(cleanedImageID, checker.Not(checker.Equals), "", check.Commentf("output should have been an image id"))
 }
