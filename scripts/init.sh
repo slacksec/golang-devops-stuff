@@ -1,54 +1,82 @@
-#! /usr/bin/env bash
-
+#!/bin/bash
 ### BEGIN INIT INFO
-# Provides:          influxdb
+# Provides:          influxd
 # Required-Start:    $all
 # Required-Stop:     $remote_fs $syslog
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: Start influxdb at boot time
+# Short-Description: Start the InfluxDB process
 ### END INIT INFO
 
-# this init script supports three different variations:
-#  1. New lsb that define start-stop-daemon
-#  2. Old lsb that don't have start-stop-daemon but define, log, pidofproc and killproc
-#  3. Centos installations without lsb-core installed
-#
-# In the third case we have to define our own functions which are very dumb
-# and expect the args to be positioned correctly.
+# If you modify this, please make sure to also edit influxdb.service
 
-if [ -e /lib/lsb/init-functions ]; then
+# Command-line options that can be set in /etc/default/influxdb.  These will override
+# any config file values.
+DEFAULT=/etc/default/influxdb
+
+# Daemon options
+INFLUXD_OPTS=
+
+# Process name ( For display )
+NAME=influxdb
+
+# User and group
+USER=influxdb
+GROUP=influxdb
+
+# Check for sudo or root privileges before continuing
+if [ "$UID" != "0" ]; then
+    echo "You must be root to run this script"
+    exit 1
+fi
+
+# Daemon name, where is the actual executable If the daemon is not
+# there, then exit.
+DAEMON=/usr/bin/influxd
+if [ ! -x $DAEMON ]; then
+    echo "Executable $DAEMON does not exist!"
+    exit 5
+fi
+
+# Configuration file
+CONFIG=/etc/influxdb/influxdb.conf
+
+# PID file for the daemon
+PIDFILE=/var/run/influxdb/influxd.pid
+PIDDIR=`dirname $PIDFILE`
+if [ ! -d "$PIDDIR" ]; then
+    mkdir -p $PIDDIR
+    chown $USER:$GROUP $PIDDIR
+fi
+
+# Max open files
+OPEN_FILE_LIMIT=65536
+
+if [ -r /lib/lsb/init-functions ]; then
     source /lib/lsb/init-functions
 fi
 
-function pidofproc() {
-    if [ $# -ne 3 ]; then
-        echo "Expected three arguments, e.g. $0 -p pidfile daemon-name"
-    fi
+# Logging
+if [ -z "$STDOUT" ]; then
+    STDOUT=/dev/null
+fi
 
-    pid=`pgrep -f $3`
-    local pidfile=`cat $2`
+if [ ! -f "$STDOUT" ]; then
+    mkdir -p $(dirname $STDOUT)
+fi
 
-    if [ "x$pidfile" == "x" ]; then
-        return 1
-    fi
+if [ -z "$STDERR" ]; then
+    STDERR=/var/log/influxdb/influxd.log
+fi
 
-    if [ "x$pid" != "x" -a "$pidfile" == "$pid" ]; then
-        return 0
-    fi
+if [ ! -f "$STDERR" ]; then
+    mkdir -p $(dirname $STDERR)
+fi
 
-    return 1
-}
-
-function killproc() {
-    if [ $# -ne 3 ]; then
-        echo "Expected three arguments, e.g. $0 -p pidfile signal"
-    fi
-
-    pid=`cat $2`
-
-    kill -s $3 $pid
-}
+# Override init script variables with DEFAULT values
+if [ -r $DEFAULT ]; then
+    source $DEFAULT
+fi
 
 function log_failure_msg() {
     echo "$@" "[ FAILED ]"
@@ -58,92 +86,148 @@ function log_success_msg() {
     echo "$@" "[ OK ]"
 }
 
-# Process name ( For display )
-name=influxdb
+function start() {
+    # Check if config file exist
+    if [ ! -r $CONFIG ]; then
+        log_failure_msg "config file $CONFIG doesn't exist (or you don't have permission to view)"
+        exit 4
+    fi
 
-# Daemon name, where is the actual executable
-daemon=/usr/bin/$name
+    # Check that the PID file exists, and check the actual status of process
+    if [ -f $PIDFILE ]; then
+        PID="$(cat $PIDFILE)"
+        if kill -0 "$PID" &>/dev/null; then
+            # Process is already up
+            log_success_msg "$NAME process is already running"
+            return 0
+        fi
+    else
+        su -s /bin/sh -c "touch $PIDFILE" $USER &>/dev/null
+        if [ $? -ne 0 ]; then
+            log_failure_msg "$PIDFILE not writable, check permissions"
+            exit 5
+        fi
+    fi
 
-# pid file for the daemon
-pidfile=/opt/influxdb/shared/influxdb.pid
+    # Bump the file limits, before launching the daemon. These will
+    # carry over to launched processes.
+    ulimit -n $OPEN_FILE_LIMIT
+    if [ $? -ne 0 ]; then
+        log_failure_msg "Unable to set ulimit to $OPEN_FILE_LIMIT"
+        exit 1
+    fi
 
-# Configuration file
-config=/opt/$name/shared/config.toml
+    # Launch process
+    echo "Starting $NAME..."
+    if which start-stop-daemon &>/dev/null; then
+        start-stop-daemon \
+            --chuid $USER:$GROUP \
+            --start \
+            --quiet \
+            --pidfile $PIDFILE \
+            --exec $DAEMON \
+            -- \
+            -pidfile $PIDFILE \
+            -config $CONFIG \
+            $INFLUXD_OPTS >>$STDOUT 2>>$STDERR &
+    else
+        local CMD="$DAEMON -pidfile $PIDFILE -config $CONFIG $INFLUXD_OPTS >>$STDOUT 2>>$STDERR &"
+        su -s /bin/sh -c "$CMD" $USER
+    fi
 
-# If the daemon is not there, then exit.
-[ -x $daemon ] || exit 5
+    # Sleep to verify process is still up
+    sleep 1
+    if [ -f $PIDFILE ]; then
+        # PIDFILE exists
+        if kill -0 $(cat $PIDFILE) &>/dev/null; then
+            # PID up, service running
+            log_success_msg "$NAME process was started"
+            return 0
+        fi
+    fi
+    log_failure_msg "$NAME process was unable to start"
+    exit 1
+}
+
+function stop() {
+    # Stop the daemon.
+    if [ -f $PIDFILE ]; then
+        local PID="$(cat $PIDFILE)"
+        if kill -0 $PID &>/dev/null; then
+            echo "Stopping $NAME..."
+            # Process still up, send SIGTERM and remove PIDFILE
+            kill -s TERM $PID &>/dev/null && rm -f "$PIDFILE" &>/dev/null
+            n=0
+            while true; do
+                # Enter loop to ensure process is stopped
+                kill -0 $PID &>/dev/null
+                if [ "$?" != "0" ]; then
+                    # Process stopped, break from loop
+                    log_success_msg "$NAME process was stopped"
+                    return 0
+                fi
+
+                # Process still up after signal, sleep and wait
+                sleep 1
+                n=$(expr $n + 1)
+                if [ $n -eq 30 ]; then
+                    # After 30 seconds, send SIGKILL
+                    echo "Timeout exceeded, sending SIGKILL..."
+                    kill -s KILL $PID &>/dev/null
+                elif [ $? -eq 40 ]; then
+                    # After 40 seconds, error out
+                    log_failure_msg "could not stop $NAME process"
+                    exit 1
+                fi
+            done
+        fi
+    fi
+    log_success_msg "$NAME process already stopped"
+}
+
+function restart() {
+    # Restart the daemon.
+    stop
+    start
+}
+
+function status() {
+    # Check the status of the process.
+    if [ -f $PIDFILE ]; then
+        PID="$(cat $PIDFILE)"
+        if kill -0 $PID &>/dev/null; then
+            log_success_msg "$NAME process is running"
+            exit 0
+        fi
+    fi
+    log_failure_msg "$NAME process is not running"
+    exit 1
+}
 
 case $1 in
     start)
-        # Checked the PID file exists and check the actual status of process
-        if [ -e $pidfile ]; then
-            pidofproc -p $pidfile $daemon > /dev/null 2>&1 && status="0" || status="$?"
-            # If the status is SUCCESS then don't need to start again.
-            if [ "x$status" = "x0" ]; then
-                log_failure_msg "$name process is running"
-                exit 1 # Exit
-            fi
-        fi
-        # Start the daemon.
-        log_success_msg "Starting the process" "$name"
-        # Start the daemon with the help of start-stop-daemon
-        # Log the message appropriately
-        cd /
-        if which start-stop-daemon > /dev/null 2>&1; then
-            nohup start-stop-daemon --chuid influxdb:influxdb -d / --start --quiet --oknodo --pidfile $pidfile --exec $daemon -- -pidfile $pidfile -config $config > /dev/null 2>&1 &
-        elif set | egrep '^start_daemon' > /dev/null 2>&1; then
-            start_daemon -u influxdb ${daemon}-daemon -pidfile $pidfile -config $config
-        else
-            sudo -u influxdb -g influxdb ${daemon}-daemon -pidfile $pidfile -config $config
-        fi
-        log_success_msg "$name process was started"
+        start
         ;;
+
     stop)
-        # Stop the daemon.
-        if [ -e $pidfile ]; then
-            pidofproc -p $pidfile $daemon > /dev/null 2>&1 && status="0" || status="$?"
-            if [ "$status" = 0 ]; then
-                if killproc -p $pidfile SIGTERM && /bin/rm -rf $pidfile; then
-                    log_success_msg "$name process was stopped"
-                else
-                    log_failure_msg "$name failed to stop service"
-                fi
-            fi
-        else
-            log_failure_msg "$name process is not running"
-        fi
+        stop
         ;;
+
     restart)
-        # Restart the daemon.
-        $0 stop && sleep 2 && $0 start
+        restart
         ;;
+
     status)
-        # Check the status of the process.
-        if [ -e $pidfile ]; then
-            if pidofproc -p $pidfile $daemon > /dev/null; then
-                log_success_msg "$name Process is running"
-                exit 0
-            else
-                log_failure_msg "$name Process is not running"
-                exit 1
-            fi
-        else
-            log_failure_msg "$name Process is not running"
-            exit 1
-        fi
+        status
         ;;
-    # reload)
-    #     # Reload the process. Basically sending some signal to a daemon to reload its configurations.
-    #     if [ -e $pidfile ]; then
-    #         start-stop-daemon --stop --signal SIGHUSR2 --quiet --pidfile $pidfile --name $name
-    #         log_success_msg "$name process reloaded successfully"
-    #     else
-    #         log_failure_msg "$pidfile does not exists"
-    #     fi
-    #     ;;
+
+    version)
+        $DAEMON version
+        ;;
+
     *)
         # For invalid arguments, print the usage message.
-        echo "Usage: $0 {start|stop|restart|reload|status}"
+        echo "Usage: $0 {start|stop|restart|status|version}"
         exit 2
         ;;
 esac

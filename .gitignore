@@ -1,36 +1,45 @@
+# Keep editor-specific, non-project specific ignore rules in global .gitignore:
+# https://help.github.com/articles/ignoring-files/#create-a-global-gitignore
+
 *~
 src/
 
 config.json
-/test
 /bin/
 
-/pkg/
-
-TAGS
-
-flymake.sh
-refresh_tags.sh
-a.out
-
-# vim temp files
-*.swp
-
-*.test
 /query/a.out*
-.DS_Store
 
 # ignore generated files.
-daemon/version.go
-parser/lex.yy.c
-parser/y.tab.h
-parser/y.tab.c
-protocol/protocol.pb.go
-build/
+cmd/influxd/version.go
 
 # executables
-/server
-/influxdb
+
+*.test
+
+influx_tsm
+**/influx_tsm
+!**/influx_tsm/
+
+influx_stress
+**/influx_stress
+!**/influx_stress/
+
+influxd
+**/influxd
+!**/influxd/
+
+influx
+**/influx
+!**/influx/
+
+influxdb
+**/influxdb
+!**/influxdb/
+
+influx_inspect
+**/influx_inspect
+!**/influx_inspect/
+
 /benchmark-tool
 /main
 /benchmark-storage
@@ -47,7 +56,6 @@ packages/
 autom4te.cache/
 config.log
 config.status
-Makefile
 
 # log file
 influxdb.log
@@ -55,6 +63,14 @@ benchmark.log
 
 # config file
 config.toml
-/admin
-/admin/
-/data/
+
+# test data files
+integration/migration_data/
+
+# man outputs
+man/*.xml
+man/*.1
+man/*.1.gz
+
+# test outputs
+/test-results.xml
