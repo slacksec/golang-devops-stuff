@@ -12,50 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// author: Cong Ding <dinggnu@gmail.com>
+// Author: Cong Ding <dinggnu@gmail.com>
 
 package stun
 
 import (
+	"crypto/rand"
 	"encoding/binary"
-	"net"
-	"time"
+	"errors"
 )
 
 type packet struct {
 	types      uint16
 	length     uint16
-	cookie     uint32
-	id         []byte // 12 bytes
+	transID    []byte // 4 bytes magic cookie + 12 bytes transaction id
 	attributes []attribute
 }
 
-func newPacket() *packet {
+func newPacket() (*packet, error) {
 	v := new(packet)
-	v.id = make([]byte, 12)
+	v.transID = make([]byte, 16)
+	binary.BigEndian.PutUint32(v.transID[:4], magicCookie)
+	_, err := rand.Read(v.transID[4:])
+	if err != nil {
+		return nil, err
+	}
 	v.attributes = make([]attribute, 0, 10)
-	v.cookie = magicCookie
 	v.length = 0
-	return v
+	return v, nil
 }
 
-func newPacketFromBytes(b []byte) *packet {
-	packet := newPacket()
-	packet.types = binary.BigEndian.Uint16(b[0:2])
-	packet.length = binary.BigEndian.Uint16(b[2:4])
-	packet.cookie = binary.BigEndian.Uint32(b[4:8])
-	packet.id = b[8:20]
-
-	for pos := uint16(20); pos < uint16(len(b)); {
-		types := binary.BigEndian.Uint16(b[pos : pos+2])
-		length := binary.BigEndian.Uint16(b[pos+2 : pos+4])
-		value := b[pos+4 : pos+4+length]
+func newPacketFromBytes(packetBytes []byte) (*packet, error) {
+	if len(packetBytes) < 24 {
+		return nil, errors.New("Received data length too short.")
+	}
+	pkt := new(packet)
+	pkt.types = binary.BigEndian.Uint16(packetBytes[0:2])
+	pkt.length = binary.BigEndian.Uint16(packetBytes[2:4])
+	pkt.transID = packetBytes[4:20]
+	pkt.attributes = make([]attribute, 0, 10)
+	for pos := uint16(20); pos < uint16(len(packetBytes)); {
+		types := binary.BigEndian.Uint16(packetBytes[pos : pos+2])
+		length := binary.BigEndian.Uint16(packetBytes[pos+2 : pos+4])
+		if pos+4+length > uint16(len(packetBytes)) {
+			return nil, errors.New("Received data format mismatch.")
+		}
+		value := packetBytes[pos+4 : pos+4+length]
 		attribute := newAttribute(types, value)
-		packet.addAttribute(*attribute)
+		pkt.addAttribute(*attribute)
 		pos += align(length) + 4
 	}
-
-	return packet
+	return pkt, nil
 }
 
 func (v *packet) addAttribute(a attribute) {
@@ -64,81 +71,59 @@ func (v *packet) addAttribute(a attribute) {
 }
 
 func (v *packet) bytes() []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint16(b[0:2], v.types)
-	binary.BigEndian.PutUint16(b[2:4], v.length)
-	binary.BigEndian.PutUint32(b[4:8], v.cookie)
-	b = append(b, v.id...)
-
+	packetBytes := make([]byte, 4)
+	binary.BigEndian.PutUint16(packetBytes[0:2], v.types)
+	binary.BigEndian.PutUint16(packetBytes[2:4], v.length)
+	packetBytes = append(packetBytes, v.transID...)
 	for _, a := range v.attributes {
 		buf := make([]byte, 2)
 		binary.BigEndian.PutUint16(buf, a.types)
-		b = append(b, buf...)
+		packetBytes = append(packetBytes, buf...)
 		binary.BigEndian.PutUint16(buf, a.length)
-		b = append(b, buf...)
-		b = append(b, a.value...)
+		packetBytes = append(packetBytes, buf...)
+		packetBytes = append(packetBytes, a.value...)
 	}
-	return b
+	return packetBytes
 }
 
-func (v *packet) mappedAddr() *Host {
+func (v *packet) getSourceAddr() *Host {
+	return v.getRawAddr(attributeSourceAddress)
+}
+
+func (v *packet) getMappedAddr() *Host {
+	return v.getRawAddr(attributeMappedAddress)
+}
+
+func (v *packet) getChangedAddr() *Host {
+	return v.getRawAddr(attributeChangedAddress)
+}
+
+func (v *packet) getOtherAddr() *Host {
+	return v.getRawAddr(attributeOtherAddress)
+}
+
+func (v *packet) getRawAddr(attribute uint16) *Host {
 	for _, a := range v.attributes {
-		if a.types == attribute_MAPPED_ADDRESS {
-			h := a.address()
-			return h
+		if a.types == attribute {
+			return a.rawAddr()
 		}
 	}
 	return nil
 }
 
-func (v *packet) changedAddr() *Host {
+func (v *packet) getXorMappedAddr() *Host {
+	addr := v.getXorAddr(attributeXorMappedAddress)
+	if addr == nil {
+		addr = v.getXorAddr(attributeXorMappedAddressExp)
+	}
+	return addr
+}
+
+func (v *packet) getXorAddr(attribute uint16) *Host {
 	for _, a := range v.attributes {
-		if a.types == attribute_CHANGED_ADDRESS {
-			h := a.address()
-			return h
+		if a.types == attribute {
+			return a.xorAddr(v.transID)
 		}
 	}
 	return nil
-}
-
-func (v *packet) xorMappedAddr() *Host {
-	for _, a := range v.attributes {
-		if (a.types == attribute_XOR_MAPPED_ADDRESS) || (a.types == attribute_XOR_MAPPED_ADDRESS_EXP) {
-			h := a.xorMappedAddr()
-			return h
-		}
-	}
-	return nil
-}
-
-// RFC 3489: Clients SHOULD retransmit the request starting with an interval
-// of 100ms, doubling every retransmit until the interval reaches 1.6s.
-// Retransmissions continue with intervals of 1.6s until a response is
-// received, or a total of 9 requests have been sent.
-func (packet *packet) send(conn net.Conn) (*packet, error) {
-	timeout := 100
-
-	for i := 0; i < 9; i++ {
-		l, err := conn.Write(packet.bytes())
-		if err != nil {
-			return nil, err
-		}
-
-		conn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Millisecond))
-		if timeout < 1600 {
-			timeout *= 2
-		}
-
-		b := make([]byte, 1024)
-		l, err = conn.Read(b)
-		if err == nil {
-			return newPacketFromBytes(b[0:l]), nil
-		} else {
-			if !err.(net.Error).Timeout() {
-				return nil, err
-			}
-		}
-	}
-
-	return nil, nil
 }
