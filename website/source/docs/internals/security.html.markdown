@@ -2,23 +2,23 @@
 layout: "docs"
 page_title: "Security Model"
 sidebar_current: "docs-internals-security"
+description: |-
+  Serf uses a symmetric key, or shared secret, cryptosystem to provide confidentiality, integrity and authentication.
 ---
 
 # Security Model
 
 Serf uses a symmetric key, or shared secret, cryptosystem to provide
-[confidentiality, integrity and authentication](http://en.wikipedia.org/wiki/Information_security).
+[confidentiality, integrity and authentication](https://en.wikipedia.org/wiki/Information_security).
 
 This means Serf communication is protected against eavesdropping, tampering,
 or attempts to generate fake events. This makes it possible to run Serf over
 untrusted networks such as EC2 and other shared hosting providers.
 
-<div class="alert alert-block alert-warning">
-<strong>Advanced Topic!</strong> This page covers the technical details of
+~> **Advanced Topic!** This page covers the technical details of
 the security model of Serf. You don't need to know these details to
 operate and use Serf. These details are documented here for those who wish
 to learn about them without having to go spelunking through the source code.
-</div>
 
 ## Security Primitives
 
@@ -27,19 +27,19 @@ All members of the Serf cluster must be provided the shared secret ahead of time
 This places the burden of key distribution on the user.
 
 To support confidentiality, all messages are encrypted using the
-[AES-128 standard](http://en.wikipedia.org/wiki/Advanced_Encryption_Standard). The
+[AES-128 standard](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard). The
 AES standard is considered one of the most secure and modern encryption standards.
 Additionally, it is a fast algorithm, and modern CPUs provide hardware instructions to
 make encryption and decryption very lightweight.
 
-AES is used with the [Galois Counter Mode (GCM)](http://en.wikipedia.org/wiki/Galois/Counter_Mode),
+AES is used with the [Galois Counter Mode (GCM)](https://en.wikipedia.org/wiki/Galois/Counter_Mode),
 using a randomly generated nonce. The use of GCM provides message integrity,
 as the ciphertext is suffixed with a 'tag' that is used to verify integrity.
 
 ## Message Format
 
 In the previous section we described the crypto primitives that are used. In this
-section we cover how messages are framed on the wire and interpretted.
+section we cover how messages are framed on the wire and interpreted.
 
 ### UDP Message Format
 
@@ -60,10 +60,10 @@ change the algorithm they use. It is currently always set to 0.
 ### TCP Message Format
 
 TCP provides a stream abstraction and therefore we must provide our own framing.
-This intoduces a potential attack vector since we cannot verify the tag
+This introduces a potential attack vector since we cannot verify the tag
 until the entire message is received, and the message length must be in plaintext.
 Our current strategy is to limit the maximum size of a framed message to prevent
-an malicious attacker from being able to send enough data to cause a Denial of Service.
+a malicious attacker from being able to send enough data to cause a Denial of Service.
 
 The TCP format is similar to the UDP format, but prepends the message with
 a message type byte (similar to other Serf messages). It also adds a 4 byte length
@@ -114,7 +114,7 @@ The basic flow of changing the encryption key on a given Serf cluster is:
 * Remove old key
 
 Due to the nature of distributed systems, it is difficult to reason about when
-to change they key used for message encryption on any given member in a
+to change the key used for message encryption on any given member in a
 cluster. Therefore, Serf allows multiple keys to be used to decrypt messages
 while the cluster converges. Decrypting messages becomes more expensive while
 there is more than one key active, as multiple attempts to decrypt any given

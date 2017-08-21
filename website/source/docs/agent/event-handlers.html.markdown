@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "Event Handlers"
 sidebar_current: "docs-agent-events"
+description: |-
+  Serf's true power and flexibility comes in the form of event handlers: scripts that are executed in response to various events that can occur related to the Serf cluster. Serf invokes events related to membership changes (when a node comes online or goes offline) as well as custom events or queries.
 ---
 
 # Event Handlers
@@ -13,16 +15,16 @@ changes (when a node comes online or goes offline) as well as
 [custom events](/docs/commands/event.html) or [queries](/docs/commands/query.html).
 
 Event handlers can be any executable, including piped executables (such
-as `awk '{print $2}' | grep foo`, since event handlers are invoked within
+as `awk '{print $2}' | grep foo`), since event handlers are invoked within
 the context of a shell. The event handler is executed anytime an event
-occurs and are expected to exit within a reasonable amount of time.
+occurs and is expected to exit within a reasonable amount of time.
 
 ## Inputs and Parameters
 
 Every time an event handler is invoked, Serf sets some environmental
 variables:
 
-* `SERF_EVENT` is the event type that is occuring. This will be one of
+* `SERF_EVENT` is the event type that is occurring. This will be one of
   `member-join`, `member-leave`, `member-failed`, `member-update`,
   `member-reap`, `user`, or `query`.
 
@@ -101,3 +103,38 @@ used to filter an event handler:
 * `query:load=uptime` - The uptime command will be invoked only for "load"
   queries.
 
+## Forking event handlers
+
+There are some cases where it may be desirable to fork a background process when
+an event handler fires. This is mainly useful for invoking scripts which take a
+minute or two to execute, and where the process output is not important. By
+default, Serf's execution subsystem will block, waiting for output and a return
+code. It is possible, however, to "detach" a process by forking and replacing
+the file descriptors for both stdout and stderr.
+
+In shell, this would look something like:
+
+```
+sleep 5 &>/dev/null &
+```
+
+In the above example, `sleep 5` is the lengthy process. Notice the first
+ampersand, which copies the file descriptor instead of just redirecting output.
+
+Similarly, in Python this might look like:
+
+```
+out_log = file('/dev/null', 'a+')
+os.dup2(out_log.fileno(), sys.stdout.fileno())
+os.dup2(out_log.fileno(), sys.stderr.fileno())
+```
+
+Or in ruby:
+
+```
+$stdout.reopen('/dev/null', 'w')
+$stderr.reopen('/dev/null', 'w')
+```
+
+**Note:** This method is really only useful for event handlers, and is mostly
+useless for [queries](/docs/commands/query.html).

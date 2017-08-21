@@ -1,3 +1,99 @@
+## 0.8.2 (UNRELEASED)
+
+FEATURES:
+
+IMRPOVEMENTS:
+
+* agent: Fixed a missing case where gossip would stop flowing to dead nodes for a short while. [GH-451]
+* agent: Uses the go-sockaddr library to look for private IP addresses, which prefers non-loopback private addresses over loopback ones when trying to automatically determine the advertise address. [GH-451]
+* agent: Properly seeds Go's random number generator using the seed library. [GH-451]
+* agent: Serf is now built with Go 1.8. [GH-455]
+* agent: Improved address comparison during conflict resolution. [GH-433]
+* library: Moved close of shutdown channel until after network resorces are released. [GH-453]
+* library: Fixed several race conditions with QueryResponse [GH-460]
+
+BUG FIXES:
+
+* agent: Added defenses against invalid network coordinates with NaN and Inf values. [GH-468]
+* agent: Fixed an issue on Windows where "wsarecv" errors were logged when clients accessed the RPC interface. [GH-479]
+
+## 0.8.1 (February 6, 2017)
+
+IMPROVEMENTS:
+
+ * agent: Added support for relaying query responses through N other nodes for redundancy. [GH-439]
+ * agent: Added the ability to tune the broadcast timeout, which might be necessary in very large clusters that experience very large, simultaneous changes to the cluster. [GH-412]
+ * agent: Added a checksum to UDP gossip messages to guard against packet corruption. [GH-432]
+ * agent: Added a short window where gossip will still flow to dead nodes so that they can more quickly refute. [GH-440]
+ * build: Serf now builds with Go 1.7.5. [GH-443]
+
+## 0.8 (September 14, 2016)
+
+FEATURES:
+
+ * **Lifeguard Updates:** Implemented a new set of feedback controls for the gossip layer that help prevent degraded nodes that can't meet the soft real-time requirements from erroneously causing flapping in other, healthy nodes. This feature tunes itself automatically and requires no configuration. [GH-394]
+
+IMRPOVEMENTS:
+
+ * Modified management of intents to be per-node to avoid intent queue overflow errors in large clusters. [GH-402]
+ * Joins based on a DNS lookup will use TCP and attempt to join with the full list of returned addresses. [GH-387]
+ * Serf's Go dependencies are now vendored using govendor. [GH-383]
+ * Updated all of Serf's dependencies. [GH-387] [GH-401]
+ * Moved dist build into a Docker container. [GH-409]
+
+BUG FIXES:
+
+ * Updated memberlist to pull in a fix for leaking goroutines when performing TCP fallback pings. This affected users with frequent UDP connectivity problems. [GH-381]
+
+## 0.7 (December 21, 2015)
+
+FEATURES:
+
+ * Added new network tomography subsystem that computes network coordinates for
+   nodes in the cluster which can be used to estimate network round trip times
+   between any two nodes; exposes new `GetCoordinate` API as as well as a
+   a new `serf rtt` command to query RTT interactively
+
+IMPROVEMENTS:
+
+ * Added support for configuring query request size and query response size [GH-346]
+ * Syslog messages are now filtered by the configured log-level
+ * New `statsd_addr` for sending metrics via UDP to statsd
+ * Added support for sending telemetry to statsite
+ * `serf info` command now displays event handlers [GH-312]
+ * Added a `MemberLeave` message to the `EventCh` for a force-leave so higher-
+   level applications can handle the leave event
+ * Lots of documentation updates
+
+BUG FIXES:
+
+ * Fixed updating cached protocol version of a node when an update event
+   fires [GH-335]
+ * Fixed a bug where an empty remote state message would cause a crash in
+   `MergeRemoteState`
+
+## 0.6.4 (Febuary 12, 2015)
+
+IMPROVEMENTS:
+
+ * Added merge delegate to Serf library to support application
+   specific logic in cluster merging.
+ * `SERF_RPC_AUTH` environment variable can be used in place of CLI flags.
+ * Display if encryption is enabled in Serf stats
+ * Improved `join` behavior when using DNS resolution
+
+BUG FIXES:
+
+ * Fixed snapshot file compaction on Windows
+ * Fixed device binding on Windows
+ * Fixed bug with empty keyring
+ * Fixed parsing of ports in some cases
+ * Fixing stability issues under high churn
+
+MISC:
+
+* Increased user event size limit to 512 bytes (previously 256)
+
 ## 0.6.3 (July 10, 2014)
 
 IMPROVEMENTS:
@@ -151,7 +247,7 @@ MISC:
   * Support for protocol version 1 (Serf 0.2) has been removed. Serf 0.5 cannot
   join a cluster that has members running version 0.2.
 
-## 0.4.5 (Febuary 25, 2014)
+## 0.4.5 (February 25, 2014)
 
 FEATURES:
 
@@ -181,7 +277,7 @@ BUG FIXES:
 
  * User event handler appends new line, this was being omitted
 
-## 0.4.1 (Febuary 3, 2014)
+## 0.4.1 (February 3, 2014)
 
 IMPROVEMENTS:
 

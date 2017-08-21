@@ -3,8 +3,9 @@ package client
 import (
 	"bufio"
 	"fmt"
+	"github.com/hashicorp/go-msgpack/codec"
 	"github.com/hashicorp/logutils"
-	"github.com/ugorji/go/codec"
+	"github.com/hashicorp/serf/coordinate"
 	"log"
 	"net"
 	"sync"
@@ -365,6 +366,26 @@ func (c *RPCClient) Stats() (map[string]map[string]string, error) {
 	return resp, err
 }
 
+// GetCoordinate is used to retrieve the cached coordinate of a node.
+func (c *RPCClient) GetCoordinate(node string) (*coordinate.Coordinate, error) {
+	header := requestHeader{
+		Command: getCoordinateCommand,
+		Seq:     c.getSeq(),
+	}
+	req := coordinateRequest{
+		Node: node,
+	}
+	var resp coordinateResponse
+
+	if err := c.genericRPC(&header, &req, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Ok {
+		return &resp.Coord, nil
+	}
+	return nil, nil
+}
+
 type monitorHandler struct {
 	client *RPCClient
 	closed bool
@@ -600,6 +621,7 @@ type QueryParam struct {
 	FilterNodes []string            // A list of node names to restrict query to
 	FilterTags  map[string]string   // A map of tag name to regex to filter on
 	RequestAck  bool                // Should nodes ack the query receipt
+	RelayFactor uint8               // Duplicate response count to be relayed back to sender for redundancy.
 	Timeout     time.Duration       // Maximum query duration. Optional, will be set automatically.
 	Name        string              // Opaque query name
 	Payload     []byte              // Opaque query payload
@@ -622,6 +644,7 @@ func (c *RPCClient) Query(params *QueryParam) error {
 		FilterNodes: params.FilterNodes,
 		FilterTags:  params.FilterTags,
 		RequestAck:  params.RequestAck,
+		RelayFactor: params.RelayFactor,
 		Timeout:     params.Timeout,
 		Name:        params.Name,
 		Payload:     params.Payload,

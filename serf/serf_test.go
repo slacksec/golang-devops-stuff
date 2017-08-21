@@ -1,10 +1,9 @@
 package serf
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
-	"github.com/hashicorp/memberlist"
-	"github.com/hashicorp/serf/testutil"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -12,6 +11,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/memberlist"
+	"github.com/hashicorp/serf/coordinate"
+	"github.com/hashicorp/serf/testutil"
 )
 
 func testConfig() *Config {
@@ -206,12 +210,13 @@ func TestSerf_eventsLeave(t *testing.T) {
 		[]EventType{EventMemberJoin, EventMemberLeave})
 }
 
-func TestSerf_eventsUser(t *testing.T) {
+func TestSerf_RemoveFailed_eventsLeave(t *testing.T) {
 	// Create the s1 config with an event channel so we can listen
 	eventCh := make(chan Event, 4)
 	s1Config := testConfig()
+	s1Config.EventCh = eventCh
+
 	s2Config := testConfig()
-	s2Config.EventCh = eventCh
 
 	s1, err := Create(s1Config)
 	if err != nil {
@@ -224,6 +229,53 @@ func TestSerf_eventsUser(t *testing.T) {
 	}
 
 	defer s1.Shutdown()
+	defer s2.Shutdown()
+
+	testutil.Yield()
+
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	testutil.Yield()
+
+	if err := s2.Shutdown(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	time.Sleep(s2Config.MemberlistConfig.ProbeInterval * 3)
+
+	if err := s1.RemoveFailedNode(s2Config.NodeName); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	testutil.Yield()
+
+	// Now that s2 has failed and been marked as left, we check the
+	// events to make sure we got a leave event in s1 about the leave.
+	testEvents(t, eventCh, s2Config.NodeName,
+		[]EventType{EventMemberJoin, EventMemberFailed, EventMemberLeave})
+}
+
+func TestSerf_eventsUser(t *testing.T) {
+	// Create the s1 config with an event channel so we can listen
+	eventCh := make(chan Event, 4)
+	s1Config := testConfig()
+	s2Config := testConfig()
+	s2Config.EventCh = eventCh
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
 	defer s2.Shutdown()
 
 	testutil.Yield()
@@ -295,12 +347,12 @@ func TestSerf_joinLeave(t *testing.T) {
 
 	testutil.Yield()
 
-	if len(s1.Members()) != 1 {
-		t.Fatalf("s1 members: %d", len(s1.Members()))
+	if len(s1.Members()) != 1 || s1.NumNodes() != 1 {
+		t.Fatalf("s1 members: %d && %d", len(s1.Members()), s1.NumNodes())
 	}
 
-	if len(s2.Members()) != 1 {
-		t.Fatalf("s2 members: %d", len(s2.Members()))
+	if len(s2.Members()) != 1 || s2.NumNodes() != 1 {
+		t.Fatalf("s2 members: %d && %d", len(s2.Members()), s2.NumNodes())
 	}
 
 	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
@@ -310,12 +362,12 @@ func TestSerf_joinLeave(t *testing.T) {
 
 	testutil.Yield()
 
-	if len(s1.Members()) != 2 {
-		t.Fatalf("s1 members: %d", len(s1.Members()))
+	if len(s1.Members()) != 2 || s1.NumNodes() != 2 {
+		t.Fatalf("s1 members: %d && %d", len(s1.Members()), s1.NumNodes())
 	}
 
-	if len(s2.Members()) != 2 {
-		t.Fatalf("s2 members: %d", len(s2.Members()))
+	if len(s2.Members()) != 2 || s2.NumNodes() != 2 {
+		t.Fatalf("s2 members: %d && %d", len(s2.Members()), s2.NumNodes())
 	}
 
 	err = s1.Leave()
@@ -326,12 +378,12 @@ func TestSerf_joinLeave(t *testing.T) {
 	// Give the reaper time to reap nodes
 	time.Sleep(s1Config.ReapInterval * 2)
 
-	if len(s1.Members()) != 1 {
-		t.Fatalf("s1 members: %d", len(s1.Members()))
+	if len(s1.Members()) != 1 || s1.NumNodes() != 1 {
+		t.Fatalf("s1 members: %d && %d", len(s1.Members()), s1.NumNodes())
 	}
 
-	if len(s2.Members()) != 1 {
-		t.Fatalf("s2 members: %d", len(s2.Members()))
+	if len(s2.Members()) != 1 || s2.NumNodes() != 1 {
+		t.Fatalf("s2 members: %d && %d", len(s2.Members()), s2.NumNodes())
 	}
 }
 
@@ -527,6 +579,95 @@ func TestSerf_reconnect_sameIP(t *testing.T) {
 		[]EventType{EventMemberJoin, EventMemberFailed, EventMemberJoin})
 }
 
+func TestSerf_update(t *testing.T) {
+	eventCh := make(chan Event, 64)
+	s1Config := testConfig()
+	s1Config.EventCh = eventCh
+
+	s2Config := testConfig()
+	s2Addr := s2Config.MemberlistConfig.BindAddr
+	s2Name := s2Config.NodeName
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	defer s1.Shutdown()
+
+	testutil.Yield()
+
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	testutil.Yield()
+
+	// Now force the shutdown of s2 so it appears to fail.
+	if err := s2.Shutdown(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Don't wait for a failure to be detected. Bring back s2 immediately
+	// by mimicking its name and address.
+	s2Config = testConfig()
+	s2Config.MemberlistConfig.BindAddr = s2Addr
+	s2Config.NodeName = s2Name
+
+	// Add a tag to force an update event, and add a version downgrade as
+	// well (that alone won't trigger an update).
+	s2Config.ProtocolVersion -= 1
+	s2Config.Tags["foo"] = "bar"
+
+	// We try for a little while to wait for s2 to fully shutdown since the
+	// shutdown method doesn't block until that's done.
+	start := time.Now()
+	for {
+		s2, err = Create(s2Config)
+		if err == nil {
+			defer s2.Shutdown()
+			break
+		} else if !strings.Contains(err.Error(), "address already in use") {
+			t.Fatalf("err: %s", err)
+		}
+
+		if time.Now().Sub(start) > 2*time.Second {
+			t.Fatalf("timed out trying to restart")
+		}
+	}
+
+	_, err = s2.Join([]string{s1Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	testutil.Yield()
+
+	testEvents(t, eventCh, s2Name,
+		[]EventType{EventMemberJoin, EventMemberUpdate})
+
+	// Verify that the member data got updated.
+	found := false
+	members := s1.Members()
+	for _, member := range members {
+		if member.Name == s2Name {
+			found = true
+			if member.Tags["foo"] != "bar" || member.DelegateCur != s2Config.ProtocolVersion {
+				t.Fatalf("bad: %#v", member)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("didn't find s2 in members")
+	}
+}
+
 func TestSerf_role(t *testing.T) {
 	s1Config := testConfig()
 	s2Config := testConfig()
@@ -694,18 +835,26 @@ func TestSerf_ReapHandler_Shutdown(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
+	// Make sure the reap handler exits on shutdown.
+	doneCh := make(chan struct{})
 	go func() {
-		s.Shutdown()
-		time.Sleep(time.Millisecond)
-		t.Fatalf("timeout")
+		s.handleReap()
+		close(doneCh)
 	}()
-	s.handleReap()
+
+	s.Shutdown()
+	select {
+	case <-doneCh:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout")
+	}
 }
 
 func TestSerf_ReapHandler(t *testing.T) {
 	c := testConfig()
 	c.ReapInterval = time.Nanosecond
 	c.TombstoneTimeout = time.Second * 6
+	c.RecentIntentTimeout = time.Second * 7
 	s, err := Create(c)
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -719,6 +868,15 @@ func TestSerf_ReapHandler(t *testing.T) {
 		&memberState{m, 0, time.Now().Add(-10 * time.Second)},
 	}
 
+	upsertIntent(s.recentIntents, "alice", messageJoinType, 1, time.Now)
+	upsertIntent(s.recentIntents, "bob", messageJoinType, 2, func() time.Time {
+		return time.Now().Add(-10 * time.Second)
+	})
+	upsertIntent(s.recentIntents, "carol", messageLeaveType, 1, time.Now)
+	upsertIntent(s.recentIntents, "doug", messageLeaveType, 2, func() time.Time {
+		return time.Now().Add(-10 * time.Second)
+	})
+
 	go func() {
 		time.Sleep(time.Millisecond)
 		s.Shutdown()
@@ -728,6 +886,18 @@ func TestSerf_ReapHandler(t *testing.T) {
 
 	if len(s.leftMembers) != 2 {
 		t.Fatalf("should be shorter")
+	}
+	if _, ok := recentIntent(s.recentIntents, "alice", messageJoinType); !ok {
+		t.Fatalf("should be buffered")
+	}
+	if _, ok := recentIntent(s.recentIntents, "bob", messageJoinType); ok {
+		t.Fatalf("should be reaped")
+	}
+	if _, ok := recentIntent(s.recentIntents, "carol", messageLeaveType); !ok {
+		t.Fatalf("should be buffered")
+	}
+	if _, ok := recentIntent(s.recentIntents, "doug", messageLeaveType); ok {
+		t.Fatalf("should be reaped")
 	}
 }
 
@@ -745,7 +915,7 @@ func TestSerf_Reap(t *testing.T) {
 		&memberState{m, 0, time.Now().Add(-10 * time.Second)},
 	}
 
-	old = s.reap(old, time.Second*6)
+	old = s.reap(old, time.Now(), time.Second*6)
 	if len(old) != 2 {
 		t.Fatalf("should be shorter")
 	}
@@ -768,28 +938,71 @@ func TestRemoveOldMember(t *testing.T) {
 }
 
 func TestRecentIntent(t *testing.T) {
-	if recentIntent(nil, "foo") != nil {
-		t.Fatalf("should get nil on empty recent")
-	}
-	if recentIntent([]nodeIntent{}, "foo") != nil {
-		t.Fatalf("should get nil on empty recent")
+	if _, ok := recentIntent(nil, "foo", messageJoinType); ok {
+		t.Fatalf("should get nothing on empty recent")
 	}
 
-	recent := []nodeIntent{
-		nodeIntent{1, "foo"},
-		nodeIntent{2, "bar"},
-		nodeIntent{3, "baz"},
-		nodeIntent{4, "bar"},
-		nodeIntent{0, "bar"},
-		nodeIntent{5, "bar"},
+	now := time.Now()
+	expire := func() time.Time {
+		return now.Add(-2 * time.Second)
+	}
+	save := func() time.Time {
+		return now
 	}
 
-	if r := recentIntent(recent, "bar"); r.LTime != 4 {
-		t.Fatalf("bad time for bar")
+	intents := make(map[string]nodeIntent)
+	if _, ok := recentIntent(intents, "foo", messageJoinType); ok {
+		t.Fatalf("should get nothing on empty recent")
+	}
+	if added := upsertIntent(intents, "foo", messageJoinType, 1, expire); !added {
+		t.Fatalf("should have added")
+	}
+	if added := upsertIntent(intents, "bar", messageLeaveType, 2, expire); !added {
+		t.Fatalf("should have added")
+	}
+	if added := upsertIntent(intents, "baz", messageJoinType, 3, save); !added {
+		t.Fatalf("should have added")
+	}
+	if added := upsertIntent(intents, "bar", messageJoinType, 4, expire); !added {
+		t.Fatalf("should have added")
+	}
+	if added := upsertIntent(intents, "bar", messageJoinType, 0, expire); added {
+		t.Fatalf("should not have added")
+	}
+	if added := upsertIntent(intents, "bar", messageJoinType, 5, expire); !added {
+		t.Fatalf("should have added")
 	}
 
-	if r := recentIntent(recent, "tubez"); r != nil {
-		t.Fatalf("got result for tubez")
+	if ltime, ok := recentIntent(intents, "foo", messageJoinType); !ok || ltime != 1 {
+		t.Fatalf("bad: %v %v", ok, ltime)
+	}
+	if ltime, ok := recentIntent(intents, "bar", messageJoinType); !ok || ltime != 5 {
+		t.Fatalf("bad: %v %v", ok, ltime)
+	}
+	if ltime, ok := recentIntent(intents, "baz", messageJoinType); !ok || ltime != 3 {
+		t.Fatalf("bad: %v %v", ok, ltime)
+	}
+	if _, ok := recentIntent(intents, "tubez", messageJoinType); ok {
+		t.Fatalf("should get nothing")
+	}
+
+	reapIntents(intents, now, time.Second)
+	if _, ok := recentIntent(intents, "foo", messageJoinType); ok {
+		t.Fatalf("should get nothing")
+	}
+	if _, ok := recentIntent(intents, "bar", messageJoinType); ok {
+		t.Fatalf("should get nothing")
+	}
+	if ltime, ok := recentIntent(intents, "baz", messageJoinType); !ok || ltime != 3 {
+		t.Fatalf("bad: %v %v", ok, ltime)
+	}
+	if _, ok := recentIntent(intents, "tubez", messageJoinType); ok {
+		t.Fatalf("should get nothing")
+	}
+
+	reapIntents(intents, now.Add(2*time.Second), time.Second)
+	if _, ok := recentIntent(intents, "baz", messageJoinType); ok {
+		t.Fatalf("should get nothing")
 	}
 }
 
@@ -831,12 +1044,12 @@ func TestSerf_joinLeaveJoin(t *testing.T) {
 
 	testutil.Yield()
 
-	if len(s1.Members()) != 1 {
-		t.Fatalf("s1 members: %d", len(s1.Members()))
+	if s1.NumNodes() != 1 {
+		t.Fatalf("s1 members: %d", s1.NumNodes())
 	}
 
-	if len(s2.Members()) != 1 {
-		t.Fatalf("s2 members: %d", len(s2.Members()))
+	if s2.NumNodes() != 1 {
+		t.Fatalf("s2 members: %d", s2.NumNodes())
 	}
 
 	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
@@ -846,12 +1059,12 @@ func TestSerf_joinLeaveJoin(t *testing.T) {
 
 	testutil.Yield()
 
-	if len(s1.Members()) != 2 {
-		t.Fatalf("s1 members: %d", len(s1.Members()))
+	if s1.NumNodes() != 2 {
+		t.Fatalf("s1 members: %d", s1.NumNodes())
 	}
 
-	if len(s2.Members()) != 2 {
-		t.Fatalf("s2 members: %d", len(s2.Members()))
+	if s2.NumNodes() != 2 {
+		t.Fatalf("s2 members: %d", s2.NumNodes())
 	}
 
 	// Leave and shutdown
@@ -895,12 +1108,12 @@ func TestSerf_joinLeaveJoin(t *testing.T) {
 	testutil.Yield()
 
 	// Should be back to both members
-	if len(s1.Members()) != 2 {
-		t.Fatalf("s1 members: %d", len(s1.Members()))
+	if s1.NumNodes() != 2 {
+		t.Fatalf("s1 members: %d", s1.NumNodes())
 	}
 
-	if len(s2.Members()) != 2 {
-		t.Fatalf("s2 members: %d", len(s2.Members()))
+	if s2.NumNodes() != 2 {
+		t.Fatalf("s2 members: %d", s2.NumNodes())
 	}
 
 	// s1 should see the node as alive
@@ -1102,7 +1315,7 @@ func TestSerf_Leave_SnapshotRecovery(t *testing.T) {
 
 	// Verify that s2 is didn't join
 	testMember(t, s1.Members(), s2Config.NodeName, StatusLeft)
-	if len(s2.Members()) != 1 {
+	if s2.NumNodes() != 1 {
 		t.Fatalf("bad members: %#v", s2.Members())
 	}
 }
@@ -1302,10 +1515,25 @@ func TestSerf_Query_Filter(t *testing.T) {
 	}
 	testutil.Yield()
 
+	s3Config := testConfig()
+	s3, err := Create(s3Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s3.Shutdown()
+	testutil.Yield()
+
+	_, err = s1.Join([]string{s3Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	testutil.Yield()
+
 	// Filter to only s1!
 	params := s2.DefaultQueryParams()
 	params.FilterNodes = []string{s1Config.NodeName}
 	params.RequestAck = true
+	params.RelayFactor = 1
 
 	// Start a query from s2
 	resp, err := s2.Query("load", []byte("sup girl"), params)
@@ -1345,8 +1573,58 @@ func TestSerf_Query_Filter(t *testing.T) {
 	}
 }
 
+func TestSerf_Query_Deduplicate(t *testing.T) {
+	s := &Serf{}
+
+	// Set up a dummy query and response
+	mq := &messageQuery{
+		LTime:   123,
+		ID:      123,
+		Timeout: time.Second,
+		Flags:   queryFlagAck,
+	}
+	query := newQueryResponse(3, mq)
+	response := &messageQueryResponse{
+		LTime: mq.LTime,
+		ID:    mq.ID,
+		From:  "node1",
+	}
+	s.queryResponse = map[LamportTime]*QueryResponse{mq.LTime: query}
+
+	// Send a few duplicate responses
+	s.handleQueryResponse(response)
+	s.handleQueryResponse(response)
+	response.Flags |= queryFlagAck
+	s.handleQueryResponse(response)
+	s.handleQueryResponse(response)
+
+	// Ensure we only get one NodeResponse off the channel
+	select {
+	case <-query.respCh:
+	default:
+		t.Fatalf("Should have a response")
+	}
+
+	select {
+	case <-query.ackCh:
+	default:
+		t.Fatalf("Should have an ack")
+	}
+
+	select {
+	case <-query.respCh:
+		t.Fatalf("Should not have any other responses")
+	default:
+	}
+
+	select {
+	case <-query.ackCh:
+		t.Fatalf("Should not have any other acks")
+	default:
+	}
+}
+
 func TestSerf_Query_sizeLimit(t *testing.T) {
-	// Create the s1 config with an event channel so we can listen
 	s1Config := testConfig()
 	s1, err := Create(s1Config)
 	if err != nil {
@@ -1355,13 +1633,30 @@ func TestSerf_Query_sizeLimit(t *testing.T) {
 	defer s1.Shutdown()
 
 	name := "this is too large a query"
-	payload := make([]byte, QuerySizeLimit)
+	payload := make([]byte, s1.config.QuerySizeLimit)
 	_, err = s1.Query(name, payload, nil)
 	if err == nil {
 		t.Fatalf("should get error")
 	}
 	if !strings.HasPrefix(err.Error(), "query exceeds limit of ") {
 		t.Fatalf("should get size limit error: %v", err)
+	}
+}
+
+func TestSerf_Query_sizeLimitIncreased(t *testing.T) {
+	s1Config := testConfig()
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	name := "this is too large a query"
+	payload := make([]byte, s1.config.QuerySizeLimit)
+	s1.config.QuerySizeLimit = 2 * s1.config.QuerySizeLimit
+	_, err = s1.Query(name, payload, nil)
+	if err != nil {
+		t.Fatalf("should not get error: %v", err)
 	}
 }
 
@@ -1383,7 +1678,7 @@ func TestSerf_NameResolution(t *testing.T) {
 	}
 	defer s2.Shutdown()
 
-	// Create an artifical node name conflict!
+	// Create an artificial node name conflict!
 	s3Config.NodeName = s1Config.NodeName
 	s3, err := Create(s3Config)
 	if err != nil {
@@ -1558,5 +1853,367 @@ func TestSerf_WriteKeyringFile(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], newKey) {
 		t.Fatalf("expected key to be primary: %s", newKey)
+	}
+}
+
+func TestSerfStats(t *testing.T) {
+	config := testConfig()
+	s1, err := Create(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	stats := s1.Stats()
+
+	expected := map[string]string{
+		"event_queue":  "0",
+		"event_time":   "1",
+		"failed":       "0",
+		"intent_queue": "0",
+		"left":         "0",
+		"health_score": "0",
+		"member_time":  "1",
+		"members":      "1",
+		"query_queue":  "0",
+		"query_time":   "1",
+		"encrypted":    "false",
+	}
+
+	for key, val := range expected {
+		v, ok := stats[key]
+		if !ok {
+			t.Fatalf("key not found in stats: %s", key)
+		}
+		if v != val {
+			t.Fatalf("bad: %s = %s", key, val)
+		}
+	}
+}
+
+type CancelMergeDelegate struct {
+	invoked bool
+}
+
+func (c *CancelMergeDelegate) NotifyMerge(members []*Member) error {
+	c.invoked = true
+	return fmt.Errorf("Merge canceled")
+}
+
+func TestSerf_Join_Cancel(t *testing.T) {
+	s1Config := testConfig()
+	merge1 := &CancelMergeDelegate{}
+	s1Config.Merge = merge1
+
+	s2Config := testConfig()
+	merge2 := &CancelMergeDelegate{}
+	s2Config.Merge = merge2
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	defer s1.Shutdown()
+	defer s2.Shutdown()
+
+	testutil.Yield()
+
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if !strings.Contains(err.Error(), "Merge canceled") {
+		t.Fatalf("err: %s", err)
+	}
+
+	testutil.Yield()
+
+	if !merge1.invoked {
+		t.Fatalf("should invoke")
+	}
+	if !merge2.invoked {
+		t.Fatalf("should invoke")
+	}
+}
+
+func TestSerf_Coordinates(t *testing.T) {
+	s1Config := testConfig()
+	s1Config.DisableCoordinates = false
+	s1Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	s2Config := testConfig()
+	s2Config.DisableCoordinates = false
+	s2Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s2.Shutdown()
+
+	// Make sure both nodes start out the origin so we can prove they did
+	// an update later.
+	c1, err := s1.GetCoordinate()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	c2, err := s2.GetCoordinate()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	const zeroThreshold = 20.0e-6
+	if c1.DistanceTo(c2).Seconds() > zeroThreshold {
+		t.Fatalf("coordinates didn't start at the origin")
+	}
+
+	// Join the two nodes together and give them time to probe each other.
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("could not join s1 and s2: %s", err)
+	}
+	testutil.Yield()
+
+	// See if they know about each other.
+	if _, ok := s1.GetCachedCoordinate(s2.config.NodeName); !ok {
+		t.Fatalf("s1 didn't get a coordinate for s2: %s", err)
+	}
+	if _, ok := s2.GetCachedCoordinate(s1.config.NodeName); !ok {
+		t.Fatalf("s2 didn't get a coordinate for s1: %s", err)
+	}
+
+	// With only one ping they won't have a good estimate of the other node's
+	// coordinate, but they should both have updated their own coordinate.
+	c1, err = s1.GetCoordinate()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	c2, err = s2.GetCoordinate()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if c1.DistanceTo(c2).Seconds() < zeroThreshold {
+		t.Fatalf("coordinates didn't update after probes")
+	}
+
+	// Make sure they cached their own current coordinate after the update.
+	c1c, ok := s1.GetCachedCoordinate(s1.config.NodeName)
+	if !ok {
+		t.Fatalf("s1 didn't cache coordinate for s1")
+	}
+	if !reflect.DeepEqual(c1, c1c) {
+		t.Fatalf("coordinates are not equal: %v != %v", c1, c1c)
+	}
+
+	// Break up the cluster and make sure the coordinates get removed by
+	// the reaper.
+	if err = s2.Leave(); err != nil {
+		t.Fatalf("s2 could not leave: %s", err)
+	}
+	time.Sleep(s1Config.ReapInterval * 2)
+	if _, ok := s1.GetCachedCoordinate(s2.config.NodeName); ok {
+		t.Fatalf("s1 should have removed s2's cached coordinate")
+	}
+
+	// Try a setup with coordinates disabled.
+	s3Config := testConfig()
+	s3Config.DisableCoordinates = true
+	s3Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+	s3, err := Create(s3Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s3.Shutdown()
+
+	_, err = s3.Join([]string{s1Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("could not join s1 and s3: %s", err)
+	}
+	testutil.Yield()
+
+	_, err = s3.GetCoordinate()
+	if err == nil || !strings.Contains(err.Error(), "Coordinates are disabled") {
+		t.Fatalf("expected coordinate disabled error, got %s", err)
+	}
+	if _, ok := s3.GetCachedCoordinate(s1.config.NodeName); ok {
+		t.Fatalf("should not have been able to get cached coordinate")
+	}
+}
+
+// pingVersionMetaDelegate is used to monkey patch a ping delegate so that it
+// sends ping messages with an unknown version number.
+type pingVersionMetaDelegate struct {
+	pingDelegate
+}
+
+// AckPayload is called to produce a payload to send back in response to a ping
+// request. In this case we send back a bogus ping response with a bad version
+// and payload.
+func (p *pingVersionMetaDelegate) AckPayload() []byte {
+	var buf bytes.Buffer
+
+	// Send back the next ping version, which is bad by default.
+	version := []byte{PingVersion + 1}
+	buf.Write(version)
+
+	buf.Write([]byte("this is bad and not a real message"))
+	return buf.Bytes()
+}
+
+func TestSerf_PingDelegateVersioning(t *testing.T) {
+	s1Config := testConfig()
+	s1Config.DisableCoordinates = false
+	s1Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+	s2Config := testConfig()
+	s2Config.DisableCoordinates = false
+	s2Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s2.Shutdown()
+
+	// Monkey patch s1 to send weird versions of the ping messages.
+	s1.config.MemberlistConfig.Ping = &pingVersionMetaDelegate{pingDelegate{s1}}
+
+	// Join the two nodes together and give them time to probe each other.
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("could not join s1 and s2: %s", err)
+	}
+	testutil.Yield()
+
+	// They both should show 2 members, but only s1 should know about s2
+	// in the cache, since s1 spoke an alien ping protocol.
+	if s1.NumNodes() != 2 || s2.NumNodes() != 2 {
+		t.Fatalf("s1 and s2 didn't probe each other")
+	}
+	if _, ok := s1.GetCachedCoordinate(s2.config.NodeName); !ok {
+		t.Fatalf("s1 didn't get a coordinate for s2: %s", err)
+	}
+	if _, ok := s2.GetCachedCoordinate(s1.config.NodeName); ok {
+		t.Fatalf("s2 got an unexpected coordinate for s1")
+	}
+}
+
+// pingDimensionMetaDelegate is used to monkey patch a ping delegate so that it
+// sends coordinates with the wrong number of dimensions.
+type pingDimensionMetaDelegate struct {
+	t *testing.T
+	pingDelegate
+}
+
+// AckPayload is called to produce a payload to send back in response to a ping
+// request. In this case we send back a legit ping response with a bad coordinate.
+func (p *pingDimensionMetaDelegate) AckPayload() []byte {
+	var buf bytes.Buffer
+
+	// The first byte is the version number, forming a simple header.
+	version := []byte{PingVersion}
+	buf.Write(version)
+
+	// Make a bad coordinate with the wrong number of dimensions.
+	coord := coordinate.NewCoordinate(coordinate.DefaultConfig())
+	coord.Vec = make([]float64, 2*len(coord.Vec))
+
+	// The rest of the message is the serialized coordinate.
+	enc := codec.NewEncoder(&buf, &codec.MsgpackHandle{})
+	if err := enc.Encode(coord); err != nil {
+		p.t.Fatalf("err: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestSerf_PingDelegateRogueCoordinate(t *testing.T) {
+	s1Config := testConfig()
+	s1Config.DisableCoordinates = false
+	s1Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+	s2Config := testConfig()
+	s2Config.DisableCoordinates = false
+	s2Config.MemberlistConfig.ProbeInterval = time.Duration(2) * time.Millisecond
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s2.Shutdown()
+
+	// Monkey patch s1 to send ping messages with bad coordinates.
+	s1.config.MemberlistConfig.Ping = &pingDimensionMetaDelegate{t, pingDelegate{s1}}
+
+	// Join the two nodes together and give them time to probe each other.
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("could not join s1 and s2: %s", err)
+	}
+	testutil.Yield()
+
+	// They both should show 2 members, but only s1 should know about s2
+	// in the cache, since s1 sent a bad coordinate.
+	if s1.NumNodes() != 2 || s2.NumNodes() != 2 {
+		t.Fatalf("s1 and s2 didn't probe each other")
+	}
+	if _, ok := s1.GetCachedCoordinate(s2.config.NodeName); !ok {
+		t.Fatalf("s1 didn't get a coordinate for s2: %s", err)
+	}
+	if _, ok := s2.GetCachedCoordinate(s1.config.NodeName); ok {
+		t.Fatalf("s2 got an unexpected coordinate for s1")
+	}
+}
+
+func TestSerf_NumNodes(t *testing.T) {
+	s1Config := testConfig()
+	s2Config := testConfig()
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s1.Shutdown()
+
+	if s1.NumNodes() != 1 {
+		t.Fatalf("Expected 1 members")
+	}
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer s2.Shutdown()
+
+	if s2.NumNodes() != 1 {
+		t.Fatalf("Expected 1 members")
+	}
+
+	testutil.Yield()
+
+	_, err = s1.Join([]string{s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	testutil.Yield()
+
+	if s1.NumNodes() != 2 {
+		t.Fatalf("Expected 2 members")
 	}
 }

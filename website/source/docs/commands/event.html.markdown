@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "Commands: Event"
 sidebar_current: "docs-commands-event"
+description: |-
+  The `serf event` command dispatches a custom user event into a Serf cluster, leveraging Serf's gossip layer for scalable broadcasting of the event to clusters of any size.
 ---
 
 # Serf Event
@@ -29,7 +31,7 @@ and cannot reply or acknowledge receipt. Serf also tries harder to deliver
 events, by performing anti-entropy over TCP as well as message replay.
 
 Queries are intended to be a real-time request and response mechanism.
-Since they are indended to be time sensitive, Serf will not do message
+Since they are intended to be time sensitive, Serf will not do message
 replay or anti-entropy, as a response to a very old query is not useful.
 Queries have more advanced filtering mechanisms and can be used to build
 more complex control flow. For example, a code deploy could check that at
@@ -53,7 +55,8 @@ Every option is optional:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.
 
 ## Sending an Event
 
@@ -79,7 +82,7 @@ period. This means that if many events of the same name are received within
 a short amount of time, the event handler is only invoked once, with the
 last event of that name received during that time period.
 
-Event coalescense works great for idempotent events such as "restart" or
+Event coalescence works great for idempotent events such as "restart" or
 events where only the last value in the payload really matters, like the
 commit in a "deploy" event. In these cases, things just work.
 

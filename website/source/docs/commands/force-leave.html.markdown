@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "Commands: Force Leave"
 sidebar_current: "docs-commands-forceleave"
+description: |-
+  The `force-leave` command forces a member of a Serf cluster to enter the left state. Note that if the member is still actually alive, it will eventually rejoin the cluster. The true purpose of this method is to force remove "failed" nodes.
 ---
 
 # Serf Force Leave
@@ -33,6 +35,7 @@ Every option is optional:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.
 
 

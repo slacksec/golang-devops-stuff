@@ -2,13 +2,15 @@
 layout: "docs"
 page_title: "Commands: Members"
 sidebar_current: "docs-commands-members"
+description: |-
+  The `serf members` command outputs the current list of members that a Serf agent knows about, along with their state. The state of a node can only be alive, left or failed.
 ---
 
 # Serf Members
 
 Command: `serf members`
 
-The members command outputs the current list of members that a Serf
+The `serf members` command outputs the current list of members that a Serf
 agent knows about, along with their state. The state of a node can only
 be "alive", "left" or "failed".
 
@@ -52,5 +54,5 @@ The command-line flags are all optional. The list of available flags are:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
-
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.

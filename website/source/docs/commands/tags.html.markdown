@@ -2,13 +2,15 @@
 layout: "docs"
 page_title: "Commands: Tags"
 sidebar_current: "docs-commands-tags"
+description: |-
+  The `serf tags` command modifies a member's tags while the Serf agent is running. The changed tags will be immediately propagated to other members in the cluster.
 ---
 
 # Serf Tags
 
 Command: `serf tags`
 
-The tags command modifies a member's tags while the Serf agent is running.
+The `serf tags` command modifies a member's tags while the Serf agent is running.
 The changed tags will be immediately propagated to other members in the
 cluster.
 
@@ -42,4 +44,5 @@ flags are:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.

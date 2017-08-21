@@ -2,6 +2,8 @@
 layout: "intro"
 page_title: "Event Handlers"
 sidebar_current: "gettingstarted-eventhandlers"
+description: |-
+  We've now seen how to start Serf agents and join them into a cluster. While this is cool to see on its own, the true power and utility of Serf is being able to react to membership changes and other events that Serf invokes. By specifying event handlers, Serf will invoke custom scripts whenever an event is received.
 ---
 
 # Event Handlers
@@ -74,7 +76,7 @@ server to a load balancer, monitoring that node with Nagios, etc.
 
 ## Types of Events
 
-There are currently four types of events that Serf invokes:
+There are currently seven types of events that Serf invokes:
 
 * `member-join` - One or more members have joined the cluster.
 * `member-leave` - One or more members have gracefully left the cluster.
