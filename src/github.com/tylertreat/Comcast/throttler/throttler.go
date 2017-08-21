@@ -1,107 +1,195 @@
 package throttler
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
-	"strings"
 )
 
 const (
-	// Start is the mode to setup packet filter rules.
-	Start           = "start"
-	stop            = "stop"
-	any             = "any"
 	linux           = "linux"
 	darwin          = "darwin"
 	freebsd         = "freebsd"
+	windows         = "windows"
 	checkOSXVersion = "sw_vers -productVersion"
+	ipfw            = "ipfw"
+	pfctl           = "pfctl"
 )
 
 // Config specifies options for configuring packet filter rules.
 type Config struct {
-	Mode       string
-	Latency    int
-	Bandwidth  int
-	PacketLoss float64
+	Device           string
+	Stop             bool
+	Latency          int
+	TargetBandwidth  int
+	DefaultBandwidth int
+	PacketLoss       float64
+	TargetIps        []string
+	TargetIps6       []string
+	TargetPorts      []string
+	TargetProtos     []string
+	DryRun           bool
 }
 
 type throttler interface {
 	setup(*Config) error
-	teardown() error
+	teardown(*Config) error
 	exists() bool
 	check() string
 }
 
-func setup(t throttler, c *Config) {
+type commander interface {
+	execute(string) error
+	executeGetLines(string) ([]string, error)
+	commandExists(string) bool
+}
+
+type dryRunCommander struct{}
+
+type shellCommander struct{}
+
+var dry bool
+
+func setup(t throttler, cfg *Config) {
 	if t.exists() {
 		fmt.Println("It looks like the packet rules are already setup")
 		os.Exit(1)
 	}
 
-	if err := t.setup(c); err != nil {
-		fmt.Println("I couldn't setup the packet rules")
+	if err := t.setup(cfg); err != nil {
+		fmt.Println("I couldn't setup the packet rules:", err.Error())
 		os.Exit(1)
 	}
 
 	fmt.Println("Packet rules setup...")
 	fmt.Printf("Run `%s` to double check\n", t.check())
-	fmt.Printf("Run `%s --mode %s` to reset\n", os.Args[0], stop)
+	fmt.Printf("Run `%s --device %s --stop` to reset\n", os.Args[0], cfg.Device)
 }
 
-func teardown(t throttler) {
+func teardown(t throttler, cfg *Config) {
 	if !t.exists() {
 		fmt.Println("It looks like the packet rules aren't setup")
 		os.Exit(1)
 	}
 
-	if err := t.teardown(); err != nil {
+	if err := t.teardown(cfg); err != nil {
 		fmt.Println("Failed to stop packet controls")
 		os.Exit(1)
 	}
 
 	fmt.Println("Packet rules stopped...")
 	fmt.Printf("Run `%s` to double check\n", t.check())
-	fmt.Printf("Run `%s --mode %s` to start\n", os.Args[0], Start)
+	fmt.Printf("Run `%s` to start\n", os.Args[0])
 }
 
 // Run executes the packet filter operation, either setting it up or tearing
 // it down.
-func Run(c *Config) {
+func Run(cfg *Config) {
+	dry = cfg.DryRun
 	var t throttler
+	var c commander
+
+	if cfg.DryRun {
+		c = &dryRunCommander{}
+	} else {
+		c = &shellCommander{}
+	}
+
 	switch runtime.GOOS {
-	case darwin, freebsd:
-		if runtime.GOOS == darwin && !osxVersionSupported() {
-			// ipfw was removed in OSX 10.10 in favor of pfctl.
-			// TODO: add support for pfctl.
-			fmt.Println("I don't support your version of OSX")
+	case freebsd:
+		if cfg.Device == "" {
+			fmt.Println("Device not specified, unable to default to eth0 on FreeBSD.")
 			os.Exit(1)
 		}
-		t = &ipfwThrottler{}
+
+		t = &ipfwThrottler{c}
+	case darwin:
+		// Avoid OS version pinning and choose based on what's available
+		if c.commandExists(pfctl) {
+			t = &pfctlThrottler{c}
+		} else if c.commandExists(ipfw) {
+			t = &ipfwThrottler{c}
+		} else {
+			fmt.Println("Could not determine an appropriate firewall tool for OSX (tried pfctl, ipfw), exiting")
+			os.Exit(1)
+		}
+
+		if cfg.Device == "" {
+			cfg.Device = "eth0"
+		}
+
 	case linux:
-		t = &tcThrottler{}
+		if cfg.Device == "" {
+			cfg.Device = "eth0"
+		}
+
+		t = &tcThrottler{c}
 	default:
 		fmt.Printf("I don't support your OS: %s\n", runtime.GOOS)
 		os.Exit(1)
 	}
 
-	switch c.Mode {
-	case Start:
-		setup(t, c)
-	case stop:
-		teardown(t)
-	default:
-		fmt.Printf("I don't know what this mode is: %s\n", c.Mode)
-		fmt.Printf("Try %q or %q\n", Start, stop)
-		os.Exit(1)
+	if !cfg.Stop {
+		setup(t, cfg)
+	} else {
+		teardown(t, cfg)
 	}
 }
 
-func osxVersionSupported() bool {
-	v, err := exec.Command("/bin/sh", "-c", checkOSXVersion).Output()
+func (c *dryRunCommander) execute(cmd string) error {
+	fmt.Println(cmd)
+	return nil
+}
+
+func (c *dryRunCommander) executeGetLines(cmd string) ([]string, error) {
+	fmt.Println(cmd)
+	return []string{}, nil
+}
+
+func (c *dryRunCommander) commandExists(cmd string) bool {
+	return true
+}
+
+func (c *shellCommander) execute(cmd string) error {
+	fmt.Println(cmd)
+	return exec.Command("/bin/sh", "-c", cmd).Run()
+}
+
+func (c *shellCommander) executeGetLines(cmd string) ([]string, error) {
+	lines := []string{}
+	child := exec.Command("/bin/sh", "-c", cmd)
+
+	out, err := child.StdoutPipe()
 	if err != nil {
-		return false
+		return []string{}, err
 	}
-	return !strings.HasPrefix(string(v), "10.10")
+
+	err = child.Start()
+	if err != nil {
+		return []string{}, err
+	}
+
+	scanner := bufio.NewScanner(out)
+
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return []string{}, errors.New(fmt.Sprint("Error reading standard input:", err))
+	}
+
+	err = child.Wait()
+	if err != nil {
+		return []string{}, err
+	}
+
+	return lines, nil
+}
+
+func (c *shellCommander) commandExists(cmd string) bool {
+	_, err := exec.LookPath(cmd)
+	return err == nil
 }
