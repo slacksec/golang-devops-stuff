@@ -2,11 +2,13 @@
 layout: "intro"
 page_title: "Custom Queries"
 sidebar_current: "gettingstarted-queries"
+description: |-
+  While custom events provide an efficient "fire-and-forget" mechanism, queries send a request and nodes can provide responds. Custom queries provide even more flexibility than events, since the target nodes can be filtered, delivery can be acknowledged and custom responses can be sent back. This makes queries useful for gathering information about a running cluster in real-time.
 ---
 
 # Custom Queries
 
-While custom events provide an efficient "fire-and-forget" mechansim, queries
+While custom events provide an efficient "fire-and-forget" mechanism, queries
 send a request and nodes can provide responds. Custom queries provide even more
 flexibility than events, since the target nodes can be filtered, delivery
 can be acknowledged and custom responses can be sent back. This makes queries
@@ -40,6 +42,11 @@ a "request", while the event handler can generate the response.
 For example, if we had a "load" custom event, we might create return
 the current load average of the machine.
 
+Serf agents must be configured to handle queries before they will
+respond to them. See the "Specifying Event Handlers" section in the
+[Event Handlers documentation](/docs/agent/event-handlers.html) for
+examples of the configuration format.
+
 ## Query Payloads
 
 Queries are not limited to just a query name. The query can also contain
@@ -62,7 +69,7 @@ need to connect to each and every node to send the message, it only needs to con
 to a handful, regardless of cluster size. It does require that all responses are
 sent directly to the originator, which can be an issue if many nodes are responding.
 
-Custom events come with some trade-offs, however:
+Custom queries come with some trade-offs, however:
 
 * Queries may not be delivered to all nodes: Because events are delivered over
   gossip, the message arrives at every node unless there is a network partition.

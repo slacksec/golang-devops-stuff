@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "RPC"
 sidebar_current: "docs-agent-rpc"
+description: |-
+  The Serf agent provides a complete RPC mechanism that can be used to control the agent programmatically. This RPC mechanism is the same one used by the CLI, but can be used by other applications to easily leverage the power of Serf without directly embedding. Additionally, it can be used as a fast IPC mechanism to allow applications to receive events immediately instead of using the fork/exec model of event handlers.
 ---
 
 # RPC Protocol
@@ -28,7 +30,7 @@ All RPC requests have a request header, and some requests have
 a request body. The request header looks like:
 
 ```
-    {"Command": "Handshake", "Seq": 0}
+    {"Command": "handshake", "Seq": 0}
 ```
 
 All responses have a response header, and some may contain
@@ -66,6 +68,7 @@ Possible commands include:
 * remove-key - Removes an existing encryption key
 * list-keys - Provides a list of encryption keys in use in the cluster
 * stats - Provides a debugging information about the running serf agent
+* get-coordinate - Returns the network coordinate for a node
 
 Below each command is documented along with any request or
 response body that is applicable.
@@ -266,7 +269,7 @@ we may start getting messages like:
     }
 ```
 
-It is important to realize that these messages are sent asyncronously,
+It is important to realize that these messages are sent asynchronously,
 and not in response to any command. That means if a client is streaming
 commands, there may be events streamed while a client is waiting for a
 response to a command. This is why the `Seq` must be used to pair requests
@@ -303,7 +306,7 @@ we may start getting messages like:
     {"Log": "2013/12/03 13:06:53 [INFO] agent: Received event: member-join"}
 ```
 
-It is important to realize that these messages are sent asyncronously,
+It is important to realize that these messages are sent asynchronously,
 and not in response to any command. That means if a client is streaming
 commands, there may be logs streamed while a client is waiting for a
 response to a command. This is why the `Seq` must be used to pair requests
@@ -353,7 +356,7 @@ tag. `RequestAck` is used to ask that nodes send an "ack" once the message is re
 otherwise only responses are delivered. `Timeout` can be provided (in nanoseconds) to
 optionally override the default.
 
-The server will respond with a standard response hedaer indicating if the query
+The server will respond with a standard response header indicating if the query
 was successful. However, the channel is now subscribed to receive any acks or
 responses. This is similar to `stream`, except scoped only to this query. The same
 `Seq` is used as the query command that matches.
@@ -382,7 +385,7 @@ We will start to get the following:
 
 Each query record has a `Type` to indicate what is being represented. This is
 one of `ack`, `response` or `done`. Once `done` is received the client should
-not expect any futher messages corresponding to that query.
+not expect any further messages corresponding to that query.
 
 ### respond
 
@@ -536,3 +539,42 @@ running serf agent. There is no request body, but the response looks like:
         "tags": {}
     }
 ```
+
+### get-coordinate
+
+The get-coordinate command is used to obtain the network coordinate of a given
+node.
+
+Serf builds up a set of network coordinates for all the nodes in the cluster.
+Agents cache these, and once the coordinates for two nodes are known, it's
+possible to estimate the network round trip time between them using a simple
+calculation.
+
+The request looks like:
+
+```
+    {"Node": "n1"}
+```
+
+Once invoked, this method will look up the coordinate in the agent's cache and
+return it, yielding a response like this:
+
+```
+    {
+        "Coord": {
+            "Adjustment": 0,
+            "Error": 1.5,
+            "Height": 0,
+            "Vec": [0,0,0,0,0,0,0,0]
+        },
+        "Ok": true
+}
+```
+
+The returned coordinate is valid only if `Ok` is true. Otherwise, there wasn't
+a coordinate available for the given node. This might mean that coordinates
+are not enabled, or that the node has not yet contacted the agent.
+
+See the [Network Coordinates](/docs/internals/coordinates.html)
+internals guide for more information on how these coordinates are computed, and
+for details on how to perform calculations with them.

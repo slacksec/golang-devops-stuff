@@ -2,13 +2,15 @@
 layout: "docs"
 page_title: "Commands: Key"
 sidebar_current: "docs-commands-key"
+description: |-
+  The `serf keys` command performs cluster-wide encryption key operations, such as installing new keys and removing old keys. When used properly, the `keys` command allows you to achieve non-disruptive encryption key rotation across a Serf cluster.
 ---
 
 # Serf Keys
 
 Command: `serf keys`
 
-The keys command performs cluster-wide encryption key operations, such as
+The `serf keys` command performs cluster-wide encryption key operations, such as
 installing new keys and removing old keys. When used properly, the `keys`
 command allows you to achieve non-disruptive encryption key rotation across a
 Serf cluster.
@@ -57,4 +59,5 @@ All operations are idempotent. The list of available flags are:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.

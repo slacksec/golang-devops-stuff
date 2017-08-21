@@ -4,9 +4,11 @@
 # is a bug that it isn't routable and this causes errors.
 #
 
+# Fail if any commands fail (unchecked), namely sudo and ifconfig.
+set -e
+
 # Check if loopback is setup
-ping -c 1 -W 10 127.0.0.2 > /dev/null 2>&1
-if [ $? -eq 0 ]
+if ping -c 1 -W 10 127.0.0.2 > /dev/null 2>&1
 then
     exit
 fi
@@ -22,7 +24,9 @@ case $OSTYPE in
 esac
 
 # Setup loopback
+echo "Using sudo to setup lo0 interface aliases for testing."
+sudo -v
 for ((i=2;i<256;i++))
 do
-    sudo ifconfig lo0 alias 127.0.0.$i up
+    sudo -n ifconfig lo0 alias 127.0.0.$i up
 done

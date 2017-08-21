@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "Commands: Reachability"
 sidebar_current: "docs-commands-reachability"
+description: |-
+  The `reachability` command performs a basic network reachability test. The local node will gossip out a ping message and request that all other nodes acknowledge delivery of the message.
 ---
 
 # Serf Reachability
@@ -38,7 +40,8 @@ Every option is optional:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.
 
 * `-verbose` - Enables verbose output
 

@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "Configuration"
 sidebar_current: "docs-agent-config"
+description: |-
+  The agent has various configuration options that can be specified via the command-line or via configuration files. All of the configuration options are completely optional and their defaults will be specified with their descriptions.
 ---
 
 # Configuration
@@ -35,6 +37,7 @@ The options below are all specified on the command-line.
   "7946" will be used. An important compatibility note, protocol version 2
   introduces support for non-consistent ports across the cluster. For more information,
   see the [compatibility page](/docs/compatibility.html).
+  Note: To use an IPv6 address, specify "[::1]" or "[::1]:7946".
 
 * `-iface` - This flag can be used to provide a binding interface. It can be
   used instead of `-bind` if the interface is known but not the address. If both
@@ -61,8 +64,8 @@ The options below are all specified on the command-line.
   in alphabetical order. For more information on the format of the configuration
   files, see the "Configuration Files" section below.
 
-* `-discover` - Discover provides a cluster name, which is used with mDNS to
-  automatically discover Serf peers. When provided, Serf will respond to mDNS
+* `-discover` - A cluster name, which is used with mDNS to
+  automatically discover peers. When provided, Serf will respond to mDNS
   queries and periodically poll for new peers. This feature requires a network
   environment that supports multicasting.
 
@@ -77,8 +80,9 @@ The options below are all specified on the command-line.
   than one encryption key until all members have received the new key. The
   keyring file helps persist changes to the encryption keyring, allowing the
   agent to start and rejoin the cluster successfully later on, even if key
-  rotations had been initiated by other members in the cluster. More information
-  on the format of the keyring file can be found below in the examples section.
+  rotations had been initiated by other members in the cluster. If left blank, the
+  keyring will not be persisted to a file. More information on the format of the
+  keyring file can be found below in the examples section.
 
   NOTE: this option is not compatible with the `-encrypt` option.
 
@@ -128,8 +132,8 @@ The options below are all specified on the command-line.
   the join every `-retry-interval` up to `-retry-max` attempts. This can be used
   instead of `-join` to continue attempting to join the cluster.
 
-* `-retry-interval` - Provides a duration string to control how after the
-  retry join is perfomed. By default, the join is attempted every 30 seconds
+* `-retry-interval` - Provides a duration string to control how often the
+  retry join is performed. By default, the join is attempted every 30 seconds
   until success. This should use the "s" suffix for second, "m" for minute,
   or "h" for hour.
 
@@ -181,6 +185,10 @@ The options below are all specified on the command-line.
   This flag can only be enabled on Linux or OSX systems, as Windows and Plan 9 do
   not provide the syslog facility.
 
+* `-broadcast-timeout` - Sets the broadcast timeout, which is the max time allowed for
+  responses to events including leave and force remove messages. Defaults to 5s. This
+  should use the "s" suffix for second, "m" for minute, or "h" for hour.
+
 ## Configuration Files
 
 In addition to the command-line options, configuration can be put into
@@ -193,25 +201,26 @@ at a single JSON object with configuration within it.
 
 #### Example Configuration File
 
-<pre class="prettyprint lang-json">
+```javascript
 {
   "tags": {
-        "role": "load-balancer",
-        "datacenter": "east"
+    "role": "load-balancer",
+    "datacenter": "east"
   },
-
   "event_handlers": [
     "handle.sh",
     "user:deploy=deploy.sh"
   ]
 }
-</pre>
+```
 
 #### Configuration Key Reference
 
 * `node_name` - Equivalent to the `-node` command-line flag.
 
 * `role` - **Deprecated**. Equivalent to the `-role` command-line flag.
+
+* `disable_coordinates` - Disables features related to [network coordinates](/docs/internals/coordinates.html).
 
 * `tags` - This is a dictionary of tag values. It is the same as specifying
   the `tag` command-line flag once per tag.
@@ -277,7 +286,7 @@ at a single JSON object with configuration within it.
   the agents that are conflicting will query the cluster to determine which node is
   believed to be "correct" by the majority of other nodes. The node(s) that are in the
   minority will shutdown at the end of the conflict resolution. Setting this flag prevents
-  this behavior, and instead Serf will merely log a warning. This is not recommanded since
+  this behavior, and instead Serf will merely log a warning. This is not recommended since
   the cluster will disagree about the mapping of NodeName -> IP:Port and cannot reconcile
   this.
 
@@ -299,22 +308,44 @@ at a single JSON object with configuration within it.
   Serf will stream various telemetry information to that instance for aggregation.
   This can be used to capture various runtime information.
 
+* `statsd_addr` - This provides the address of a statsd instance. If provided
+  Serf will stream various telemetry information to that instance for aggregation.
+  This can be used to capture various runtime information.
+
+* `query_response_size_limit` and `query_size_limit` limit the inbound and outbound
+  payload sizes for queries, respectively. These must fit in a UDP packet with some
+  additional overhead, so tuning these past the default values of 1024 will depend
+  on your network configuration.
+
+* `broadcast_timeout` - Equivalent to the `-broadcast-timeout` command-line flag.
+
 #### Example Keyring File
 
 The keyring file is a simple JSON-formatted text file. It is important to
 understand how Serf will use its contents. Following is an example of a keyring
 file:
 
-<pre class="prettyprint lang-json">
+```javascript
 [
   "QHOYjmYlxSCBhdfiolhtDQ==",
   "daZ2wnuw+Ql+2hCm7vQB6A==",
   "keTZydopxtiTY7HVoqeWGw=="
 ]
-</pre>
+```
 
 The order in which the keys appear is important. The key appearing first in the
 list is the primary key, which is the key used to encrypt all outgoing messages.
 The remaining keys in the list are considered secondary and are used for
 decryption only. During message decryption, Serf uses the configured encryption
 keys in the order they appear in the keyring file until all keys are exhausted.
+
+## Ports Used
+
+Serf requires 2 ports to work properly. Below we document the requirements for each
+port.
+
+* Gossip (Default 7946) This is used for communication between the Serf nodes. TCP
+and UDP.
+
+* RPC (Default 7373) This is used by agents to handle RPC from the CLI, as well as
+by custom RPC clients written by users. TCP only.

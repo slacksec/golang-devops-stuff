@@ -2,13 +2,15 @@
 layout: "docs"
 page_title: "Commands: Monitor"
 sidebar_current: "docs-commands-monitor"
+description: |-
+  The `serf monitor` command is used to connect and follow the logs of a running Serf agent. Monitor will show the recent logs and then continue to follow the logs, not exiting until interrupted or until the remote agent quits.
 ---
 
 # Serf Monitor
 
 Command: `serf monitor`
 
-The monitor command is used to connect and follow the logs of a running
+The `serf monitor` command is used to connect and follow the logs of a running
 Serf agent. Monitor will show the recent logs and then continue to follow
 the logs, not exiting until interrupted or until the remote agent quits.
 
@@ -34,5 +36,5 @@ The command-line flags are all optional. The list of available flags are:
 
 * `-rpc-auth` - Optional RPC auth token. If the agent is configured to use
   an auth token, then this must be provided or the agent will refuse the
-  command.
-
+  command. This option can also be controlled using the `SERF_RPC_AUTH`
+  environment variable.
