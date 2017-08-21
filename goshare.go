@@ -9,18 +9,17 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jmhodges/levigo"
-
+	golconfig "github.com/abhishekkr/gol/golconfig"
 	golerror "github.com/abhishekkr/gol/golerror"
+	golkeyvalTSDS "github.com/abhishekkr/gol/golkeyvalTSDS"
 	gollist "github.com/abhishekkr/gol/gollist"
-	abkleveldb "github.com/abhishekkr/levigoNS/leveldb"
 )
 
 var (
-	db *levigo.DB
+	tsds golkeyvalTSDS.TSDSDBEngine
 )
 
-/* just a banner print */
+/* banner just brand print */
 func banner() {
 	fmt.Println("**************************************************")
 	fmt.Println("  ___  ____      ___        __   _   __")
@@ -31,7 +30,9 @@ func banner() {
 	fmt.Println("**************************************************")
 }
 
-/* checking if you still wanna keep the goshare up */
+/*
+DoYouWannaContinue checking if you still wanna keep the goshare up.
+*/
 func DoYouWannaContinue() {
 	var input string
 	for {
@@ -46,14 +47,26 @@ func DoYouWannaContinue() {
 }
 
 /*
-putting together base engine for GoShare
+goshareDB returns golkeyval DBEngine for it.
+*/
+func goshareDB(config golconfig.FlatConfig) {
+	if config["TSEngine"] == "namespace" {
+		tsds = golkeyvalTSDS.GetNamespaceEngine(config)
+	} else {
+		panic("Unhandled TimeSeries Engine required.")
+	}
+}
+
+/*
+GoShareEngine putting together base engine for GoShare as per config.
 dbpath, server_uri, httpport, rep_port, *string
 */
-func GoShareEngine(config Config) {
+func GoShareEngine(config golconfig.FlatConfig) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// remember it will be same DB instance shared across goshare package
-	db = abkleveldb.CreateDB(config["dbpath"])
+	goshareDB(config)
+
 	if config["cpuprofile"] != "" {
 		f, err := os.Create(config["cpuprofile"])
 		if err != nil {
@@ -66,19 +79,22 @@ func GoShareEngine(config Config) {
 		}()
 	}
 
-	_http_port, err_http_port := strconv.Atoi(config["http-port"])
-	_reply_ports, err_reply_ports := gollist.CSVToNumbers(config["rep-ports"])
-	if err_http_port == nil && err_reply_ports == nil {
-		go GoShareHTTP(config["server-uri"], _http_port)
-		go GoShareZMQ(config["server-uri"], _reply_ports)
+	_httpPort, errHTTPPort := strconv.Atoi(config["http-port"])
+	_replyPorts, errReplyPorts := gollist.CSVToNumbers(config["rep-ports"])
+	if errHTTPPort == nil && errReplyPorts == nil {
+		go GoShareHTTP(config["server-uri"], _httpPort)
+		go GoShareZMQ(config["server-uri"], _replyPorts)
 	} else {
 		golerror.Boohoo("Port parameters to bind, error-ed while conversion to number.", true)
 	}
 }
 
-/* GoShare DB */
+/*
+GoShare is daddy-o of goshare instance.
+*/
 func GoShare() {
 	banner()
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	GoShareEngine(ConfigFromFlags())
 	DoYouWannaContinue()
 }

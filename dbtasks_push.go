@@ -1,42 +1,45 @@
 package goshare
 
-import (
-	"strings"
+import "strings"
 
-	levigoNS "github.com/abhishekkr/levigoNS"
-	abkleveldb "github.com/abhishekkr/levigoNS/leveldb"
-	levigoTSDS "github.com/abhishekkr/levigoTSDS"
-)
-
-/* Push a given set of Key-Val */
+/*
+PushKeyVal pushes a given set of Key-Val.
+*/
 func PushKeyVal(key string, val string) bool {
-	return abkleveldb.PushKeyVal(key, val, db)
+	return tsds.PushKeyVal(key, val)
 }
 
-/* Push a given Namespace-Key and its value */
+/*
+PushKeyValNS pushes a given Namespace-Key and its value.
+*/
 func PushKeyValNS(key string, val string) bool {
-	return levigoNS.PushNS(key, val, db)
+	return tsds.PushNS(key, val)
 }
 
-/* Push a key namespace-d with current time */
+/*
+PushKeyValNowTSDS pushes a key namespace-d with current time.
+*/
 func PushKeyValNowTSDS(key string, val string) bool {
-	return levigoTSDS.PushNowTSDS(key, val, db)
+	return tsds.PushNowTSDS(key, val)
 }
 
-/* Push a key namespace-d with goltime.Timestamp  */
+/*
+PushKeyValTSDS pushes a key namespace-d with goltime.Timestamp.
+*/
 func PushKeyValTSDS(packet Packet) bool {
 	status := true
-	_time := packet.TimeDot.Time()
 	for _key, _val := range packet.HashMap {
 		_val = strings.Replace(_val, "\n", " ", -1)
-		status = status && levigoTSDS.PushTSDS(_key, _val, _time, db)
+		status = status && tsds.PushTSDS(_key, _val, packet.TimeDot)
 	}
 	return status
 }
 
-/* return func handle according to KeyType */
-func PushFuncByKeyType(key_type string) FunkAxnParamKeyVal {
-	switch key_type {
+/*
+PushFuncByKeyType returns func handle according to KeyType.
+*/
+func PushFuncByKeyType(keyType string) FunkAxnParamKeyVal {
+	switch keyType {
 	case "now":
 		return PushKeyValNowTSDS
 
@@ -49,7 +52,9 @@ func PushFuncByKeyType(key_type string) FunkAxnParamKeyVal {
 	}
 }
 
-/* handles multi-item */
+/*
+PushFromPacket handles push task based on provided Packet.
+*/
 func PushFromPacket(packet Packet) bool {
 	status := true
 	switch packet.KeyType {
