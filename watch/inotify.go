@@ -1,17 +1,18 @@
+// Copyright (c) 2015 HPE Software Inc. All rights reserved.
 // Copyright (c) 2013 ActiveState Software Inc. All rights reserved.
 
 package watch
 
 import (
 	"fmt"
-	"github.com/ActiveState/tail/util"
-	"github.com/howeyc/fsnotify"
-	"gopkg.in/tomb.v1"
 	"os"
 	"path/filepath"
-)
 
-var inotifyTracker *InotifyTracker
+	"github.com/hpcloud/tail/util"
+
+	"gopkg.in/fsnotify.v1"
+	"gopkg.in/tomb.v1"
+)
 
 // InotifyFileWatcher uses inotify to monitor file changes.
 type InotifyFileWatcher struct {
@@ -20,24 +21,16 @@ type InotifyFileWatcher struct {
 }
 
 func NewInotifyFileWatcher(filename string) *InotifyFileWatcher {
-	fw := &InotifyFileWatcher{filename, 0}
+	fw := &InotifyFileWatcher{filepath.Clean(filename), 0}
 	return fw
 }
 
 func (fw *InotifyFileWatcher) BlockUntilExists(t *tomb.Tomb) error {
-	w, err := inotifyTracker.NewWatcher()
+	err := WatchCreate(fw.Filename)
 	if err != nil {
 		return err
 	}
-	defer inotifyTracker.CloseWatcher(w)
-
-	dirname := filepath.Dir(fw.Filename)
-
-	// Watch for new files to be created in the parent directory.
-	err = w.WatchFlags(dirname, fsnotify.FSN_CREATE)
-	if err != nil {
-		return err
-	}
+	defer RemoveWatchCreate(fw.Filename)
 
 	// Do a real check now as the file might have been created before
 	// calling `WatchFlags` above.
@@ -46,12 +39,23 @@ func (fw *InotifyFileWatcher) BlockUntilExists(t *tomb.Tomb) error {
 		return err
 	}
 
+	events := Events(fw.Filename)
+
 	for {
 		select {
-		case evt, ok := <-w.Event:
+		case evt, ok := <-events:
 			if !ok {
 				return fmt.Errorf("inotify watcher has been closed")
-			} else if evt.Name == fw.Filename {
+			}
+			evtName, err := filepath.Abs(evt.Name)
+			if err != nil {
+				return err
+			}
+			fwFilename, err := filepath.Abs(fw.Filename)
+			if err != nil {
+				return err
+			}
+			if evtName == fwFilename {
 				return nil
 			}
 		case <-t.Dying():
@@ -61,51 +65,54 @@ func (fw *InotifyFileWatcher) BlockUntilExists(t *tomb.Tomb) error {
 	panic("unreachable")
 }
 
-func (fw *InotifyFileWatcher) ChangeEvents(t *tomb.Tomb, fi os.FileInfo) *FileChanges {
+func (fw *InotifyFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChanges, error) {
+	err := Watch(fw.Filename)
+	if err != nil {
+		return nil, err
+	}
+
 	changes := NewFileChanges()
-
-	w, err := inotifyTracker.NewWatcher()
-	if err != nil {
-		util.Fatal("Error creating fsnotify watcher: %v", err)
-	}
-	err = w.Watch(fw.Filename)
-	if err != nil {
-		util.Fatal("Error watching %v: %v", fw.Filename, err)
-	}
-
-	fw.Size = fi.Size()
+	fw.Size = pos
 
 	go func() {
-		defer inotifyTracker.CloseWatcher(w)
-		defer changes.Close()
+
+		events := Events(fw.Filename)
 
 		for {
 			prevSize := fw.Size
 
-			var evt *fsnotify.FileEvent
+			var evt fsnotify.Event
 			var ok bool
 
 			select {
-			case evt, ok = <-w.Event:
+			case evt, ok = <-events:
 				if !ok {
+					RemoveWatch(fw.Filename)
 					return
 				}
 			case <-t.Dying():
+				RemoveWatch(fw.Filename)
 				return
 			}
 
 			switch {
-			case evt.IsDelete():
+			case evt.Op&fsnotify.Remove == fsnotify.Remove:
 				fallthrough
 
-			case evt.IsRename():
+			case evt.Op&fsnotify.Rename == fsnotify.Rename:
+				RemoveWatch(fw.Filename)
 				changes.NotifyDeleted()
 				return
 
-			case evt.IsModify():
+			//With an open fd, unlink(fd) - inotify returns IN_ATTRIB (==fsnotify.Chmod)
+			case evt.Op&fsnotify.Chmod == fsnotify.Chmod:
+				fallthrough
+
+			case evt.Op&fsnotify.Write == fsnotify.Write:
 				fi, err := os.Stat(fw.Filename)
 				if err != nil {
 					if os.IsNotExist(err) {
+						RemoveWatch(fw.Filename)
 						changes.NotifyDeleted()
 						return
 					}
@@ -124,13 +131,5 @@ func (fw *InotifyFileWatcher) ChangeEvents(t *tomb.Tomb, fi os.FileInfo) *FileCh
 		}
 	}()
 
-	return changes
-}
-
-func Cleanup() {
-	inotifyTracker.CloseAll()
-}
-
-func init() {
-	inotifyTracker = NewInotifyTracker()
+	return changes, nil
 }

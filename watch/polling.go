@@ -1,12 +1,15 @@
+// Copyright (c) 2015 HPE Software Inc. All rights reserved.
 // Copyright (c) 2013 ActiveState Software Inc. All rights reserved.
 
 package watch
 
 import (
-	"github.com/ActiveState/tail/util"
-	"gopkg.in/tomb.v1"
 	"os"
+	"runtime"
 	"time"
+
+	"github.com/hpcloud/tail/util"
+	"gopkg.in/tomb.v1"
 )
 
 // PollingFileWatcher polls the file for changes.
@@ -39,20 +42,21 @@ func (fw *PollingFileWatcher) BlockUntilExists(t *tomb.Tomb) error {
 	panic("unreachable")
 }
 
-func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, origFi os.FileInfo) *FileChanges {
+func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChanges, error) {
+	origFi, err := os.Stat(fw.Filename)
+	if err != nil {
+		return nil, err
+	}
+
 	changes := NewFileChanges()
 	var prevModTime time.Time
 
 	// XXX: use tomb.Tomb to cleanly manage these goroutines. replace
 	// the fatal (below) with tomb's Kill.
 
-	fw.Size = origFi.Size()
+	fw.Size = pos
 
 	go func() {
-		defer changes.Close()
-
-		var retry int = 0
-
 		prevSize := fw.Size
 		for {
 			select {
@@ -64,14 +68,12 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, origFi os.FileInfo) *Fi
 			time.Sleep(POLL_DURATION)
 			fi, err := os.Stat(fw.Filename)
 			if err != nil {
-				if os.IsNotExist(err) {
+				// Windows cannot delete a file if a handle is still open (tail keeps one open)
+				// so it gives access denied to anything trying to read it until all handles are released.
+				if os.IsNotExist(err) || (runtime.GOOS == "windows" && os.IsPermission(err)) {
 					// File does not exist (has been deleted).
 					changes.NotifyDeleted()
 					return
-				}
-
-				if permissionErrorRetry(err, &retry) {
-					continue
 				}
 
 				// XXX: report this error back to the user
@@ -91,6 +93,12 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, origFi os.FileInfo) *Fi
 				prevSize = fw.Size
 				continue
 			}
+			// File got bigger?
+			if prevSize > 0 && prevSize < fw.Size {
+				changes.NotifyModified()
+				prevSize = fw.Size
+				continue
+			}
 			prevSize = fw.Size
 
 			// File was appended to (changed)?
@@ -102,7 +110,7 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, origFi os.FileInfo) *Fi
 		}
 	}()
 
-	return changes
+	return changes, nil
 }
 
 func init() {
