@@ -1,9 +1,14 @@
 
-- [ ] Ping timer
+- [ ] Better constructors, options handling
+- [ ] Functions for callback settings after connection created.
+- [ ] Better options for subscriptions. Slow Consumer state settable, Go routines vs Inline.
+- [ ] Move off of channels for subscribers, use syncPool linkedLists, etc with highwater.
+- [ ] Test for valid subjects on publish and subscribe?
 - [ ] SyncSubscriber and Next for EncodedConn
 - [ ] Fast Publisher?
 - [ ] pooling for structs used? leaky bucket?
 - [ ] Timeout 0 should work as no timeout
+- [x] Ping timer
 - [x] Name in Connect for gnatsd
 - [x] Asynchronous error handling
 - [x] Parser rewrite

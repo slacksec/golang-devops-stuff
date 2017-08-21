@@ -1,22 +1,31 @@
 package nats
 
+////////////////////////////////////////////////////////////////////////////////
+// Package scoped specific tests here..
+////////////////////////////////////////////////////////////////////////////////
+
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
-	"math"
-	"regexp"
+	"fmt"
+	"reflect"
 	"runtime"
-	"sync"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/gnatsd/server"
+	gnatsd "github.com/nats-io/gnatsd/test"
 )
 
 // Dumb wait program to sync on callbacks, etc... Will timeout
-func wait(ch chan bool) error {
-	return waitTime(ch, 200*time.Millisecond)
+func Wait(ch chan bool) error {
+	return WaitTime(ch, 5*time.Second)
 }
 
-func waitTime(ch chan bool, timeout time.Duration) error {
+func WaitTime(ch chan bool, timeout time.Duration) error {
 	select {
 	case <-ch:
 		return nil
@@ -25,364 +34,1144 @@ func waitTime(ch chan bool, timeout time.Duration) error {
 	return errors.New("timeout")
 }
 
-func TestCloseLeakingGoRoutines(t *testing.T) {
-	base := runtime.NumGoroutine()
-	nc := newConnection(t)
-	time.Sleep(10 * time.Millisecond)
-	nc.Close()
-	time.Sleep(10 * time.Millisecond)
-	delta := (runtime.NumGoroutine() - base)
-	if delta > 0 {
-		t.Fatalf("%d Go routines still exist post Close()", delta)
+func stackFatalf(t *testing.T, f string, args ...interface{}) {
+	lines := make([]string, 0, 32)
+	msg := fmt.Sprintf(f, args...)
+	lines = append(lines, msg)
+
+	// Generate the Stack of callers: Skip us and verify* frames.
+	for i := 2; true; i++ {
+		_, file, line, ok := runtime.Caller(i)
+		if !ok {
+			break
+		}
+		msg := fmt.Sprintf("%d - %s:%d", i, file, line)
+		lines = append(lines, msg)
 	}
-	// Make sure we can call Close() multiple times
-	nc.Close()
+	t.Fatalf("%s", strings.Join(lines, "\n"))
 }
 
-func TestMultipleClose(t *testing.T) {
-	nc := newConnection(t)
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			nc.Close()
-			wg.Done()
-		}()
-	}
-	wg.Wait()
+////////////////////////////////////////////////////////////////////////////////
+// Reconnect tests
+////////////////////////////////////////////////////////////////////////////////
+
+const TEST_PORT = 8368
+
+var reconnectOpts = Options{
+	Url:            fmt.Sprintf("nats://localhost:%d", TEST_PORT),
+	AllowReconnect: true,
+	MaxReconnect:   10,
+	ReconnectWait:  100 * time.Millisecond,
+	Timeout:        DefaultTimeout,
 }
 
-func TestBadOptionTimeoutConnect(t *testing.T) {
-	opts := DefaultOptions
-	opts.Timeout = -1
-	opts.Url = "nats://localhost:4222"
+func RunServerOnPort(port int) *server.Server {
+	opts := gnatsd.DefaultTestOptions
+	opts.Port = port
+	return RunServerWithOptions(opts)
+}
 
-	_, err := opts.Connect()
+func RunServerWithOptions(opts server.Options) *server.Server {
+	return gnatsd.RunServer(&opts)
+}
+
+func TestReconnectServerStats(t *testing.T) {
+	ts := RunServerOnPort(TEST_PORT)
+
+	opts := reconnectOpts
+	nc, _ := opts.Connect()
+	defer nc.Close()
+	nc.Flush()
+
+	ts.Shutdown()
+	// server is stopped here...
+
+	ts = RunServerOnPort(TEST_PORT)
+	defer ts.Shutdown()
+
+	if err := nc.FlushTimeout(5 * time.Second); err != nil {
+		t.Fatalf("Error on Flush: %v", err)
+	}
+
+	// Make sure the server who is reconnected has the reconnects stats reset.
+	nc.mu.Lock()
+	_, cur := nc.currentServer()
+	nc.mu.Unlock()
+
+	if cur.reconnects != 0 {
+		t.Fatalf("Current Server's reconnects should be 0 vs %d\n", cur.reconnects)
+	}
+}
+
+func TestParseStateReconnectFunctionality(t *testing.T) {
+	ts := RunServerOnPort(TEST_PORT)
+	ch := make(chan bool)
+
+	opts := reconnectOpts
+	dch := make(chan bool)
+	opts.DisconnectedCB = func(_ *Conn) {
+		dch <- true
+	}
+
+	nc, errc := opts.Connect()
+	if errc != nil {
+		t.Fatalf("Failed to create a connection: %v\n", errc)
+	}
+	ec, errec := NewEncodedConn(nc, DEFAULT_ENCODER)
+	if errec != nil {
+		nc.Close()
+		t.Fatalf("Failed to create an encoded connection: %v\n", errec)
+	}
+	defer ec.Close()
+
+	testString := "bar"
+	ec.Subscribe("foo", func(s string) {
+		if s != testString {
+			t.Fatal("String doesn't match")
+		}
+		ch <- true
+	})
+	ec.Flush()
+
+	// Got a RACE condition with Travis build. The locking below does not
+	// really help because the parser running in the readLoop accesses
+	// nc.ps without the connection lock. Sleeping may help better since
+	// it would make the memory write in parse.go (when processing the
+	// pong) further away from the modification below.
+	time.Sleep(1 * time.Second)
+
+	// Simulate partialState, this needs to be cleared
+	nc.mu.Lock()
+	nc.ps.state = OP_PON
+	nc.mu.Unlock()
+
+	ts.Shutdown()
+	// server is stopped here...
+
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get the DisconnectedCB")
+	}
+
+	if err := ec.Publish("foo", testString); err != nil {
+		t.Fatalf("Failed to publish message: %v\n", err)
+	}
+
+	ts = RunServerOnPort(TEST_PORT)
+	defer ts.Shutdown()
+
+	if err := ec.FlushTimeout(5 * time.Second); err != nil {
+		t.Fatalf("Error on Flush: %v", err)
+	}
+
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not receive our message")
+	}
+
+	expectedReconnectCount := uint64(1)
+	reconnectedCount := ec.Conn.Stats().Reconnects
+
+	if reconnectedCount != expectedReconnectCount {
+		t.Fatalf("Reconnect count incorrect: %d vs %d\n",
+			reconnectedCount, expectedReconnectCount)
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// ServerPool tests
+////////////////////////////////////////////////////////////////////////////////
+
+var testServers = []string{
+	"nats://localhost:1222",
+	"nats://localhost:1223",
+	"nats://localhost:1224",
+	"nats://localhost:1225",
+	"nats://localhost:1226",
+	"nats://localhost:1227",
+	"nats://localhost:1228",
+}
+
+func TestServersRandomize(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.Servers = testServers
+	nc := &Conn{Opts: opts}
+	if err := nc.setupServerPool(); err != nil {
+		t.Fatalf("Problem setting up Server Pool: %v\n", err)
+	}
+	// Build []string from srvPool
+	clientServers := []string{}
+	for _, s := range nc.srvPool {
+		clientServers = append(clientServers, s.url.String())
+	}
+	// In theory this could happen..
+	if reflect.DeepEqual(testServers, clientServers) {
+		t.Fatalf("ServerPool list not randomized\n")
+	}
+
+	// Now test that we do not randomize if proper flag is set.
+	opts = GetDefaultOptions()
+	opts.Servers = testServers
+	opts.NoRandomize = true
+	nc = &Conn{Opts: opts}
+	if err := nc.setupServerPool(); err != nil {
+		t.Fatalf("Problem setting up Server Pool: %v\n", err)
+	}
+	// Build []string from srvPool
+	clientServers = []string{}
+	for _, s := range nc.srvPool {
+		clientServers = append(clientServers, s.url.String())
+	}
+	if !reflect.DeepEqual(testServers, clientServers) {
+		t.Fatalf("ServerPool list should not be randomized\n")
+	}
+
+	// Although the original intent was that if Opts.Url is
+	// set, Opts.Servers is not (and vice versa), the behavior
+	// is that Opts.Url is always first, even when randomization
+	// is enabled. So make sure that this is still the case.
+	opts = GetDefaultOptions()
+	opts.Url = DefaultURL
+	opts.Servers = testServers
+	nc = &Conn{Opts: opts}
+	if err := nc.setupServerPool(); err != nil {
+		t.Fatalf("Problem setting up Server Pool: %v\n", err)
+	}
+	// Build []string from srvPool
+	clientServers = []string{}
+	for _, s := range nc.srvPool {
+		clientServers = append(clientServers, s.url.String())
+	}
+	// In theory this could happen..
+	if reflect.DeepEqual(testServers, clientServers) {
+		t.Fatalf("ServerPool list not randomized\n")
+	}
+	if clientServers[0] != DefaultURL {
+		t.Fatalf("Options.Url should be first in the array, got %v", clientServers[0])
+	}
+}
+
+func TestSelectNextServer(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.Servers = testServers
+	opts.NoRandomize = true
+	nc := &Conn{Opts: opts}
+	if err := nc.setupServerPool(); err != nil {
+		t.Fatalf("Problem setting up Server Pool: %v\n", err)
+	}
+	if nc.url != nc.srvPool[0].url {
+		t.Fatalf("Wrong default selection: %v\n", nc.url)
+	}
+
+	sel, err := nc.selectNextServer()
+	if err != nil {
+		t.Fatalf("Got an err: %v\n", err)
+	}
+	// Check that we are now looking at #2, and current is now last.
+	if len(nc.srvPool) != len(testServers) {
+		t.Fatalf("List is incorrect size: %d vs %d\n", len(nc.srvPool), len(testServers))
+	}
+	if nc.url.String() != testServers[1] {
+		t.Fatalf("Selection incorrect: %v vs %v\n", nc.url, testServers[1])
+	}
+	if nc.srvPool[len(nc.srvPool)-1].url.String() != testServers[0] {
+		t.Fatalf("Did not push old to last position\n")
+	}
+	if sel != nc.srvPool[0] {
+		t.Fatalf("Did not return correct server: %v vs %v\n", sel.url, nc.srvPool[0].url)
+	}
+
+	// Test that we do not keep servers where we have tried to reconnect past our limit.
+	nc.srvPool[0].reconnects = int(opts.MaxReconnect)
+	if _, err := nc.selectNextServer(); err != nil {
+		t.Fatalf("Got an err: %v\n", err)
+	}
+	// Check that we are now looking at #3, and current is not in the list.
+	if len(nc.srvPool) != len(testServers)-1 {
+		t.Fatalf("List is incorrect size: %d vs %d\n", len(nc.srvPool), len(testServers)-1)
+	}
+	if nc.url.String() != testServers[2] {
+		t.Fatalf("Selection incorrect: %v vs %v\n", nc.url, testServers[2])
+	}
+	if nc.srvPool[len(nc.srvPool)-1].url.String() == testServers[1] {
+		t.Fatalf("Did not throw away the last server correctly\n")
+	}
+}
+
+// This will test that comma separated url strings work properly for
+// the Connect() command.
+func TestUrlArgument(t *testing.T) {
+	check := func(url string, expected []string) {
+		if !reflect.DeepEqual(processUrlString(url), expected) {
+			t.Fatalf("Got wrong response processing URL: %q, RES: %#v\n", url, processUrlString(url))
+		}
+	}
+	// This is normal case
+	oneExpected := []string{"nats://localhost:1222"}
+
+	check("nats://localhost:1222", oneExpected)
+	check("nats://localhost:1222 ", oneExpected)
+	check(" nats://localhost:1222", oneExpected)
+	check(" nats://localhost:1222 ", oneExpected)
+
+	var multiExpected = []string{
+		"nats://localhost:1222",
+		"nats://localhost:1223",
+		"nats://localhost:1224",
+	}
+
+	check("nats://localhost:1222,nats://localhost:1223,nats://localhost:1224", multiExpected)
+	check("nats://localhost:1222, nats://localhost:1223, nats://localhost:1224", multiExpected)
+	check(" nats://localhost:1222, nats://localhost:1223, nats://localhost:1224 ", multiExpected)
+	check("nats://localhost:1222,   nats://localhost:1223  ,nats://localhost:1224", multiExpected)
+}
+
+func TestParserPing(t *testing.T) {
+	c := &Conn{}
+	fake := &bytes.Buffer{}
+	c.bw = bufio.NewWriterSize(fake, c.Opts.ReconnectBufSize)
+
+	c.ps = &parseState{}
+
+	if c.ps.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.ps.state)
+	}
+	ping := []byte("PING\r\n")
+	err := c.parse(ping[:1])
+	if err != nil || c.ps.state != OP_P {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(ping[1:2])
+	if err != nil || c.ps.state != OP_PI {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(ping[2:3])
+	if err != nil || c.ps.state != OP_PIN {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(ping[3:4])
+	if err != nil || c.ps.state != OP_PING {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(ping[4:5])
+	if err != nil || c.ps.state != OP_PING {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(ping[5:6])
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(ping)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Should tolerate spaces
+	ping = []byte("PING  \r")
+	err = c.parse(ping)
+	if err != nil || c.ps.state != OP_PING {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	c.ps.state = OP_START
+	ping = []byte("PING  \r  \n")
+	err = c.parse(ping)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+}
+
+func TestParserErr(t *testing.T) {
+	c := &Conn{}
+	c.status = CLOSED
+	fake := &bytes.Buffer{}
+	c.bw = bufio.NewWriterSize(fake, c.Opts.ReconnectBufSize)
+
+	c.ps = &parseState{}
+
+	// This test focuses on the parser only, not how the error is
+	// actually processed by the upper layer.
+
+	if c.ps.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.ps.state)
+	}
+
+	expectedError := "'Any kind of error'"
+	errProto := []byte("-ERR  " + expectedError + "\r\n")
+	err := c.parse(errProto[:1])
+	if err != nil || c.ps.state != OP_MINUS {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[1:2])
+	if err != nil || c.ps.state != OP_MINUS_E {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[2:3])
+	if err != nil || c.ps.state != OP_MINUS_ER {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[3:4])
+	if err != nil || c.ps.state != OP_MINUS_ERR {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[4:5])
+	if err != nil || c.ps.state != OP_MINUS_ERR_SPC {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[5:6])
+	if err != nil || c.ps.state != OP_MINUS_ERR_SPC {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+
+	// Check with split arg buffer
+	err = c.parse(errProto[6:7])
+	if err != nil || c.ps.state != MINUS_ERR_ARG {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[7:10])
+	if err != nil || c.ps.state != MINUS_ERR_ARG {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[10 : len(errProto)-2])
+	if err != nil || c.ps.state != MINUS_ERR_ARG {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	if c.ps.argBuf == nil {
+		t.Fatal("ArgBuf should not be nil")
+	}
+	s := string(c.ps.argBuf)
+	if s != expectedError {
+		t.Fatalf("Expected %v, got %v", expectedError, s)
+	}
+	err = c.parse(errProto[len(errProto)-2:])
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+
+	// Check without split arg buffer
+	errProto = []byte("-ERR 'Any error'\r\n")
+	err = c.parse(errProto)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+}
+
+func TestParserOK(t *testing.T) {
+	c := &Conn{}
+	c.ps = &parseState{}
+
+	if c.ps.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.ps.state)
+	}
+	errProto := []byte("+OKay\r\n")
+	err := c.parse(errProto[:1])
+	if err != nil || c.ps.state != OP_PLUS {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[1:2])
+	if err != nil || c.ps.state != OP_PLUS_O {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[2:3])
+	if err != nil || c.ps.state != OP_PLUS_OK {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(errProto[3:])
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+}
+
+func TestParserShouldFail(t *testing.T) {
+	c := &Conn{}
+	c.ps = &parseState{}
+
+	if err := c.parse([]byte(" PING")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("POO")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("Px")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("PIx")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("PINx")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	// Stop here because 'PING' protos are tolerant for anything between PING and \n
+
+	c.ps.state = OP_START
+	if err := c.parse([]byte("POx")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("PONx")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	// Stop here because 'PONG' protos are tolerant for anything between PONG and \n
+
+	c.ps.state = OP_START
+	if err := c.parse([]byte("ZOO")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("Mx\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSx\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSGx\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSG  foo\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSG \r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSG foo 1\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSG foo bar 1\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSG foo bar 1 baz\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("MSG foo 1 bar baz\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("+x\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("+Ox\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("-x\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("-Ex\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("-ERx\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+	c.ps.state = OP_START
+	if err := c.parse([]byte("-ERRx\r\n")); err == nil {
+		t.Fatal("Should have received a parse error")
+	}
+}
+
+func TestParserSplitMsg(t *testing.T) {
+
+	nc := &Conn{}
+	nc.ps = &parseState{}
+
+	buf := []byte("MSG a\r\n")
+	err := nc.parse(buf)
 	if err == nil {
 		t.Fatal("Expected an error")
 	}
-	if err != ErrNoServers {
-		t.Fatalf("Expected a ErrNoServers error: Got %v\n", err)
+	nc.ps = &parseState{}
+
+	buf = []byte("MSG a b c\r\n")
+	err = nc.parse(buf)
+	if err == nil {
+		t.Fatal("Expected an error")
 	}
-}
+	nc.ps = &parseState{}
 
-func TestSimplePublish(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	if err := nc.Publish("foo", []byte("Hello World")); err != nil {
-		t.Fatal("Failed to publish string message: ", err)
+	expectedCount := uint64(1)
+	expectedSize := uint64(3)
+
+	buf = []byte("MSG a")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
 	}
-}
-
-func TestSimplePublishNoData(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	if err := nc.Publish("foo", nil); err != nil {
-		t.Fatal("Failed to publish empty message: ", err)
+	if nc.ps.argBuf == nil {
+		t.Fatal("Arg buffer should have been created")
 	}
-}
 
-func TestAsyncSubscribe(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	omsg := []byte("Hello World")
-	ch := make(chan bool)
+	buf = []byte(" 1 3\r\nf")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if nc.ps.ma.size != 3 {
+		t.Fatalf("Wrong msg size: %d instead of 3", nc.ps.ma.size)
+	}
+	if nc.ps.ma.sid != 1 {
+		t.Fatalf("Wrong sid: %d instead of 1", nc.ps.ma.sid)
+	}
+	if string(nc.ps.ma.subject) != "a" {
+		t.Fatalf("Wrong subject: '%s' instead of 'a'", string(nc.ps.ma.subject))
+	}
+	if nc.ps.msgBuf == nil {
+		t.Fatal("Msg buffer should have been created")
+	}
 
-	_, err := nc.Subscribe("foo", func(m *Msg) {
-		if !bytes.Equal(m.Data, omsg) {
-			t.Fatal("Message received does not match")
+	buf = []byte("oo\r\n")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if (nc.Statistics.InMsgs != expectedCount) || (nc.Statistics.InBytes != expectedSize) {
+		t.Fatalf("Wrong stats: %d - %d instead of %d - %d", nc.Statistics.InMsgs, nc.Statistics.InBytes, expectedCount, expectedSize)
+	}
+	if (nc.ps.argBuf != nil) || (nc.ps.msgBuf != nil) {
+		t.Fatal("Buffers should be nil now")
+	}
+
+	buf = []byte("MSG a 1 3\r\nfo")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if nc.ps.ma.size != 3 {
+		t.Fatalf("Wrong msg size: %d instead of 3", nc.ps.ma.size)
+	}
+	if nc.ps.ma.sid != 1 {
+		t.Fatalf("Wrong sid: %d instead of 1", nc.ps.ma.sid)
+	}
+	if string(nc.ps.ma.subject) != "a" {
+		t.Fatalf("Wrong subject: '%s' instead of 'a'", string(nc.ps.ma.subject))
+	}
+	if nc.ps.argBuf == nil {
+		t.Fatal("Arg buffer should have been created")
+	}
+	if nc.ps.msgBuf == nil {
+		t.Fatal("Msg buffer should have been created")
+	}
+
+	expectedCount++
+	expectedSize += 3
+
+	buf = []byte("o\r\n")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if (nc.Statistics.InMsgs != expectedCount) || (nc.Statistics.InBytes != expectedSize) {
+		t.Fatalf("Wrong stats: %d - %d instead of %d - %d", nc.Statistics.InMsgs, nc.Statistics.InBytes, expectedCount, expectedSize)
+	}
+	if (nc.ps.argBuf != nil) || (nc.ps.msgBuf != nil) {
+		t.Fatal("Buffers should be nil now")
+	}
+
+	buf = []byte("MSG a 1 6\r\nfo")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if nc.ps.ma.size != 6 {
+		t.Fatalf("Wrong msg size: %d instead of 3", nc.ps.ma.size)
+	}
+	if nc.ps.ma.sid != 1 {
+		t.Fatalf("Wrong sid: %d instead of 1", nc.ps.ma.sid)
+	}
+	if string(nc.ps.ma.subject) != "a" {
+		t.Fatalf("Wrong subject: '%s' instead of 'a'", string(nc.ps.ma.subject))
+	}
+	if nc.ps.argBuf == nil {
+		t.Fatal("Arg buffer should have been created")
+	}
+	if nc.ps.msgBuf == nil {
+		t.Fatal("Msg buffer should have been created")
+	}
+
+	buf = []byte("ob")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+
+	expectedCount++
+	expectedSize += 6
+
+	buf = []byte("ar\r\n")
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if (nc.Statistics.InMsgs != expectedCount) || (nc.Statistics.InBytes != expectedSize) {
+		t.Fatalf("Wrong stats: %d - %d instead of %d - %d", nc.Statistics.InMsgs, nc.Statistics.InBytes, expectedCount, expectedSize)
+	}
+	if (nc.ps.argBuf != nil) || (nc.ps.msgBuf != nil) {
+		t.Fatal("Buffers should be nil now")
+	}
+
+	// Let's have a msg that is bigger than the parser's scratch size.
+	// Since we prepopulate the msg with 'foo', adding 3 to the size.
+	msgSize := cap(nc.ps.scratch) + 100 + 3
+	buf = []byte(fmt.Sprintf("MSG a 1 b %d\r\nfoo", msgSize))
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if nc.ps.ma.size != msgSize {
+		t.Fatalf("Wrong msg size: %d instead of %d", nc.ps.ma.size, msgSize)
+	}
+	if nc.ps.ma.sid != 1 {
+		t.Fatalf("Wrong sid: %d instead of 1", nc.ps.ma.sid)
+	}
+	if string(nc.ps.ma.subject) != "a" {
+		t.Fatalf("Wrong subject: '%s' instead of 'a'", string(nc.ps.ma.subject))
+	}
+	if string(nc.ps.ma.reply) != "b" {
+		t.Fatalf("Wrong reply: '%s' instead of 'b'", string(nc.ps.ma.reply))
+	}
+	if nc.ps.argBuf == nil {
+		t.Fatal("Arg buffer should have been created")
+	}
+	if nc.ps.msgBuf == nil {
+		t.Fatal("Msg buffer should have been created")
+	}
+
+	expectedCount++
+	expectedSize += uint64(msgSize)
+
+	bufSize := msgSize - 3
+
+	buf = make([]byte, bufSize)
+	for i := 0; i < bufSize; i++ {
+		buf[i] = byte('a' + (i % 26))
+	}
+
+	err = nc.parse(buf)
+	if err != nil {
+		t.Fatalf("Parser error: %v", err)
+	}
+	if nc.ps.state != MSG_PAYLOAD {
+		t.Fatalf("Wrong state: %v instead of %v", nc.ps.state, MSG_PAYLOAD)
+	}
+	if nc.ps.ma.size != msgSize {
+		t.Fatalf("Wrong (ma) msg size: %d instead of %d", nc.ps.ma.size, msgSize)
+	}
+	if len(nc.ps.msgBuf) != msgSize {
+		t.Fatalf("Wrong msg size: %d instead of %d", len(nc.ps.msgBuf), msgSize)
+	}
+	// Check content:
+	if string(nc.ps.msgBuf[0:3]) != "foo" {
+		t.Fatalf("Wrong msg content: %s", string(nc.ps.msgBuf))
+	}
+	for k := 3; k < nc.ps.ma.size; k++ {
+		if nc.ps.msgBuf[k] != byte('a'+((k-3)%26)) {
+			t.Fatalf("Wrong msg content: %s", string(nc.ps.msgBuf))
 		}
-		if m.Sub == nil {
-			t.Fatal("Callback does not have a valid Subscription")
+	}
+
+	buf = []byte("\r\n")
+	if err := nc.parse(buf); err != nil {
+		t.Fatalf("Unexpected error during parsing: %v", err)
+	}
+	if (nc.Statistics.InMsgs != expectedCount) || (nc.Statistics.InBytes != expectedSize) {
+		t.Fatalf("Wrong stats: %d - %d instead of %d - %d", nc.Statistics.InMsgs, nc.Statistics.InBytes, expectedCount, expectedSize)
+	}
+	if (nc.ps.argBuf != nil) || (nc.ps.msgBuf != nil) {
+		t.Fatal("Buffers should be nil now")
+	}
+	if nc.ps.state != OP_START {
+		t.Fatalf("Wrong state: %v", nc.ps.state)
+	}
+}
+
+func TestNormalizeError(t *testing.T) {
+	received := "Typical Error"
+	expected := strings.ToLower(received)
+	if s := normalizeErr("-ERR '" + received + "'"); s != expected {
+		t.Fatalf("Expected '%s', got '%s'", expected, s)
+	}
+
+	received = "Trim Surrounding Spaces"
+	expected = strings.ToLower(received)
+	if s := normalizeErr("-ERR    '" + received + "'   "); s != expected {
+		t.Fatalf("Expected '%s', got '%s'", expected, s)
+	}
+
+	received = "Trim Surrounding Spaces Without Quotes"
+	expected = strings.ToLower(received)
+	if s := normalizeErr("-ERR    " + received + "   "); s != expected {
+		t.Fatalf("Expected '%s', got '%s'", expected, s)
+	}
+
+	received = "Error Without Quotes"
+	expected = strings.ToLower(received)
+	if s := normalizeErr("-ERR " + received); s != expected {
+		t.Fatalf("Expected '%s', got '%s'", expected, s)
+	}
+
+	received = "Error With Quote Only On Left"
+	expected = strings.ToLower(received)
+	if s := normalizeErr("-ERR '" + received); s != expected {
+		t.Fatalf("Expected '%s', got '%s'", expected, s)
+	}
+
+	received = "Error With Quote Only On Right"
+	expected = strings.ToLower(received)
+	if s := normalizeErr("-ERR " + received + "'"); s != expected {
+		t.Fatalf("Expected '%s', got '%s'", expected, s)
+	}
+}
+
+func TestAsyncINFO(t *testing.T) {
+	opts := GetDefaultOptions()
+	c := &Conn{Opts: opts}
+
+	c.ps = &parseState{}
+
+	if c.ps.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.ps.state)
+	}
+
+	info := []byte("INFO {}\r\n")
+	if c.ps.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.ps.state)
+	}
+	err := c.parse(info[:1])
+	if err != nil || c.ps.state != OP_I {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(info[1:2])
+	if err != nil || c.ps.state != OP_IN {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(info[2:3])
+	if err != nil || c.ps.state != OP_INF {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(info[3:4])
+	if err != nil || c.ps.state != OP_INFO {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(info[4:5])
+	if err != nil || c.ps.state != OP_INFO_SPC {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	err = c.parse(info[5:])
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+
+	// All at once
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+
+	// Server pool needs to be setup
+	c.setupServerPool()
+
+	// Partials requiring argBuf
+	expectedServer := serverInfo{
+		Id:           "test",
+		Host:         "localhost",
+		Port:         4222,
+		Version:      "1.2.3",
+		AuthRequired: true,
+		TLSRequired:  true,
+		MaxPayload:   2 * 1024 * 1024,
+		ConnectURLs:  []string{"localhost:5222", "localhost:6222"},
+	}
+	// Set NoRandomize so that the check with expectedServer info
+	// matches.
+	c.Opts.NoRandomize = true
+
+	b, _ := json.Marshal(expectedServer)
+	info = []byte(fmt.Sprintf("INFO %s\r\n", b))
+	if c.ps.state != OP_START {
+		t.Fatalf("Expected OP_START vs %d\n", c.ps.state)
+	}
+	err = c.parse(info[:9])
+	if err != nil || c.ps.state != INFO_ARG || c.ps.argBuf == nil {
+		t.Fatalf("Unexpected: %d err: %v argBuf: %v\n", c.ps.state, err, c.ps.argBuf)
+	}
+	err = c.parse(info[9:11])
+	if err != nil || c.ps.state != INFO_ARG || c.ps.argBuf == nil {
+		t.Fatalf("Unexpected: %d err: %v argBuf: %v\n", c.ps.state, err, c.ps.argBuf)
+	}
+	err = c.parse(info[11:])
+	if err != nil || c.ps.state != OP_START || c.ps.argBuf != nil {
+		t.Fatalf("Unexpected: %d err: %v argBuf: %v\n", c.ps.state, err, c.ps.argBuf)
+	}
+	if !reflect.DeepEqual(c.info, expectedServer) {
+		t.Fatalf("Expected server info to be: %v, got: %v", expectedServer, c.info)
+	}
+
+	// Good INFOs
+	good := []string{"INFO {}\r\n", "INFO  {}\r\n", "INFO {} \r\n", "INFO { \"server_id\": \"test\"  }   \r\n", "INFO {\"connect_urls\":[]}\r\n"}
+	for _, gi := range good {
+		c.ps = &parseState{}
+		err = c.parse([]byte(gi))
+		if err != nil || c.ps.state != OP_START {
+			t.Fatalf("Protocol %q should be fine. Err=%v state=%v", gi, err, c.ps.state)
 		}
-		ch <- true
-	})
-	if err != nil {
-		t.Fatal("Failed to subscribe: ", err)
 	}
-	nc.Publish("foo", omsg)
-	if e := wait(ch); e != nil {
-		t.Fatal("Message not received for subscription")
-	}
-}
 
-func TestSyncSubscribe(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	s, err := nc.SubscribeSync("foo")
-	if err != nil {
-		t.Fatal("Failed to subscribe: ", err)
-	}
-	omsg := []byte("Hello World")
-	nc.Publish("foo", omsg)
-	msg, err := s.NextMsg(1 * time.Second)
-	if err != nil || !bytes.Equal(msg.Data, omsg) {
-		t.Fatal("Message received does not match")
-	}
-}
-
-func TestPubSubWithReply(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	s, err := nc.SubscribeSync("foo")
-	if err != nil {
-		t.Fatal("Failed to subscribe: ", err)
-	}
-	omsg := []byte("Hello World")
-	nc.PublishMsg(&Msg{Subject: "foo", Reply: "bar", Data: omsg})
-	msg, err := s.NextMsg(10 * time.Second)
-	if err != nil || !bytes.Equal(msg.Data, omsg) {
-		t.Fatal("Message received does not match")
-	}
-}
-
-func TestFlush(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-
-	omsg := []byte("Hello World")
-	for i := 0; i < 10000; i++ {
-		nc.Publish("flush", omsg)
-	}
-	if err := nc.Flush(); err != nil {
-		t.Fatalf("Received error from flush: %s\n", err)
-	}
-	if nb := nc.bw.Buffered(); nb > 0 {
-		t.Fatalf("Outbound buffer not empty: %d bytes\n", nb)
-	}
-}
-
-func TestQueueSubscriber(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	s1, _ := nc.QueueSubscribeSync("foo", "bar")
-	s2, _ := nc.QueueSubscribeSync("foo", "bar")
-	omsg := []byte("Hello World")
-	nc.Publish("foo", omsg)
-	nc.Flush()
-	r1, r2 := len(s1.mch), len(s2.mch)
-	if (r1 + r2) != 1 {
-		t.Fatal("Received too many messages for multiple queue subscribers")
-	}
-	// Drain messages
-	s1.NextMsg(0)
-	s2.NextMsg(0)
-
-	total := 1000
-	for i := 0; i < total; i++ {
-		nc.Publish("foo", omsg)
-	}
-	nc.Flush()
-	v := uint(float32(total) * 0.15)
-	r1, r2 = len(s1.mch), len(s2.mch)
-	if r1+r2 != total {
-		t.Fatalf("Incorrect number of messages: %d vs %d", (r1 + r2), total)
-	}
-	expected := total / 2
-	d1 := uint(math.Abs(float64(expected - r1)))
-	d2 := uint(math.Abs(float64(expected - r2)))
-	if d1 > v || d2 > v {
-		t.Fatalf("Too much variance in totals: %d, %d > %d", d1, d2, v)
-	}
-}
-
-func TestReplyArg(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	ch := make(chan bool)
-	replyExpected := "bar"
-
-	nc.Subscribe("foo", func(m *Msg) {
-		if m.Reply != replyExpected {
-			t.Fatalf("Did not receive correct reply arg in callback: "+
-				"('%s' vs '%s')", m.Reply, replyExpected)
+	// Wrong INFOs
+	wrong := []string{"IxNFO {}\r\n", "INxFO {}\r\n", "INFxO {}\r\n", "INFOx {}\r\n", "INFO{}\r\n", "INFO {}"}
+	for _, wi := range wrong {
+		c.ps = &parseState{}
+		err = c.parse([]byte(wi))
+		if err == nil && c.ps.state == OP_START {
+			t.Fatalf("Protocol %q should have failed", wi)
 		}
-		ch <- true
-	})
-	nc.PublishMsg(&Msg{Subject: "foo", Reply: replyExpected, Data: []byte("Hello")})
-	if e := wait(ch); e != nil {
-		t.Fatal("Did not receive callback")
 	}
-}
 
-func TestSyncReplyArg(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	replyExpected := "bar"
-	s, _ := nc.SubscribeSync("foo")
-	nc.PublishMsg(&Msg{Subject: "foo", Reply: replyExpected, Data: []byte("Hello")})
-	msg, err := s.NextMsg(1 * time.Second)
-	if err != nil {
-		t.Fatal("Received an err on NextMsg()")
-	}
-	if msg.Reply != replyExpected {
-		t.Fatalf("Did not receive correct reply arg in callback: "+
-			"('%s' vs '%s')", msg.Reply, replyExpected)
-	}
-}
-
-func TestUnsubscribe(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	received := 0
-	max := 10
-	nc.Subscribe("foo", func(m *Msg) {
-		received += 1
-		if received == max {
-			err := m.Sub.Unsubscribe()
-			if err != nil {
-				t.Fatal("Unsubscribe failed with err:", err)
+	checkPool := func(inThatOrder bool, urls ...string) {
+		// Check both pool and urls map
+		if len(c.srvPool) != len(urls) {
+			stackFatalf(t, "Pool should have %d elements, has %d", len(urls), len(c.srvPool))
+		}
+		if len(c.urls) != len(urls) {
+			stackFatalf(t, "Map should have %d elements, has %d", len(urls), len(c.urls))
+		}
+		for i, url := range urls {
+			if inThatOrder {
+				if c.srvPool[i].url.Host != url {
+					stackFatalf(t, "Pool should have %q at index %q, has %q", url, i, c.srvPool[i].url.Host)
+				}
+			} else {
+				if _, present := c.urls[url]; !present {
+					stackFatalf(t, "Pool should have %q", url)
+				}
 			}
 		}
-	})
-	send := 20
-	for i := 0; i < send; i++ {
-		nc.Publish("foo", []byte("hello"))
 	}
-	nc.Flush()
-	if received != max {
-		t.Fatalf("Received wrong # of messages after unsubscribe: %d vs %d",
-			received, max)
+
+	// Now test the decoding of "connect_urls"
+
+	// No randomize for now
+	c.Opts.NoRandomize = true
+	// Reset the pool
+	c.setupServerPool()
+	// Reinitialize the parser
+	c.ps = &parseState{}
+
+	info = []byte("INFO {\"connect_urls\":[\"localhost:5222\"]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool now should contain localhost:4222 (the default URL) and localhost:5222
+	checkPool(true, "localhost:4222", "localhost:5222")
+
+	// Make sure that if client receives the same, it is not added again.
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool should still contain localhost:4222 (the default URL) and localhost:5222
+	checkPool(true, "localhost:4222", "localhost:5222")
+
+	// Receive a new URL
+	info = []byte("INFO {\"connect_urls\":[\"localhost:6222\"]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool now should contain localhost:4222 (the default URL) localhost:5222 and localhost:6222
+	checkPool(true, "localhost:4222", "localhost:5222", "localhost:6222")
+
+	// Receive more than 1 URL at once
+	info = []byte("INFO {\"connect_urls\":[\"localhost:7222\", \"localhost:8222\"]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool now should contain localhost:4222 (the default URL) localhost:5222, localhost:6222
+	// localhost:7222 and localhost:8222
+	checkPool(true, "localhost:4222", "localhost:5222", "localhost:6222", "localhost:7222", "localhost:8222")
+
+	// Test with pool randomization now. Note that with randominzation,
+	// the initial pool is randomize, then each array of urls that the
+	// client gets from the INFO protocol is randomized, but added to
+	// the end of the pool.
+	c.Opts.NoRandomize = false
+	c.setupServerPool()
+
+	info = []byte("INFO {\"connect_urls\":[\"localhost:5222\"]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool now should contain localhost:4222 (the default URL) and localhost:5222
+	checkPool(true, "localhost:4222", "localhost:5222")
+
+	// Make sure that if client receives the same, it is not added again.
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool should still contain localhost:4222 (the default URL) and localhost:5222
+	checkPool(true, "localhost:4222", "localhost:5222")
+
+	// Receive a new URL
+	info = []byte("INFO {\"connect_urls\":[\"localhost:6222\"]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool now should contain localhost:4222 (the default URL) localhost:5222 and localhost:6222
+	checkPool(true, "localhost:4222", "localhost:5222", "localhost:6222")
+
+	// Receive more than 1 URL at once. Add more than 2 to increase the chance of
+	// the array being shuffled.
+	info = []byte("INFO {\"connect_urls\":[\"localhost:7222\", \"localhost:8222\", " +
+		"\"localhost:9222\", \"localhost:10222\", \"localhost:11222\"]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+	// Pool now should contain localhost:4222 (the default URL) localhost:5222, localhost:6222
+	// localhost:7222, localhost:8222, localhost:9222, localhost:10222 and localhost:11222
+	checkPool(false, "localhost:4222", "localhost:5222", "localhost:6222", "localhost:7222", "localhost:8222",
+		"localhost:9222", "localhost:10222", "localhost:11222")
+
+	// Finally, check that (part of) the pool should be randomized.
+	allUrls := []string{"localhost:4222", "localhost:5222", "localhost:6222", "localhost:7222", "localhost:8222",
+		"localhost:9222", "localhost:10222", "localhost:11222"}
+	same := 0
+	for i, url := range c.srvPool {
+		if url.url.Host == allUrls[i] {
+			same++
+		}
+	}
+	if same == len(allUrls) {
+		t.Fatal("Pool does not seem to be randomized")
+	}
+
+	// Check that pool may be randomized on setup, but new URLs are always
+	// added at end of pool.
+	c.Opts.NoRandomize = false
+	c.Opts.Servers = testServers
+	// Reset the pool
+	c.setupServerPool()
+	// Reinitialize the parser
+	c.ps = &parseState{}
+	// Capture the pool sequence after randomization
+	urlsAfterPoolSetup := make([]string, 0, len(c.srvPool))
+	for _, srv := range c.srvPool {
+		urlsAfterPoolSetup = append(urlsAfterPoolSetup, srv.url.Host)
+	}
+	checkPoolOrderDidNotChange := func() {
+		for i := 0; i < len(urlsAfterPoolSetup); i++ {
+			if c.srvPool[i].url.Host != urlsAfterPoolSetup[i] {
+				stackFatalf(t, "Pool should have %q at index %q, has %q", urlsAfterPoolSetup[i], i, c.srvPool[i].url.Host)
+			}
+		}
+	}
+	// Add new urls
+	newURLs := []string{
+		"localhost:6222",
+		"localhost:7222",
+		"localhost:8222\", \"localhost:9222",
+		"localhost:10222\", \"localhost:11222\", \"localhost:12222,",
+	}
+	for _, newURL := range newURLs {
+		info = []byte("INFO {\"connect_urls\":[\"" + newURL + "]}\r\n")
+		err = c.parse(info)
+		if err != nil || c.ps.state != OP_START {
+			t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+		}
+		// Check that pool order does not change up to the new addition(s).
+		checkPoolOrderDidNotChange()
 	}
 }
 
-func TestDoubleUnsubscribe(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	s, err := nc.SubscribeSync("foo")
+func TestConnServers(t *testing.T) {
+	opts := GetDefaultOptions()
+	c := &Conn{Opts: opts}
+	c.ps = &parseState{}
+	c.setupServerPool()
+
+	validateURLs := func(serverUrls []string, expectedUrls ...string) {
+		var found bool
+		if len(serverUrls) != len(expectedUrls) {
+			stackFatalf(t, "Array should have %d elements, has %d", len(expectedUrls), len(serverUrls))
+		}
+
+		for _, ev := range expectedUrls {
+			found = false
+			for _, av := range serverUrls {
+				if ev == av {
+					found = true
+					break
+				}
+			}
+			if !found {
+				stackFatalf(t, "array is missing %q in %v", ev, serverUrls)
+			}
+		}
+	}
+
+	// check the default url
+	validateURLs(c.Servers(), "nats://localhost:4222")
+	if len(c.DiscoveredServers()) != 0 {
+		t.Fatalf("Expected no discovered servers")
+	}
+
+	// Add a new URL
+	err := c.parse([]byte("INFO {\"connect_urls\":[\"localhost:5222\"]}\r\n"))
 	if err != nil {
-		t.Fatal("Failed to subscribe: ", err)
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
 	}
-	if err = s.Unsubscribe(); err != nil {
-		t.Fatal("Unsubscribe failed with err:", err)
-	}
-	if err = s.Unsubscribe(); err == nil {
-		t.Fatal("Unsubscribe should have reported an error")
-	}
+	// Server list should now contain both the default and the new url.
+	validateURLs(c.Servers(), "nats://localhost:4222", "nats://localhost:5222")
+	// Discovered servers should only contain the new url.
+	validateURLs(c.DiscoveredServers(), "nats://localhost:5222")
+
+	// verify user credentials are stripped out.
+	opts.Servers = []string{"nats://user:pass@localhost:4333", "nats://token@localhost:4444"}
+	c = &Conn{Opts: opts}
+	c.ps = &parseState{}
+	c.setupServerPool()
+
+	validateURLs(c.Servers(), "nats://localhost:4333", "nats://localhost:4444")
 }
 
-func TestRequestTimeout(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	if _, err := nc.Request("foo", []byte("help"), 10*time.Millisecond); err == nil {
-		t.Fatalf("Expected to receive a timeout error")
+func TestProcessErrAuthorizationError(t *testing.T) {
+	ach := make(chan asyncCB, 1)
+	called := make(chan error, 1)
+	c := &Conn{
+		ach: ach,
+		Opts: Options{
+			AsyncErrorCB: func(nc *Conn, sub *Subscription, err error) {
+				called <- err
+			},
+		},
 	}
-}
-
-func TestRequest(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	response := []byte("I will help you")
-	nc.Subscribe("foo", func(m *Msg) {
-		nc.Publish(m.Reply, response)
-	})
-	msg, err := nc.Request("foo", []byte("help"), 50*time.Millisecond)
-	if err != nil {
-		t.Fatalf("Received an error on Request test: %s", err)
-	}
-	if !bytes.Equal(msg.Data, response) {
-		t.Fatalf("Received invalid response")
-	}
-}
-
-func TestRequestNoBody(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	response := []byte("I will help you")
-	nc.Subscribe("foo", func(m *Msg) {
-		nc.Publish(m.Reply, response)
-	})
-	msg, err := nc.Request("foo", nil, 50*time.Millisecond)
-	if err != nil {
-		t.Fatalf("Received an error on Request test: %s", err)
-	}
-	if !bytes.Equal(msg.Data, response) {
-		t.Fatalf("Received invalid response")
-	}
-}
-
-func TestFlushInCB(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-	ch := make(chan bool)
-
-	nc.Subscribe("foo", func(_ *Msg) {
-		nc.Flush()
-		ch <- true
-	})
-	nc.Publish("foo", []byte("Hello"))
-	if e := wait(ch); e != nil {
-		t.Fatal("Flush did not return properly in callback")
-	}
-}
-
-func TestReleaseFlush(t *testing.T) {
-	nc := newConnection(t)
-	for i := 0; i < 1000; i++ {
-		nc.Publish("foo", []byte("Hello"))
-	}
-	go nc.Close()
-	nc.Flush()
-}
-
-func TestInbox(t *testing.T) {
-	inbox := NewInbox()
-	if matched, _ := regexp.Match(`_INBOX.\S`, []byte(inbox)); !matched {
-		t.Fatal("Bad INBOX format")
-	}
-}
-
-func TestStats(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-
-	data := []byte("The quick brown fox jumped over the lazy dog")
-	iter := 10
-
-	for i := 0; i < iter; i++ {
-		nc.Publish("foo", data)
+	c.processErr("Authorization Violation")
+	select {
+	case cb := <-ach:
+		cb()
+	default:
+		t.Fatal("Expected callback on channel")
 	}
 
-	if nc.OutMsgs != uint64(iter) {
-		t.Fatalf("Not properly tracking OutMsgs: received %d, wanted %d\n", nc.OutMsgs, iter)
-	}
-	obb := uint64(iter * len(data))
-	if nc.OutBytes != obb {
-		t.Fatalf("Not properly tracking OutBytes: received %d, wanted %d\n", nc.OutBytes, obb)
-	}
-
-	// Clear outbound
-	nc.OutMsgs, nc.OutBytes = 0, 0
-
-	// Test both sync and async versions of subscribe.
-	nc.Subscribe("foo", func(_ *Msg) {})
-	nc.SubscribeSync("foo")
-
-	for i := 0; i < iter; i++ {
-		nc.Publish("foo", data)
-	}
-	nc.Flush()
-
-	if nc.InMsgs != uint64(2*iter) {
-		t.Fatalf("Not properly tracking InMsgs: received %d, wanted %d\n", nc.InMsgs, 2*iter)
-	}
-
-	ibb := 2 * obb
-	if nc.InBytes != ibb {
-		t.Fatalf("Not properly tracking InBytes: received %d, wanted %d\n", nc.InBytes, ibb)
-	}
-}
-
-func TestRaceSafeStats(t *testing.T) {
-	nc := newConnection(t)
-	defer nc.Close()
-
-	go nc.Publish("foo", []byte("Hello World"))
-	time.Sleep(200 * time.Millisecond)
-
-	stats := nc.Stats()
-
-	if stats.OutMsgs != uint64(1) {
-		t.Fatalf("Not properly tracking OutMsgs: received %d, wanted %d\n", nc.OutMsgs, 1)
+	select {
+	case err := <-called:
+		if err != ErrAuthorization {
+			t.Fatalf("Expected ErrAuthorization, got: %v", err)
+		}
+	default:
+		t.Fatal("Expected error on channel")
 	}
 }
