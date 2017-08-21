@@ -4,7 +4,7 @@ API Reference
 User creation
 -------------
 
-Creates an user in the database.
+Creates a user in the database.
 
 * Method: POST
 * URI: /user
@@ -13,12 +13,12 @@ Creates an user in the database.
 User removal
 ------------
 
-Removes an user from the database.
+Removes a user from the database.
 
 Key add
 -------
 
-Adds a key to an user in the database and writes it in authorized_keys file from the user running Gandalf.
+Adds a key to a user in the database and writes it in authorized_keys file from the user running Gandalf.
 
 Key removal
 -----------
@@ -30,6 +30,17 @@ Repository creation
 
 Creates a repository in the database and an equivalent bare repository in the filesystem.
 
+* Method: POST
+* URI: /repository
+* Format: JSON
+
+Example URL (http://gandalf-server omitted for clarity)::
+
+    $ curl -XPOST /repository \                  # POST to /repository
+        -d '{"name": "myrepository", \           # Name of the repository
+            "users": ["myuser"], \               # Users with read/write access
+            "readonlyusers": ["alice", "bob"]}'  # Users with read-only access
+
 Repository removal
 ------------------
 
@@ -40,15 +51,62 @@ Repository retrieval
 
 Retrieves information about a repository.
 
+Access set in repository
+--------------------------
+
+Redefines collections of users with read and write access into a repository. Specify ``readonly=yes`` if you'd like to set read-only access.
+
+* Method: PUT
+* URI: /repository/set
+* Format: JSON
+
+Example URL for **read/write** access (http://gandalf-server omitted for clarity)::
+
+    $ curl -XPUT /repository/set \                  # PUT to /repository/set
+        -d '{"repositories": ["myrepo"], \          # Collection of repositories
+            "users": ["john", "james"]}'            # Users with read/write access
+
+Example URL for **read-only** access (http://gandalf-server omitted for clarity)::
+
+    $ curl -XPUT /repository/set?readonly=yes \     # PUT to /repository/set
+        -d '{"repositories": ["myrepo"], \          # Collection of repositories
+            "users": ["bob", "alice"]}'             # Users with read-only access
+
 Access grant in repository
 --------------------------
 
-Grants an user read and write access into a repository.
+Grants a user read and write access into a repository. Specify ``readonly=yes`` if you'd like to grant read-only access.
+
+* Method: POST
+* URI: /repository/grant
+* Format: JSON
+
+Example URL for **read/write** access (http://gandalf-server omitted for clarity)::
+
+    $ curl -XPOST /repository/grant \               # POST to /repository/grant
+        -d '{"repositories": ["myrepo"], \          # Collection of repositories
+            "users": ["john", "james"]}'            # Users with read/write access
+
+Example URL for **read-only** access (http://gandalf-server omitted for clarity)::
+
+    $ curl -XPOST /repository/grant?readonly=yes \  # POST to /repository/grant
+        -d '{"repositories": ["myrepo"], \          # Collection of repositories
+            "users": ["bob", "alice"]}'             # Users with read-only access
 
 Access revoke in repository
 ---------------------------
 
-Revokes an user read and write access from a repository.
+Revokes a user both read **and** write access from a repository.
+
+* Method: DELETE
+* URI: /repository/revoke
+* Format: JSON
+
+Example URL (http://gandalf-server omitted for clarity)::
+
+    $ curl -XDELETE /repository/revoke \            # DELETE to /repository/grant
+        -d '{"repositories": ["myrepo"], \          # Collection of repositories
+            "users": ["john", "james"]}'            # Users with read-only access
 
 Get file contents
 -----------------
@@ -130,8 +188,8 @@ Example URLs (http://gandalf-server omitted for clarity)::
     $ curl /repository/myrepository/archive?ref=master&format=tar.gz     # gets master and tar.gz format
     $ curl /repository/myrepository/archive?ref=0.1.0&format=zip         # gets 0.1.0 tag and zip format
 
-Get branch
------------
+Get branches
+------------
 
 Returns a list of all the branches of the specified `repository`.
 
@@ -152,13 +210,18 @@ Example result::
         createdAt: "Mon Jul 28 10:13:27 2014 -0300"
         author: {
             name: "Author name",
-            email: "author@email.com",
-            date: "Mon Jul 28 10:13:27 2014 -0300""
+            email: "<author@email.com>",
+            date: "Mon Jul 28 10:13:27 2014 -0300"
         },
         committer: {
             name: "Committer name",
-            email: "committer@email.com",
+            email: "<committer@email.com>",
             date: "Tue Jul 29 13:43:57 2014 -0300"
+        },
+        tagger: {
+            date: "",
+            email: "",
+            name: ""
         },
         _links: {
             zipArchive: "/repository/myrepository/branch/archive?ref=master&format=zip",
@@ -170,8 +233,8 @@ Example URL (http://gandalf-server omitted for clarity)::
 
     $ curl /repository/myrepository/branches                  # gets list of branches
 
-Get tag
--------
+Get tags
+--------
 
 Returns a list of all the tags of the specified `repository`.
 
@@ -192,17 +255,50 @@ Example result::
         createdAt: "Mon Jul 28 10:13:27 2014 -0300"
         author: {
             name: "Author name",
-            email: "author@email.com",
-            date: "Mon Jul 28 10:13:27 2014 -0300""
+            email: "<author@email.com>",
+            date: "Mon Jul 28 10:13:27 2014 -0300"
         },
         committer: {
             name: "Committer name",
-            email: "committer@email.com",
+            email: "<committer@email.com>",
             date: "Tue Jul 29 13:43:57 2014 -0300"
+        },
+        tagger: {
+            name: "",
+            email: "",
+            date: ""
         },
         _links: {
             zipArchive: "/repository/myrepository/branch/archive?ref=0.1&format=zip",
             tarArchive: "/repository/myrepository/branch/archive?ref=0.1&format=tar.gz"
+        }
+    }]
+
+Example result for an `annotated tag <https://git-scm.com/book/en/v2/Git-Basics-Tagging#Annotated-Tags>`_::
+
+    [{
+        ref: "6767b5de5943632e47cb6f8bf5b2147bc0be5cf8",
+        name: "0.2",
+        subject: "much WOW",
+        createdAt: "Tue Jul 29 13:43:57 2014 -0300"
+        author: {
+            name: "",
+            email: "",
+            date: ""
+        },
+        committer: {
+            name: "",
+            email: "",
+            date: ""
+        },
+        tagger: {
+            name: "Tagger name",
+            email: "<tagger@email.com>",
+            date: "Tue Jul 29 13:43:57 2014 -0300"
+        },
+        _links: {
+            zipArchive: "/repository/myrepository/branch/archive?ref=0.2&format=zip",
+            tarArchive: "/repository/myrepository/branch/archive?ref=0.2&format=tar.gz"
         }
     }]
 
@@ -216,7 +312,7 @@ Add repository hook
 Create a repository hook.
 
 * Method: POST
-* URI: /repository/hook/`:name`
+* URI: /hook/`:name`
 
 Where:
 
@@ -228,9 +324,9 @@ Where:
         * `pre-receive`
         * `update`
 
-Example URL (http://gandalf-server omitted for clarity)::
+Example URL for bare repository (http://gandalf-server omitted for clarity)::
 
-    $ curl -d '{"repositories": ["some-repo"], "content": "content of my update hook"}' localhost:8000/repository/hook/update
+    $ curl -d '{"content": "content of my post-receive hook"}' localhost:8000/hook/post-receive
 
 You should see the following:
 
@@ -238,4 +334,160 @@ You should see the following:
 
 ::
 
-    hook update successfully created for [some-repo]
+    hook post-receive successfully created
+
+
+Example URL for one or more repositories (http://gandalf-server omitted for clarity)::
+
+    $ curl -d '{"repositories": ["some-repo"], "content": "content of my update hook"}' localhost:8000/hook/update
+
+You should see the following:
+
+.. highlight:: bash
+
+::
+
+    hook update successfully created for some-repo
+
+Commit
+------
+
+Commits a ZIP file into `repository`.
+
+* Method: POST
+* URI: /repository/`:name`/commit
+* Format: MULTIPART
+
+Where:
+
+* `:name` is the name of the repository.
+
+Expects a multipart form with the following fields:
+
+* `message`: The commit message
+* `author-name`: The name of the author
+* `author-email`: The email of the author
+* `committer-name`: The name of the committer
+* `committer-email`: The email of the committer
+* `branch`: The name of the branch this commit will be applied to
+* `zipfile`: A ZIP file with files and directory structure for this commit. These
+  files will copied on top of current repository contents.
+
+Due to files being added over current existing repository contents, it's not
+possible to remove exiting files from the repository. It's only possible to add or
+modify existing ones.
+
+Example URL (http://gandalf-server omitted for clarity)::
+
+    # commit `scaffold.zip` into `myrepository`:
+    $ curl -XPOST /repository/myrepository/commit \
+        -F "message=Repository scaffold" \
+        -F "author-name=Author Name" \
+        -F "author-email=author@email.com" \
+        -F "committer-name=Committer Name" \
+        -F "committer-email=committer@email.com" \
+        -F "branch=master" \
+        -F "zipfile=@scaffold.zip"
+
+Example result::
+
+    {
+        ref: "6767b5de5943632e47cb6f8bf5b2147bc0be5cf8",
+        name: "master",
+        subject: "Repository scaffold",
+        createdAt: "Mon Jul 28 10:13:27 2014 -0300"
+        author: {
+            name: "Author Name",
+            email: "<author@email.com>",
+            date: "Mon Jul 28 10:13:27 2014 -0300"
+        },
+        committer: {
+            name: "Committer Name",
+            email: "<committer@email.com>",
+            date: "Tue Jul 29 13:43:57 2014 -0300"
+        },
+        tagger: {
+            date: "",
+            email: "",
+            name: ""
+        },
+        _links: {
+            tarArchive: "/repository/myrepository/archive?ref=master&format=tar.gz",
+            zipArchive: "/repository/myrepository/archive?ref=master&format=zip",
+        }
+    }
+
+Logs
+----
+
+Returns a list of all commits into `repository`.
+
+* Method: GET
+* URI: /repository/`:name`/logs?ref=:ref&total=:total
+* Format: JSON
+
+Where:
+
+* `:name` is the name of the repository;
+* `:ref` is the repository ref (commit, tag or branch);
+* `:total` is the maximum number of items to retrieve
+
+Example URL (http://gandalf-server omitted for clarity)::
+
+    $ curl /repository/myrepository/logs?ref=HEAD&total=1
+
+Example result::
+
+    {
+        commits: [{
+            ref: "6767b5de5943632e47cb6f8bf5b2147bc0be5cf8",
+            subject: "much WOW",
+            createdAt: "Mon Jul 28 10:13:27 2014 -0300"
+            author: {
+                name: "Author name",
+                email: "<author@email.com>",
+                date: "Mon Jul 28 10:13:27 2014 -0300"
+            },
+            committer: {
+                name: "Committer name",
+                email: "<committer@email.com>",
+                date: "Tue Jul 29 13:43:57 2014 -0300"
+            },
+            parent: [
+                "a367b5de5943632e47cb6f8bf5b2147bc0be5cf8"
+            ]
+        }],
+        next: "1267b5de5943632e47cb6f8bf5b2147bc0be5cf123"
+    }
+
+Namespaces
+----------
+
+Gandalf supports namespaces for repositories and must be informed in the name of the repository followed by a single slash and the actual name of the repository, i.e. `mynamespace/myrepository`. Examples of usage:
+
+* Creates a repository in a namespace:
+
+    * Method: POST
+    * URI: /repository
+    * Format: JSON
+
+    Example URL (http://gandalf-server omitted for clarity)::
+
+        $ curl -XPOST /repository \
+            -d '{"name": "mynamespace/myrepository", \
+                "users": ["myuser"], \
+                "readonlyusers": ["alice", "bob"]}'
+
+* Returns a list of all the branches of the specified `mynamespace/myrepository`.
+
+    * Method: GET
+    * URI: //repository/`:name`/branches
+    * Format: JSON
+
+    Where:
+
+    * `:name` is the name of the repository.
+
+    Example URL (http://gandalf-server omitted for clarity)::
+
+        $ curl /repository/mynamespace/myrepository/branches  # gets list of branches

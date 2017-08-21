@@ -1,4 +1,4 @@
-// Copyright 2014 gandalf authors. All rights reserved.
+// Copyright 2015 gandalf authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -8,10 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tsuru/gandalf/db"
-	"github.com/tsuru/gandalf/hook"
-	"github.com/tsuru/gandalf/repository"
-	"github.com/tsuru/gandalf/user"
 	"io"
 	"io/ioutil"
 	"mime"
@@ -19,8 +15,29 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
+
+	"github.com/gorilla/pat"
+	"github.com/tsuru/config"
+	"github.com/tsuru/gandalf/db"
+	"github.com/tsuru/gandalf/hook"
+	"github.com/tsuru/gandalf/multipartzip"
+	"github.com/tsuru/gandalf/repository"
+	"github.com/tsuru/gandalf/user"
 )
+
+var maxMemory uint
+
+func maxMemoryValue() uint {
+	if maxMemory > 0 {
+		return maxMemory
+	}
+	var err error
+	maxMemory, err = config.GetUint("api:request:maxMemory")
+	if err != nil {
+		panic("You should configure a api:request:maxMemory for gandalf.")
+	}
+	return maxMemory
+}
 
 func accessParameters(body io.ReadCloser) (repositories, users []string, err error) {
 	var params map[string][]string
@@ -38,34 +55,73 @@ func accessParameters(body io.ReadCloser) (repositories, users []string, err err
 	return repositories, users, nil
 }
 
-func GrantAccess(w http.ResponseWriter, r *http.Request) {
-	// TODO: update README
+func SetupRouter() *pat.Router {
+	router := pat.New()
+	router.Post("/user/{name}/key", http.HandlerFunc(addKey))
+	router.Delete("/user/{name}/key/{keyname}", http.HandlerFunc(removeKey))
+	router.Put("/user/{name}/key/{keyname}", http.HandlerFunc(updateKey))
+	router.Get("/user/{name}/keys", http.HandlerFunc(listKeys))
+	router.Post("/user", http.HandlerFunc(newUser))
+	router.Delete("/user/{name}", http.HandlerFunc(removeUser))
+	router.Delete("/repository/revoke", http.HandlerFunc(revokeAccess))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/archive", http.HandlerFunc(getArchive))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/contents", http.HandlerFunc(getFileContents))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/tree", http.HandlerFunc(getTree))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/branches", http.HandlerFunc(getBranches))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/tags", http.HandlerFunc(getTags))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/diff/commits", http.HandlerFunc(getDiff))
+	router.Post("/repository/{name:[^/]*/?[^/]+}/commit", http.HandlerFunc(commit))
+	router.Get("/repository/{name:[^/]*/?[^/]+}/logs", http.HandlerFunc(getLogs))
+	router.Post("/repository/grant", http.HandlerFunc(grantAccess))
+	router.Post("/repository", http.HandlerFunc(newRepository))
+	router.Get("/repository/{name:[^/]*/?[^/]+}", http.HandlerFunc(getRepository))
+	router.Delete("/repository/{name:[^/]*/?[^/]+}", http.HandlerFunc(removeRepository))
+	router.Put("/repository/{name:[^/]*/?[^/]+}", http.HandlerFunc(updateRepository))
+	router.Get("/healthcheck", http.HandlerFunc(healthCheck))
+	router.Post("/hook/{name}", http.HandlerFunc(addHook))
+	return router
+}
+
+func grantAccess(w http.ResponseWriter, r *http.Request) {
 	repositories, users, err := accessParameters(r.Body)
+	readOnly := r.URL.Query().Get("readonly") == "yes"
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := repository.GrantAccess(repositories, users); err != nil {
+	if err := repository.GrantAccess(repositories, users, readOnly); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	fmt.Fprintf(w, "Successfully granted access to users \"%s\" into repository \"%s\"", users, repositories)
+	if readOnly {
+		fmt.Fprintf(w, "Successfully granted read-only access to users \"%s\" into repository \"%s\"", users, repositories)
+	} else {
+		fmt.Fprintf(w, "Successfully granted full access to users \"%s\" into repository \"%s\"", users, repositories)
+	}
 }
 
-func RevokeAccess(w http.ResponseWriter, r *http.Request) {
+func revokeAccess(w http.ResponseWriter, r *http.Request) {
 	repositories, users, err := accessParameters(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := repository.RevokeAccess(repositories, users); err != nil {
+	if err := repository.RevokeAccess(repositories, users, true); err != nil {
+		status := http.StatusInternalServerError
+		if err == repository.ErrRepositoryNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	if err := repository.RevokeAccess(repositories, users, false); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	fmt.Fprintf(w, "Successfully revoked access to users \"%s\" into repositories \"%s\"", users, repositories)
 }
 
-func AddKey(w http.ResponseWriter, r *http.Request) {
+func addKey(w http.ResponseWriter, r *http.Request) {
 	keys := map[string]string{}
 	if err := parseBody(r.Body, &keys); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -92,7 +148,31 @@ func AddKey(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "Key(s) successfully created")
 }
 
-func RemoveKey(w http.ResponseWriter, r *http.Request) {
+func updateKey(w http.ResponseWriter, r *http.Request) {
+	uName := r.URL.Query().Get(":name")
+	kName := r.URL.Query().Get(":keyname")
+	defer r.Body.Close()
+	content, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	key := user.Key{Name: kName, Body: string(content)}
+	if err := user.UpdateKey(uName, key); err != nil {
+		switch err {
+		case user.ErrInvalidKey:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case user.ErrUserNotFound, user.ErrKeyNotFound:
+			http.Error(w, err.Error(), http.StatusNotFound)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	fmt.Fprintf(w, "Key %q successfully updated!", kName)
+}
+
+func removeKey(w http.ResponseWriter, r *http.Request) {
 	uName := r.URL.Query().Get(":name")
 	kName := r.URL.Query().Get(":keyname")
 	if err := user.RemoveKey(uName, kName); err != nil {
@@ -102,7 +182,7 @@ func RemoveKey(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Key \"%s\" successfully removed", kName)
 }
 
-func ListKeys(w http.ResponseWriter, r *http.Request) {
+func listKeys(w http.ResponseWriter, r *http.Request) {
 	uName := r.URL.Query().Get(":name")
 	keys, err := user.ListKeys(uName)
 	if err != nil {
@@ -122,7 +202,7 @@ type jsonUser struct {
 	Keys map[string]string
 }
 
-func NewUser(w http.ResponseWriter, r *http.Request) {
+func newUser(w http.ResponseWriter, r *http.Request) {
 	var usr jsonUser
 	if err := parseBody(r.Body, &usr); err != nil {
 		http.Error(w, "Got error while parsing body: "+err.Error(), http.StatusBadRequest)
@@ -130,39 +210,61 @@ func NewUser(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := user.New(usr.Name, usr.Keys)
 	if err != nil {
-		http.Error(w, "Got error while creating user: "+err.Error(), http.StatusBadRequest)
+		status := http.StatusInternalServerError
+		if err == user.ErrUserAlreadyExists {
+			status = http.StatusConflict
+		}
+		if _, ok := err.(*user.InvalidUserError); ok {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	fmt.Fprintf(w, "User \"%s\" successfully created\n", u.Name)
 }
 
-func RemoveUser(w http.ResponseWriter, r *http.Request) {
+func removeUser(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get(":name")
 	if err := user.Remove(name); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusInternalServerError
+		if err == user.ErrUserNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	fmt.Fprintf(w, "User \"%s\" successfully removed\n", name)
 }
 
-func NewRepository(w http.ResponseWriter, r *http.Request) {
+func newRepository(w http.ResponseWriter, r *http.Request) {
 	var repo repository.Repository
 	if err := parseBody(r.Body, &repo); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rep, err := repository.New(repo.Name, repo.Users, repo.IsPublic)
+	_, err := repository.New(repo.Name, repo.Users, repo.ReadOnlyUsers, repo.IsPublic)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusInternalServerError
+		if err == repository.ErrRepositoryAlreadyExists {
+			status = http.StatusConflict
+		}
+		if _, ok := err.(*repository.InvalidRepositoryError); ok {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
-	fmt.Fprintf(w, "Repository \"%s\" successfully created\n", rep.Name)
+	fmt.Fprintf(w, "Repository \"%s\" successfully created\n", repo.Name)
 }
 
-func GetRepository(w http.ResponseWriter, r *http.Request) {
+func getRepository(w http.ResponseWriter, r *http.Request) {
 	repo, err := repository.Get(r.URL.Query().Get(":name"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		status := http.StatusInternalServerError
+		if err == repository.ErrRepositoryNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	out, err := json.Marshal(&repo)
@@ -173,25 +275,34 @@ func GetRepository(w http.ResponseWriter, r *http.Request) {
 	w.Write(out)
 }
 
-func RemoveRepository(w http.ResponseWriter, r *http.Request) {
+func removeRepository(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get(":name")
 	if err := repository.Remove(name); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if err == repository.ErrRepositoryNotFound {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	fmt.Fprintf(w, "Repository \"%s\" successfully removed\n", name)
 }
 
-func RenameRepository(w http.ResponseWriter, r *http.Request) {
-	var p struct{ Name string }
+func updateRepository(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get(":name")
+	repo, err := repository.Get(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
 	defer r.Body.Close()
-	err := parseBody(r.Body, &p)
+	err = parseBody(r.Body, &repo)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	name := r.URL.Query().Get(":name")
-	err = repository.Rename(name, p.Name)
-	if err != nil && err.Error() == "not found" {
+	err = repository.Update(name, repo)
+	if err != nil && err == repository.ErrRepositoryNotFound {
 		http.Error(w, err.Error(), http.StatusNotFound)
 	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -203,7 +314,7 @@ type repositoryHook struct {
 	Content      string
 }
 
-func AddHook(w http.ResponseWriter, r *http.Request) {
+func addHook(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get(":name")
 	if name != "post-receive" && name != "pre-receive" && name != "update" {
 		http.Error(w,
@@ -220,17 +331,16 @@ func AddHook(w http.ResponseWriter, r *http.Request) {
 	}
 	repos := []string{}
 	if err := json.Unmarshal(body, &params); err != nil {
-		content := strings.NewReader(string(body))
-		if err := hook.Add(name, repos, content); err != nil {
+		if err := hook.Add(name, repos, body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-	}
-	content := strings.NewReader(params.Content)
-	repos = params.Repositories
-	if err := hook.Add(name, repos, content); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	} else {
+		repos = params.Repositories
+		if err := hook.Add(name, repos, []byte(params.Content)); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	if len(repos) > 0 {
 		fmt.Fprint(w, "hook ", name, " successfully created for ", repos, "\n")
@@ -253,7 +363,7 @@ func parseBody(body io.ReadCloser, result interface{}) error {
 	return nil
 }
 
-func HealthCheck(w http.ResponseWriter, r *http.Request) {
+func healthCheck(w http.ResponseWriter, r *http.Request) {
 	conn, err := db.Conn()
 	if err != nil {
 		return
@@ -267,15 +377,24 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("WORKING"))
 }
 
-func GetFileContents(w http.ResponseWriter, r *http.Request) {
+func getMimeType(path string, content []byte) string {
+	extension := filepath.Ext(path)
+	mimeType := mime.TypeByExtension(extension)
+	if mimeType == "" {
+		mimeType = http.DetectContentType(content)
+	}
+	return mimeType
+}
+
+func getFileContents(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get(":name")
 	path := r.URL.Query().Get("path")
 	ref := r.URL.Query().Get("ref")
 	if ref == "" {
 		ref = "master"
 	}
-	if path == "" || repo == "" {
-		err := fmt.Errorf("Error when trying to obtain file %s on ref %s of repository %s (repository and path are required).", path, ref, repo)
+	if path == "" {
+		err := fmt.Errorf("Error when trying to obtain an uknown file on ref %s of repository %s (path is required).", ref, repo)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -284,22 +403,17 @@ func GetFileContents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	extension := filepath.Ext(path)
-	mimeType := mime.TypeByExtension(extension)
-	if mimeType == "" {
-		mimeType = "text/plain; charset=utf-8"
-	}
-	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Type", getMimeType(path, contents))
 	w.Header().Set("Content-Length", strconv.Itoa(len(contents)))
 	w.Write(contents)
 }
 
-func GetArchive(w http.ResponseWriter, r *http.Request) {
+func getArchive(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get(":name")
 	ref := r.URL.Query().Get("ref")
 	format := r.URL.Query().Get("format")
-	if ref == "" || format == "" || repo == "" {
-		err := fmt.Errorf("Error when trying to obtain archive for ref '%s' (format: %s) of repository '%s' (repository, ref and format are required).", ref, format, repo)
+	if ref == "" || format == "" {
+		err := fmt.Errorf("Error when trying to obtain archive for ref '%s' (format: %s) of repository '%s' (ref and format are required).", ref, format, repo)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -330,7 +444,7 @@ func GetArchive(w http.ResponseWriter, r *http.Request) {
 	w.Write(contents)
 }
 
-func GetTree(w http.ResponseWriter, r *http.Request) {
+func getTree(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get(":name")
 	path := r.URL.Query().Get("path")
 	ref := r.URL.Query().Get("ref")
@@ -340,80 +454,60 @@ func GetTree(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "."
 	}
-	if repo == "" {
-		err := fmt.Errorf("Error when trying to obtain tree for path %s on ref %s of repository %s (repository is required).", path, ref, repo)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	tree, err := repository.GetTree(repo, ref, path)
 	if err != nil {
-		err := fmt.Errorf("Error when trying to obtain tree for path %s on ref %s of repository %s (%s).", path, ref, repo, err)
+		err = fmt.Errorf("Error when trying to obtain tree for path %s on ref %s of repository %s (%s).", path, ref, repo, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	b, err := json.Marshal(tree)
 	if err != nil {
-		err := fmt.Errorf("Error when trying to obtain tree for path %s on ref %s of repository %s (%s).", path, ref, repo, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		err = fmt.Errorf("Error when trying to obtain tree for path %s on ref %s of repository %s (%s).", path, ref, repo, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Write(b)
 }
 
-func GetBranches(w http.ResponseWriter, r *http.Request) {
+func getBranches(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get(":name")
-	if repo == "" {
-		err := fmt.Errorf("Error when trying to obtain the branches of repository %s (repository is required).", repo)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	branches, err := repository.GetBranches(repo)
 	if err != nil {
-		err := fmt.Errorf("Error when trying to obtain the branches of repository %s (%s).", repo, err)
+		err = fmt.Errorf("Error when trying to obtain the branches of repository %s (%s).", repo, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	b, err := json.Marshal(branches)
 	if err != nil {
-		err := fmt.Errorf("Error when trying to obtain the branches of repository %s (%s).", repo, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		err = fmt.Errorf("Error when trying to obtain the branches of repository %s (%s).", repo, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Write(b)
 }
 
-func GetTags(w http.ResponseWriter, r *http.Request) {
+func getTags(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get(":name")
 	ref := r.URL.Query().Get("ref")
-	if repo == "" {
-		err := fmt.Errorf("Error when trying to obtain tags on ref %s of repository %s (repository is required).", ref, repo)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	tags, err := repository.GetTags(repo)
 	if err != nil {
-		err := fmt.Errorf("Error when trying to obtain tags on ref %s of repository %s (%s).", ref, repo, err)
+		err = fmt.Errorf("Error when trying to obtain tags on ref %s of repository %s (%s).", ref, repo, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	b, err := json.Marshal(tags)
 	if err != nil {
-		err := fmt.Errorf("Error when trying to obtain tags on ref %s of repository %s (%s).", ref, repo, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		err = fmt.Errorf("Error when trying to obtain tags on ref %s of repository %s (%s).", ref, repo, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Write(b)
 }
 
-func GetDiff(w http.ResponseWriter, r *http.Request) {
+func getDiff(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get(":name")
 	previousCommit := r.URL.Query().Get("previous_commit")
 	lastCommit := r.URL.Query().Get("last_commit")
-	if repo == "" {
-		err := fmt.Errorf("Error when trying to obtain diff between hash commits of repository %s (repository is required).", repo)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	if previousCommit == "" || lastCommit == "" {
 		err := fmt.Errorf("Error when trying to obtain diff between hash commits of repository %s (Hash Commit(s) are required).", repo)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -426,4 +520,77 @@ func GetDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(diff)))
 	w.Write(diff)
+}
+
+func commit(w http.ResponseWriter, r *http.Request) {
+	repo := r.URL.Query().Get(":name")
+	err := r.ParseMultipartForm(int64(maxMemoryValue()))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	form := r.MultipartForm
+	data := map[string]string{
+		"branch":          "",
+		"message":         "",
+		"author-name":     "",
+		"author-email":    "",
+		"committer-name":  "",
+		"committer-email": "",
+	}
+	for key := range data {
+		data[key], err = multipartzip.ValueField(form, key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	commit := repository.GitCommit{
+		Branch:  data["branch"],
+		Message: data["message"],
+		Author: repository.GitUser{
+			Name:  data["author-name"],
+			Email: data["author-email"],
+		},
+		Committer: repository.GitUser{
+			Name:  data["committer-name"],
+			Email: data["committer-email"],
+		},
+	}
+	ref, err := repository.CommitZip(repo, r.MultipartForm.File["zipfile"][0], commit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	b, err := json.Marshal(ref)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write(b)
+}
+
+func getLogs(w http.ResponseWriter, r *http.Request) {
+	repo := r.URL.Query().Get(":name")
+	ref := r.URL.Query().Get("ref")
+	path := r.URL.Query().Get("path")
+	total, err := strconv.Atoi(r.URL.Query().Get("total"))
+	if err != nil {
+		err = fmt.Errorf("Error when trying to obtain logs for ref %s of repository %s (%s).", ref, repo, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	logs, err := repository.GetLogs(repo, ref, total, path)
+	if err != nil {
+		err = fmt.Errorf("Error when trying to obtain logs for ref %s of repository %s (%s).", ref, repo, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	b, err := json.Marshal(logs)
+	if err != nil {
+		err = fmt.Errorf("Error when trying to obtain logs for ref %s of repository %s (%s).", ref, repo, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write(b)
 }

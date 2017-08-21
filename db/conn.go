@@ -1,4 +1,4 @@
-// Copyright 2014 gandalf authors. All rights reserved.
+// Copyright 2015 gandalf authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -25,14 +25,7 @@ type Storage struct {
 // Most gandalf packages should probably use this function. storage.Open is intended for
 // use when supporting more than one database.
 func conn() (*storage.Storage, error) {
-	url, _ := config.GetString("database:url")
-	if url == "" {
-		url = DefaultDatabaseURL
-	}
-	dbname, _ := config.GetString("database:name")
-	if dbname == "" {
-		dbname = DefaultDatabaseName
-	}
+	url, dbname := DbConfig()
 	return storage.Open(url, dbname)
 }
 
@@ -43,6 +36,18 @@ func Conn() (*Storage, error) {
 	)
 	strg.Storage, err = conn()
 	return &strg, err
+}
+
+func DbConfig() (string, string) {
+	url, _ := config.GetString("database:url")
+	if url == "" {
+		url = DefaultDatabaseURL
+	}
+	dbname, _ := config.GetString("database:name")
+	if dbname == "" {
+		dbname = DefaultDatabaseName
+	}
+	return url, dbname
 }
 
 // Repository returns a reference to the "repository" collection in MongoDB.
@@ -56,8 +61,10 @@ func (s *Storage) User() *storage.Collection {
 }
 
 func (s *Storage) Key() *storage.Collection {
-	index := mgo.Index{Key: []string{"body"}, Unique: true}
+	bodyIndex := mgo.Index{Key: []string{"body"}, Unique: true}
+	nameIndex := mgo.Index{Key: []string{"username", "name"}, Unique: true}
 	c := s.Collection("key")
-	c.EnsureIndex(index)
+	c.EnsureIndex(bodyIndex)
+	c.EnsureIndex(nameIndex)
 	return c
 }

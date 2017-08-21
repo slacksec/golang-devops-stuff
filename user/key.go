@@ -1,4 +1,4 @@
-// Copyright 2014 gandalf authors. All rights reserved.
+// Copyright 2015 gandalf authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,22 +6,23 @@ package user
 
 import (
 	"bufio"
-	"code.google.com/p/go.crypto/ssh"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tsuru/config"
-	"github.com/tsuru/gandalf/db"
-	"github.com/tsuru/gandalf/fs"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
 	"io"
 	"os"
 	"os/user"
 	"path"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/tsuru/config"
+	"github.com/tsuru/gandalf/db"
+	"github.com/tsuru/gandalf/fs"
+	tsurufs "github.com/tsuru/tsuru/fs"
+	"golang.org/x/crypto/ssh"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
 var (
@@ -84,7 +85,6 @@ func (k *Key) dump(w io.Writer) error {
 	return nil
 }
 
-// authKey returns the file to write user's keys.
 func authKey() string {
 	if path, _ := config.GetString("authorized-keys-path"); path != "" {
 		return path
@@ -98,22 +98,58 @@ func authKey() string {
 	return path.Join(home, ".ssh", "authorized_keys")
 }
 
-// writeKeys serializes the given key in the authorized_keys file (of the
-// current user).
+// creates a copy of the authorized_keys and returns it, with the file cursor
+// pointing at the first byte of the file.
+func copyFile() (tsurufs.File, error) {
+	path := authKey()
+	fi, statErr := fs.Filesystem().Stat(path)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, statErr
+	}
+	dstPath := path + ".tmp"
+	dst, err := fs.Filesystem().OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if !os.IsNotExist(statErr) {
+		original, err := fs.Filesystem().Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer original.Close()
+		n, err := io.Copy(dst, original)
+		if err != nil {
+			dst.Close()
+			return nil, err
+		}
+		if n != fi.Size() {
+			dst.Close()
+			return nil, io.ErrShortWrite
+		}
+		dst.Seek(0, 0)
+	}
+	return dst, nil
+}
+
+// moveFile writes the authorized key file atomically.
+func moveFile(fromPath string) error {
+	return fs.Filesystem().Rename(fromPath, authKey())
+}
+
 func writeKey(k *Key) error {
-	file, err := fs.Filesystem().OpenFile(authKey(), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	file, err := copyFile()
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
-	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-	return k.dump(file)
+	file.Seek(0, 2)
+	err = k.dump(file)
+	if err != nil {
+		return err
+	}
+	return moveFile(file.Name())
 }
 
-// Writes `key` in authorized_keys file (from current user)
-// It does not writes in the database, there is no need for that since the key
-// object is embedded on the user's document
 func addKey(name, body, username string) error {
 	key, err := newKey(name, username, body)
 	if err != nil {
@@ -134,6 +170,33 @@ func addKey(name, body, username string) error {
 	return writeKey(key)
 }
 
+func updateKey(name, body, username string) error {
+	newK, err := newKey(name, username, body)
+	if err != nil {
+		return err
+	}
+	var oldK Key
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	err = conn.Key().Find(bson.M{"name": name, "username": username}).One(&oldK)
+	if err != nil {
+		return ErrKeyNotFound
+	}
+	err = remove(&oldK)
+	if err != nil {
+		return err
+	}
+	err = writeKey(newK)
+	if err != nil {
+		writeKey(&oldK)
+		return err
+	}
+	return conn.Key().Update(bson.M{"name": name, "username": username}, newK)
+}
+
 func addKeys(keys map[string]string, username string) error {
 	for name, k := range keys {
 		err := addKey(name, k, username)
@@ -146,7 +209,7 @@ func addKeys(keys map[string]string, username string) error {
 
 func remove(k *Key) error {
 	formatted := k.format()
-	file, err := fs.Filesystem().OpenFile(authKey(), os.O_RDWR|os.O_EXCL, 0644)
+	file, err := copyFile()
 	if err != nil {
 		return err
 	}
@@ -170,7 +233,7 @@ func remove(k *Key) error {
 	if n != len(content) {
 		return io.ErrShortWrite
 	}
-	return nil
+	return moveFile(file.Name())
 }
 
 func removeUserKeys(username string) error {
@@ -227,7 +290,8 @@ func ListKeys(uName string) (KeyList, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	if n, err := conn.User().FindId(uName).Count(); err != nil || n != 1 {
+	n, err := conn.User().FindId(uName).Count()
+	if err != nil || n != 1 {
 		return nil, ErrUserNotFound
 	}
 	var keys []Key

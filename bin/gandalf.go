@@ -8,11 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/tsuru/config"
-	"github.com/tsuru/gandalf/db"
-	"github.com/tsuru/gandalf/repository"
-	"github.com/tsuru/gandalf/user"
-	"gopkg.in/mgo.v2/bson"
 	"io"
 	"log/syslog"
 	"os"
@@ -20,6 +15,12 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/tsuru/config"
+	"github.com/tsuru/gandalf/db"
+	"github.com/tsuru/gandalf/repository"
+	"github.com/tsuru/gandalf/user"
+	"gopkg.in/mgo.v2/bson"
 )
 
 var log *syslog.Writer
@@ -38,6 +39,11 @@ func hasReadPermission(u *user.User, r *repository.Repository) (allowed bool) {
 		return true
 	}
 	for _, userName := range r.Users {
+		if u.Name == userName {
+			return true
+		}
+	}
+	for _, userName := range r.ReadOnlyUsers {
 		if u.Name == userName {
 			return true
 		}
@@ -63,7 +69,7 @@ func action() string {
 // and gets the repository from the database based on the info
 // obtained by the SSH_ORIGINAL_COMMAND parse.
 func requestedRepository() (repository.Repository, error) {
-	repoName, err := requestedRepositoryName()
+	_, repoName, err := parseGitCommand()
 	if err != nil {
 		return repository.Repository{}, err
 	}
@@ -79,30 +85,27 @@ func requestedRepository() (repository.Repository, error) {
 	return repo, nil
 }
 
-func requestedRepositoryName() (string, error) {
-	r, err := regexp.Compile(`[\w-]+ '/?([\w-]+)\.git'`)
+// Checks whether a command is a valid git command
+// The following format is allowed:
+// (git-[a-z-]+) '/?([\w-+@][\w-+.@]*/)?([\w-]+)\.git'
+func parseGitCommand() (command, name string, err error) {
+	// The following regex validates the git command, which is in the form:
+	//    <git-command> [<namespace>/]<name>
+	// with namespace being optional. If a namespace is used, we validate it
+	// according to the following:
+	//  - a namespace is optional
+	//  - a namespace contains only alphanumerics, underlines, @´s, -´s, +´s
+	//    and periods but it does not start with a period (.)
+	//  - one and exactly one slash (/) separates namespace and the actual name
+	r, err := regexp.Compile(`(git-[a-z-]+) '/?([\w-+@][\w-+.@]*/)?([\w-]+)\.git'`)
 	if err != nil {
 		panic(err)
 	}
 	m := r.FindStringSubmatch(os.Getenv("SSH_ORIGINAL_COMMAND"))
-	if len(m) < 2 {
-		return "", errors.New("Cannot deduce repository name from command. You are probably trying to do something nasty")
+	if len(m) != 4 {
+		return "", "", errors.New("You've tried to execute some weird command, I'm deliberately denying you to do that, get over it.")
 	}
-	return m[1], nil
-}
-
-// Checks whether a command is a valid git command
-// The following format is allowed:
-//  git-([\w-]+) '([\w-]+)\.git'
-func validateCmd() error {
-	r, err := regexp.Compile(`git-([\w-]+) '/?([\w-]+)\.git'`)
-	if err != nil {
-		panic(err)
-	}
-	if m := r.FindStringSubmatch(os.Getenv("SSH_ORIGINAL_COMMAND")); len(m) < 3 {
-		return errors.New("You've tried to execute some weird command, I'm deliberately denying you to do that, get over it.")
-	}
-	return nil
+	return m[1], m[2] + m[3], nil
 }
 
 // Executes the SSH_ORIGINAL_COMMAND based on the condition
@@ -116,7 +119,7 @@ func executeAction(f func(*user.User, *repository.Repository) bool, errMsg strin
 		return
 	}
 	defer conn.Close()
-	if err := conn.User().Find(bson.M{"_id": os.Args[1]}).One(&u); err != nil {
+	if err = conn.User().Find(bson.M{"_id": os.Args[1]}).One(&u); err != nil {
 		log.Err("Error obtaining user. Gandalf database is probably in an inconsistent state.")
 		fmt.Fprintln(os.Stderr, "Error obtaining user. Gandalf database is probably in an inconsistent state.")
 		return
@@ -138,6 +141,9 @@ func executeAction(f func(*user.User, *repository.Repository) bool, errMsg strin
 		cmd := exec.Command(c[0], c[1:]...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = stdout
+		baseEnv := os.Environ()
+		baseEnv = append(baseEnv, "TSURU_USER="+u.Name)
+		cmd.Env = baseEnv
 		stderr := &bytes.Buffer{}
 		cmd.Stderr = stderr
 		err = cmd.Run()
@@ -161,21 +167,18 @@ func formatCommand() ([]string, error) {
 		log.Err(err.Error())
 		return []string{}, err
 	}
-	repoName, err := requestedRepositoryName()
+	_, repoName, err := parseGitCommand()
 	if err != nil {
 		log.Err(err.Error())
 		return []string{}, err
 	}
 	repoName += ".git"
 	cmdList := strings.Split(os.Getenv("SSH_ORIGINAL_COMMAND"), " ")
-	for i, c := range cmdList {
-		c = strings.Trim(c, "'")
-		c = strings.Trim(c, "/")
-		if c == repoName {
-			cmdList[i] = path.Join(p, repoName)
-			break
-		}
+	if len(cmdList) != 2 {
+		log.Err("Malformed git command")
+		return []string{}, fmt.Errorf("Malformed git command")
 	}
+	cmdList[1] = path.Join(p, repoName)
 	return cmdList, nil
 }
 
@@ -192,7 +195,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return
 	}
-	err = validateCmd()
+	_, _, err = parseGitCommand()
 	if err != nil {
 		log.Err(err.Error())
 		fmt.Fprintln(os.Stderr, err.Error())
