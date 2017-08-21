@@ -1,80 +1,86 @@
-# Throttled
+# Throttled [![build status](https://secure.travis-ci.org/throttled/throttled.svg)](https://travis-ci.org/throttled/throttled) [![GoDoc](https://godoc.org/gopkg.in/throttled/throttled.v2?status.svg)](https://godoc.org/gopkg.in/throttled/throttled.v2)
 
-[![build status](https://secure.travis-ci.org/PuerkitoBio/throttled.png)](http://travis-ci.org/PuerkitoBio/throttled)
+Package throttled implements rate limiting using the [generic cell rate
+algorithm][gcra] to limit access to resources such as HTTP endpoints.
 
-Package throttled implements different throttling strategies for controlling
-access to HTTP handlers.
+The 2.0.0 release made some major changes to the throttled API. If
+this change broke your code in problematic ways or you wish a feature
+of the old API had been retained, please open an issue.  We don't
+guarantee any particular changes but would like to hear more about
+what our users need. Thanks!
 
 ## Installation
 
-`go get github.com/PuerkitoBio/throttled/...`
-
-## Inverval
-
-The Interval function creates a throttler that allows requests to go through at
-a controlled, constant interval. The interval may be applied to all requests
-(vary argument == nil) or independently based on vary-by criteria.
-
-For example:
-
-    th := throttled.Interval(throttled.PerSec(10), 100, &throttled.VaryBy{Path: true}, 50)
-    h := th.Throttle(myHandler)
-    http.ListenAndServe(":9000", h)
-
-Creates a throttler that will allow a request each 100ms (10 requests per second), with
-a buffer of 100 exceeding requests before dropping requests with a status code 429 (by
-default, configurable using th.DeniedHandler or the package-global DefaultDeniedHandler
-variable). Different paths will be throttled independently, so that /path_a and /path_b
-both can serve 10 requests per second. The last argument, 50, indicates the maximum number
-of keys that the throttler will keep in memory.
-
-## MemStats
-
-The MemStats function creates a throttler that allows requests to go through only if
-the memory statistics of the current process are below specified thresholds.
-
-For example:
-
-    th := throttled.MemStats(throttled.MemThresholds(&runtime.MemStats{NumGC: 10}, 10*time.Millisecond)
-    h := th.Throttle(myHandler)
-    http.ListenAndServe(":9000", h)
-
-Creates a throttler that will allow requests to go through until the number of garbage
-collections reaches the initial number + 10 (the MemThresholds function creates absolute
-memory stats thresholds from offsets). The second argument, 10ms, indicates the refresh
-rate of the memory stats.
-
-## RateLimit
-
-The RateLimit function creates a throttler that allows a certain number of requests in
-a given time window, as is often implemented in public RESTful APIs.
-
-For example:
-
-    th := throttled.RateLimit(throttled.PerMin(30), &throttled.VaryBy{RemoteAddr: true}, store.NewMemStore(1000))
-    h := th.Throttle(myHandler)
-    http.ListenAndServe(":9000", h)
-
-Creates a throttler that will limit requests to 30 per minute, based on the remote address
-of the client, and will store the counter and remaining time of the current window in the
-provided memory store, limiting the number of keys to keep in memory to 1000. The store
-sub-package also provides a Redis-based Store implementations.
-
-The RateLimit throttler sets the expected X-RateLimit-* headers on the response, and
-also sets a Retry-After header when the limit is exceeded.
+throttled uses gopkg.in for semantic versioning:
+`go get gopkg.in/throttled/throttled.v2`
 
 ## Documentation
 
-The API documentation is available as usual on [godoc.org][doc].
+API documentation is available on [godoc.org][doc]. The following
+example demonstrates the usage of HTTPLimiter for rate-limiting access
+to an http.Handler to 20 requests per path per minute with bursts of
+up to 5 additional requests:
 
-There is also a [blog post explaining the package's usage on 0value.com][blog].
+```go
+store, err := memstore.New(65536)
+if err != nil {
+	log.Fatal(err)
+}
 
-Finally, many examples are provided in the /examples sub-folder of the repository.
+quota := throttled.RateQuota{throttled.PerMin(20), 5}
+rateLimiter, err := throttled.NewGCRARateLimiter(store, quota)
+if err != nil {
+	log.Fatal(err)
+}
+
+httpRateLimiter := throttled.HTTPRateLimiter{
+	RateLimiter: rateLimiter,
+	VaryBy:      &throttled.VaryBy{Path: true},
+}
+
+http.ListenAndServe(":8080", httpRateLimiter.RateLimit(myHandler))
+```
+
+## Contributing
+
+Since throttled uses gopkg.in for versioning, running `go get` against
+a fork or cloning from Github to the default path will break
+imports. Instead, use the following process for setting up your
+environment and contributing:
+
+```sh
+# Retrieve the source and dependencies.
+go get gopkg.in/throttled/throttled.v2/...
+
+# Fork the project on Github. For all following directions replace
+# <username> with your Github username. Add your fork as a remote.
+cd $GOPATH/src/gopkg.in/throttled/throttled.v2
+git remote add fork git@github.com:<username>/throttled.git
+
+# Create a branch, make your changes, test them and commit.
+git checkout -b my-new-feature
+# <do some work>
+make test 
+git commit -a
+git push -u fork my-new-feature
+```
+
+When your changes are ready, [open a pull request][pr] using "compare
+across forks".
+
+## Related Projects
+
+See [throttled/gcra][throttled-gcra] for a list of other projects related to
+rate limiting and GCRA.
 
 ## License
 
-The [BSD 3-clause license][bsd]. Copyright (c) 2014 Martin Angers.
+The [BSD 3-clause license][bsd]. Copyright (c) 2014 Martin Angers and contributors.
 
-[doc]: http://godoc.org/github.com/PuerkitoBio/throttled
 [blog]: http://0value.com/throttled--guardian-of-the-web-server
-[bsd]: http://opensource.org/licenses/BSD-3-Clause
+[bsd]: https://opensource.org/licenses/BSD-3-Clause
+[doc]: https://godoc.org/gopkg.in/throttled/throttled.v2
+[gcra]: https://en.wikipedia.org/wiki/Generic_cell_rate_algorithm
+[puerkitobio]: https://github.com/puerkitobio/
+[pr]: https://github.com/throttled/throttled/compare
+[throttled-gcra]: https://github.com/throttled/gcra
