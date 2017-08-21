@@ -1,6 +1,8 @@
-// Copyright (C) 2014 Jakob Borg and Contributors (see the CONTRIBUTORS file).
-// All rights reserved. Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -9,43 +11,37 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
-	"github.com/syncthing/syncthing/files"
-	"github.com/syncthing/syncthing/protocol"
-	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syncthing/syncthing/lib/db"
 )
 
 func main() {
+	var mode string
 	log.SetFlags(0)
 	log.SetOutput(os.Stdout)
 
-	repo := flag.String("repo", "default", "Repository ID")
-	node := flag.String("node", "", "Node ID (blank for global)")
+	flag.StringVar(&mode, "mode", "dump", "Mode of operation: dump, dumpsize")
+
 	flag.Parse()
 
-	db, err := leveldb.OpenFile(flag.Arg(0), nil)
+	path := flag.Arg(0)
+	if path == "" {
+		path = filepath.Join(defaultConfigDir(), "index-v0.14.0.db")
+	}
+
+	fmt.Println("Path:", path)
+
+	ldb, err := db.Open(path)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fs := files.NewSet(*repo, db)
-
-	if *node == "" {
-		log.Printf("*** Global index for repo %q", *repo)
-		fs.WithGlobal(func(f protocol.FileInfo) bool {
-			fmt.Println(f)
-			fmt.Println("\t", fs.Availability(f.Name))
-			return true
-		})
+	if mode == "dump" {
+		dump(ldb)
+	} else if mode == "dumpsize" {
+		dumpsize(ldb)
 	} else {
-		n, err := protocol.NodeIDFromString(*node)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("*** Have index for repo %q node %q", *repo, n)
-		fs.WithHave(n, func(f protocol.FileInfo) bool {
-			fmt.Println(f)
-			return true
-		})
+		fmt.Println("Unknown mode")
 	}
 }
