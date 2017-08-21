@@ -7,42 +7,53 @@ import (
 	"github.com/abhishekkr/gol/golconfig"
 )
 
-type Config map[string]string
-
 // flags
 var (
-	flag_config     = flag.String("config", "", "the path to overriding config file")
-	flag_dbpath     = flag.String("dbpath", "/tmp/GO.DB", "the path to DB")
-	flag_server_uri = flag.String("server-uri", "0.0.0.0", "what Port to Run HTTP Server at")
-	flag_http_port  = flag.String("http-port", "9999", "what Port to Run HTTP Server at")
-	flag_rep_ports  = flag.String("rep-ports", "9898,9797", "what PORT to run ZMQ REP at")
-	flag_cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+	flagConfig = flag.String("config", "", "the path to overriding config file")
+
+	flagDBEngine = flag.String("DBEngine", "leveldb", "the type of KeyVal DB backend to be used")
+	flagNSEngine = flag.String("NSEngine", "delimited", "the type of NameSpace DB backend to be used")
+	flagTSEngine = flag.String("TSEngine", "namespace", "the type of TimeSeries backend to be used")
+
+	flagDBPath     = flag.String("DBPath", "/tmp/GO.DB", "the path to DB")
+	flagServerUri  = flag.String("server-uri", "0.0.0.0", "what Port to Run HTTP Server at")
+	flagHTTPPort   = flag.String("http-port", "9999", "what Port to Run HTTP Server at")
+	flagRepPorts   = flag.String("rep-ports", "9898,9797", "what PORT to run ZMQ REP at")
+	flagCPUProfile = flag.String("cpuprofile", "", "write cpu profile to file")
 )
 
-/* assign val to *key only if it's empty */
-func assignIfEmpty(mapper Config, key string, val string) {
+/* assignIfEmpty assigns val to *key only if it's empty */
+func assignIfEmpty(mapper golconfig.FlatConfig, key string, val string) {
 	if mapper[key] == "" {
 		mapper[key] = val
 	}
 }
 
-/* config from flags */
-func ConfigFromFlags() Config {
+/*
+ConfigFromFlags configs from values provided to flags.
+*/
+func ConfigFromFlags() golconfig.FlatConfig {
 	flag.Parse()
 
-	var config Config
-	config = make(Config)
-	if *flag_config != "" {
-		config_file := golconfig.GetConfig("json")
-		config_file.ConfigFromFile(*flag_config, &config)
+	var config golconfig.FlatConfig
+	config = make(golconfig.FlatConfig)
+	if *flagConfig != "" {
+		configFile := golconfig.GetConfigurator("json")
+		configFile.ConfigFromFile(*flagConfig, &config)
 	}
 
-	assignIfEmpty(config, "dbpath", *flag_dbpath)
-	assignIfEmpty(config, "server-uri", *flag_server_uri)
-	assignIfEmpty(config, "http-port", *flag_http_port)
-	assignIfEmpty(config, "rep-ports", *flag_rep_ports)
-	assignIfEmpty(config, "cpuprofile", *flag_cpuprofile)
+	assignIfEmpty(config, "DBEngine", *flagDBEngine)
+	assignIfEmpty(config, "NSEngine", *flagNSEngine)
+	assignIfEmpty(config, "TSEngine", *flagTSEngine)
+	assignIfEmpty(config, "DBPath", *flagDBPath)
+	assignIfEmpty(config, "server-uri", *flagServerUri)
+	assignIfEmpty(config, "http-port", *flagHTTPPort)
+	assignIfEmpty(config, "rep-ports", *flagRepPorts)
+	assignIfEmpty(config, "cpuprofile", *flagCPUProfile)
 
-	fmt.Println("Starting for:", config)
+	fmt.Println("GoShare config:")
+	for cfg, val := range config {
+		fmt.Printf("[ %v : %v ]\n", cfg, val)
+	}
 	return config
 }
