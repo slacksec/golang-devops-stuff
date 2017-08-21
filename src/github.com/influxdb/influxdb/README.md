@@ -1,35 +1,71 @@
-InfluxDB [![Build Status](https://travis-ci.org/influxdb/influxdb.png?branch=master)](https://travis-ci.org/influxdb/influxdb)
-=========
+# InfluxDB [![Circle CI](https://circleci.com/gh/influxdata/influxdb/tree/master.svg?style=svg)](https://circleci.com/gh/influxdata/influxdb/tree/master) [![Go Report Card](https://goreportcard.com/badge/github.com/influxdata/influxdb)](https://goreportcard.com/report/github.com/influxdata/influxdb) [![Docker pulls](https://img.shields.io/docker/pulls/library/influxdb.svg)](https://hub.docker.com/_/influxdb/)
 
-InfluxDB is an open source **distributed time series database** with
+## An Open-Source Time Series Database
+
+InfluxDB is an open source **time series database** with
 **no external dependencies**. It's useful for recording metrics,
 events, and performing analytics.
 
-It has a built-in HTTP API so you don't have to write any server side
-code to get up and running.
+## Features
 
-InfluxDB is designed to be scalable, simple to install and manage, and
-fast to get data in and out.
+* Built-in [HTTP API](https://docs.influxdata.com/influxdb/latest/guides/writing_data/) so you don't have to write any server side code to get up and running.
+* Data can be tagged, allowing very flexible querying.
+* SQL-like query language.
+* Simple to install and manage, and fast to get data in and out.
+* It aims to answer queries in real-time. That means every data point is
+  indexed as it comes in and is immediately available in queries that
+  should return in < 100ms.
 
-It aims to answer queries in real-time. That means every data point is
-indexed as it comes in and is immediately available in queries that
-should return in < 100ms.
+## Installation
 
-## Quickstart
+We recommend installing InfluxDB using one of the [pre-built packages](https://influxdata.com/downloads/#influxdb). Then start InfluxDB using:
 
-* Understand the [design goals and motivations of the project](http://influxdb.org/docs/v0.7/introduction/overview.html).
-* Follow the [getting started guide](http://influxdb.org/docs/v0.7/introduction/getting_started.html) to find out how to install InfluxDB, start writing data, and issue queries - in just a few minutes.
-* See the
-  [list of libraries for different languages](http://influxdb.com/docs/v0.7/client_libraries/javascript.html),
-  or check out the
-  [HTTP API documentation to start writing a library for your favorite language](http://influxdb.org/docs/v0.7/api/reading_and_writing_data.html).
+* `service influxdb start` if you have installed InfluxDB using an official Debian or RPM package.
+* `systemctl start influxdb` if you have installed InfluxDB using an official Debian or RPM package, and are running a distro with `systemd`. For example, Ubuntu 15 or later.
+* `$GOPATH/bin/influxd` if you have built InfluxDB from source.
 
-## Building
+## Getting Started
 
-You don't need to build the project to use it. Pre-built
-[binaries and instructions to install InfluxDB are here](http://influxdb.org/docs/v0.7/introduction/installation.html). That's
-the recommended way to get it running. However, if you want to
-contribute to the core of InfluxDB, you'll need to build. For those
-adventurous enough, you can
-[follow along on our docs](http://github.com/influxdb/influxdb/blob/master/docs/contributing.md)
+### Create your first database
 
+```
+curl -XPOST 'http://localhost:8086/query' --data-urlencode "q=CREATE DATABASE mydb"
+```
+
+### Insert some data
+```
+curl -XPOST 'http://localhost:8086/write?db=mydb' \
+-d 'cpu,host=server01,region=uswest load=42 1434055562000000000'
+
+curl -XPOST 'http://localhost:8086/write?db=mydb' \
+-d 'cpu,host=server02,region=uswest load=78 1434055562000000000'
+
+curl -XPOST 'http://localhost:8086/write?db=mydb' \
+-d 'cpu,host=server03,region=useast load=15.4 1434055562000000000'
+```
+
+### Query for the data
+```JSON
+curl -G http://localhost:8086/query?pretty=true --data-urlencode "db=mydb" \
+--data-urlencode "q=SELECT * FROM cpu WHERE host='server01' AND time < now() - 1d"
+```
+
+### Analyze the data
+```JSON
+curl -G http://localhost:8086/query?pretty=true --data-urlencode "db=mydb" \
+--data-urlencode "q=SELECT mean(load) FROM cpu WHERE region='uswest'"
+```
+
+## Documentation
+
+* Read more about the [design goals and motivations of the project](https://docs.influxdata.com/influxdb/latest/).
+* Follow the [getting started guide](https://docs.influxdata.com/influxdb/latest/introduction/getting_started/) to learn the basics in just a few minutes.
+* Learn more about [InfluxDB's key concepts](https://docs.influxdata.com/influxdb/latest/guides/writing_data/).
+
+## Contributing
+
+If you're feeling adventurous and want to contribute to InfluxDB, see our [contributing doc](https://github.com/influxdata/influxdb/blob/master/CONTRIBUTING.md) for info on how to make feature requests, build from source, and run tests.
+
+## Looking for Support?
+
+InfluxDB offers a number of services to help your project succeed. We offer Developer Support for organizations in active development, Managed Hosting to make it easy to move into production, and Enterprise Support for companies requiring the best response times, SLAs, and technical fixes. Visit our [support page](https://influxdata.com/services/) or contact [sales@influxdb.com](mailto:sales@influxdb.com) to learn how we can best help you succeed.
