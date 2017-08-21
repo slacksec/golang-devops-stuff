@@ -17,7 +17,7 @@ func TestTCPOutput(t *testing.T) {
 		wg.Done()
 	})
 	input := NewTestInput()
-	output := NewTCPOutput(listener.Addr().String())
+	output := NewTCPOutput(listener.Addr().String(), &TCPOutputConfig{})
 
 	Plugins.Inputs = []io.Reader{input}
 	Plugins.Outputs = []io.Writer{output}
@@ -35,7 +35,7 @@ func TestTCPOutput(t *testing.T) {
 }
 
 func startTCP(cb func([]byte)) net.Listener {
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 
 	if err != nil {
 		log.Fatal("Can't start:", err)
@@ -44,22 +44,16 @@ func startTCP(cb func([]byte)) net.Listener {
 	go func() {
 		for {
 			conn, _ := listener.Accept()
-			
+			defer conn.Close()
+
 			go func() {
 				reader := bufio.NewReader(conn)
-				for {
-					buf,err := reader.ReadBytes('¶')
-					new_buf_len := len(buf) - 2
-					new_buf := make([]byte, new_buf_len)
-					copy(new_buf, buf[:new_buf_len])
-					if err != nil {
-						if err != io.EOF {
-							log.Printf("error: %s\n", err)
-						}
-					}
-					cb(new_buf)
+				scanner := bufio.NewScanner(reader)
+				scanner.Split(payloadScanner)
+
+				for scanner.Scan() {
+					cb(scanner.Bytes())
 				}
-				conn.Close()
 			}()
 		}
 	}()
@@ -75,7 +69,7 @@ func BenchmarkTCPOutput(b *testing.B) {
 		wg.Done()
 	})
 	input := NewTestInput()
-	output := NewTCPOutput(listener.Addr().String())
+	output := NewTCPOutput(listener.Addr().String(), &TCPOutputConfig{})
 
 	Plugins.Inputs = []io.Reader{input}
 	Plugins.Outputs = []io.Writer{output}

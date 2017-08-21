@@ -5,10 +5,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/http/httputil"
 	"os"
-	"runtime/debug"
+	"os/signal"
+	"runtime"
+	_ "runtime/debug"
 	"runtime/pprof"
+	"syscall"
 	"time"
 )
 
@@ -18,20 +24,46 @@ var (
 	memprofile = flag.String("memprofile", "", "write memory profile to this file")
 )
 
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rb, _ := httputil.DumpRequest(r, false)
+		log.Println(string(rb))
+		next.ServeHTTP(w, r)
+	})
+}
+
+var closeCh chan int
+
 func main() {
-	// Don't exit on panic
-	defer func() {
-		if r := recover(); r != nil {
-			if _, ok := r.(error); !ok {
-				fmt.Printf("PANIC: pkg: %v %s \n", r, debug.Stack())
-			}
+	closeCh = make(chan int)
+	// // Don't exit on panic
+	// defer func() {
+	// 	if r := recover(); r != nil {
+	// 		fmt.Printf("PANIC: pkg: %v %s \n", r, debug.Stack())
+	// 	}
+	// }()
+
+	// If not set via env cariable
+	if len(os.Getenv("GOMAXPROCS")) == 0 {
+		runtime.GOMAXPROCS(runtime.NumCPU() * 2)
+	}
+
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "file-server" {
+		if len(args) != 2 {
+			log.Fatal("You should specify port and IP (optional) for the file server. Example: `gor file-server :80`")
 		}
-	}()
+		dir, _ := os.Getwd()
+
+		log.Println("Started example file server for current directory on address ", args[1])
+
+		log.Fatal(http.ListenAndServe(args[1], loggingMiddleware(http.FileServer(http.Dir(dir)))))
+	} else {
+		flag.Parse()
+		InitPlugins()
+	}
 
 	fmt.Println("Version:", VERSION)
-
-	flag.Parse()
-	InitPlugins()
 
 	if len(Plugins.Inputs) == 0 || len(Plugins.Outputs) == 0 {
 		log.Fatal("Required at least 1 input and 1 output")
@@ -45,7 +77,33 @@ func main() {
 		profileCPU(*cpuprofile)
 	}
 
-	Start(nil)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		finalize()
+		os.Exit(1)
+	}()
+
+	if Settings.exitAfter > 0 {
+		log.Println("Running gor for a duration of", Settings.exitAfter)
+		closeCh = make(chan int)
+
+		time.AfterFunc(Settings.exitAfter, func() {
+			log.Println("Stopping gor after", Settings.exitAfter)
+			close(closeCh)
+		})
+	}
+
+	Start(closeCh)
+}
+
+func finalize() {
+	for _, p := range Plugins.All {
+		if cp, ok := p.(io.Closer); ok {
+			cp.Close()
+		}
+	}
 }
 
 func profileCPU(cpuprofile string) {
@@ -56,10 +114,10 @@ func profileCPU(cpuprofile string) {
 		}
 		pprof.StartCPUProfile(f)
 
-		time.AfterFunc(60*time.Second, func() {
+		time.AfterFunc(30*time.Second, func() {
 			pprof.StopCPUProfile()
 			f.Close()
-			log.Println("Stop profiling after 60 seconds")
+			log.Println("Stop profiling after 30 seconds")
 		})
 	}
 }
@@ -70,7 +128,7 @@ func profileMEM(memprofile string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		time.AfterFunc(60*time.Second, func() {
+		time.AfterFunc(30*time.Second, func() {
 			pprof.WriteHeapProfile(f)
 			f.Close()
 		})

@@ -2,24 +2,14 @@ package main
 
 import (
 	"io"
-	"net"
+	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
+	_ "net/http/httputil"
 	"sync"
 	"testing"
 	"time"
 )
-
-func startHTTP(cb func(*http.Request)) net.Listener {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		go cb(r)
-	})
-
-	listener, _ := net.Listen("tcp", ":0")
-
-	go http.Serve(listener, handler)
-
-	return listener
-}
 
 func TestHTTPOutput(t *testing.T) {
 	wg := new(sync.WaitGroup)
@@ -27,10 +17,7 @@ func TestHTTPOutput(t *testing.T) {
 
 	input := NewTestInput()
 
-	headers := HTTPHeaders{HTTPHeader{"User-Agent", "Gor"}}
-	methods := HTTPMethods{"GET", "PUT", "POST"}
-
-	listener := startHTTP(func(req *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Header.Get("User-Agent") != "Gor" {
 			t.Error("Wrong header")
 		}
@@ -39,18 +26,36 @@ func TestHTTPOutput(t *testing.T) {
 			t.Error("Wrong method")
 		}
 
+		if req.Method == "POST" {
+			defer req.Body.Close()
+			body, _ := ioutil.ReadAll(req.Body)
+
+			if string(body) != "a=1&b=2" {
+				t.Error("Wrong POST body:", string(body))
+			}
+		}
+
+		wg.Done()
+	}))
+	defer server.Close()
+
+	headers := HTTPHeaders{HTTPHeader{"User-Agent", "Gor"}}
+	methods := HTTPMethods{[]byte("GET"), []byte("PUT"), []byte("POST")}
+	Settings.modifierConfig = HTTPModifierConfig{headers: headers, methods: methods}
+
+	http_output := NewHTTPOutput(server.URL, &HTTPOutputConfig{Debug: true, TrackResponses: true})
+	output := NewTestOutput(func(data []byte) {
 		wg.Done()
 	})
 
-	output := NewHTTPOutput(listener.Addr().String(), headers, methods, HTTPUrlRegexp{}, HTTPHeaderFilters{}, HTTPHeaderHashFilters{})
-
 	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	Plugins.Outputs = []io.Writer{http_output, output}
 
 	go Start(quit)
 
-	for i := 0; i < 100; i++ {
-		wg.Add(2)
+	for i := 0; i < 1; i++ {
+		// 2 http-output, 2 - test output request, 2 - test output http response
+		wg.Add(6) // OPTIONS should be ignored
 		input.EmitPOST()
 		input.EmitOPTIONS()
 		input.EmitGET()
@@ -59,23 +64,83 @@ func TestHTTPOutput(t *testing.T) {
 	wg.Wait()
 
 	close(quit)
+
+	Settings.modifierConfig = HTTPModifierConfig{}
+}
+
+func TestHTTPOutputKeepOriginalHost(t *testing.T) {
+	wg := new(sync.WaitGroup)
+	quit := make(chan int)
+
+	input := NewTestInput()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Host != "custom-host.com" {
+			t.Error("Wrong header", req.Host)
+		}
+
+		wg.Done()
+	}))
+	defer server.Close()
+
+	headers := HTTPHeaders{HTTPHeader{"Host", "custom-host.com"}}
+	Settings.modifierConfig = HTTPModifierConfig{headers: headers}
+
+	output := NewHTTPOutput(server.URL, &HTTPOutputConfig{Debug: false, OriginalHost: true})
+
+	Plugins.Inputs = []io.Reader{input}
+	Plugins.Outputs = []io.Writer{output}
+
+	go Start(quit)
+
+	wg.Add(1)
+	input.EmitGET()
+
+	wg.Wait()
+
+	close(quit)
+
+	Settings.modifierConfig = HTTPModifierConfig{}
+}
+
+func TestOutputHTTPSSL(t *testing.T) {
+	wg := new(sync.WaitGroup)
+	quit := make(chan int)
+
+	// Origing and Replay server initialization
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wg.Done()
+	}))
+
+	input := NewTestInput()
+	output := NewHTTPOutput(server.URL, &HTTPOutputConfig{})
+
+	Plugins.Inputs = []io.Reader{input}
+	Plugins.Outputs = []io.Writer{output}
+
+	go Start(quit)
+
+	wg.Add(2)
+
+	input.EmitPOST()
+	input.EmitGET()
+
+	wg.Wait()
+	close(quit)
 }
 
 func BenchmarkHTTPOutput(b *testing.B) {
 	wg := new(sync.WaitGroup)
 	quit := make(chan int)
 
-	input := NewTestInput()
-
-	headers := HTTPHeaders{HTTPHeader{"User-Agent", "Gor"}}
-	methods := HTTPMethods{"GET", "PUT", "POST"}
-
-	listener := startHTTP(func(req *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		wg.Done()
-	})
+	}))
+	defer server.Close()
 
-	output := NewHTTPOutput(listener.Addr().String(), headers, methods, HTTPUrlRegexp{}, HTTPHeaderFilters{}, HTTPHeaderHashFilters{})
+	input := NewTestInput()
+	output := NewHTTPOutput(server.URL, &HTTPOutputConfig{})
 
 	Plugins.Inputs = []io.Reader{input}
 	Plugins.Outputs = []io.Writer{output}
