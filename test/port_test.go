@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/apcera/gnatsd/server"
+	"github.com/nats-io/gnatsd/server"
 )
 
 func TestResolveRandomPort(t *testing.T) {
-	opts := &server.Options{Port: server.RANDOM_PORT}
+	opts := &server.Options{Host: "127.0.0.1", Port: server.RANDOM_PORT}
 	s := RunServer(opts)
 	defer s.Shutdown()
 

@@ -21,6 +21,12 @@ _testmain.go
 
 *.exe
 
+# Eclipse
+.project
+
+# IntelliJ
+.idea/
+
 # Emacs
 *~
 \#*\#
@@ -31,3 +37,10 @@ _testmain.go
 
 # bin
 gnatsd
+
+# coverage
+coverage.out
+
+# Cross compiled binaries
+pkg
+

@@ -1,4 +1,4 @@
-// Copyright 2012 Apcera Inc. All rights reserved.
+// Copyright 2012-2014 Apcera Inc. All rights reserved.
 
 package server
 
@@ -24,6 +24,7 @@ type parseState struct {
 	scratch [MAX_CONTROL_LINE_SIZE]byte
 }
 
+// Parser constants
 const (
 	OP_START = iota
 	OP_PLUS
@@ -66,6 +67,7 @@ const (
 	OP_UNS
 	OP_UNSU
 	OP_UNSUB
+	OP_UNSUB_SPC
 	UNSUB_ARG
 	OP_M
 	OP_MS
@@ -83,11 +85,19 @@ func (c *client) parse(buf []byte) error {
 	var i int
 	var b byte
 
+	mcl := MAX_CONTROL_LINE_SIZE
+	if c.srv != nil && c.srv.getOpts() != nil {
+		mcl = c.srv.getOpts().MaxControlLine
+	}
+
 	// snapshot this, and reset when we receive a
 	// proper CONNECT if needed.
 	authSet := c.isAuthTimerSet()
 
-	for i, b = range buf {
+	// Move to loop instead of range syntax to allow jumping of i
+	for i = 0; i < len(buf); i++ {
+		b = buf[i]
+
 		switch c.state {
 		case OP_START:
 			if b != 'C' && b != 'c' && authSet {
@@ -101,7 +111,11 @@ func (c *client) parse(buf []byte) error {
 			case 'U', 'u':
 				c.state = OP_U
 			case 'M', 'm':
-				c.state = OP_M
+				if c.typ == CLIENT {
+					goto parseErr
+				} else {
+					c.state = OP_M
+				}
 			case 'C', 'c':
 				c.state = OP_C
 			case 'I', 'i':
@@ -160,7 +174,13 @@ func (c *client) parse(buf []byte) error {
 				if err := c.processPub(arg); err != nil {
 					return err
 				}
-				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
+				c.drop, c.as, c.state = OP_START, i+1, MSG_PAYLOAD
+				// If we don't have a saved buffer then jump ahead with
+				// the index. If this overruns what is left we fall out
+				// and process split buffer.
+				if c.msgBuf == nil {
+					i = c.as + c.pa.size - LEN_CR_LF
+				}
 			default:
 				if c.argBuf != nil {
 					c.argBuf = append(c.argBuf, b)
@@ -168,7 +188,23 @@ func (c *client) parse(buf []byte) error {
 			}
 		case MSG_PAYLOAD:
 			if c.msgBuf != nil {
-				c.msgBuf = append(c.msgBuf, b)
+				// copy as much as we can to the buffer and skip ahead.
+				toCopy := c.pa.size - len(c.msgBuf)
+				avail := len(buf) - i
+				if avail < toCopy {
+					toCopy = avail
+				}
+				if toCopy > 0 {
+					start := len(c.msgBuf)
+					// This is needed for copy to work.
+					c.msgBuf = c.msgBuf[:start+toCopy]
+					copy(c.msgBuf[start:], buf[i:i+toCopy])
+					// Update our index
+					i = (i + toCopy) - 1
+				} else {
+					// Fall back to append if needed.
+					c.msgBuf = append(c.msgBuf, b)
+				}
 				if len(c.msgBuf) >= c.pa.size {
 					c.state = MSG_END
 				}
@@ -275,6 +311,13 @@ func (c *client) parse(buf []byte) error {
 				goto parseErr
 			}
 		case OP_UNSUB:
+			switch b {
+			case ' ', '\t':
+				c.state = OP_UNSUB_SPC
+			default:
+				goto parseErr
+			}
+		case OP_UNSUB_SPC:
 			switch b {
 			case ' ', '\t':
 				continue
@@ -398,12 +441,23 @@ func (c *client) parse(buf []byte) error {
 			case '\r':
 				c.drop = 1
 			case '\n':
-				if err := c.processConnect(buf[c.as : i-c.drop]); err != nil {
+				var arg []byte
+				if c.argBuf != nil {
+					arg = c.argBuf
+					c.argBuf = nil
+				} else {
+					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.processConnect(arg); err != nil {
 					return err
 				}
 				c.drop, c.state = 0, OP_START
 				// Reset notion on authSet
 				authSet = c.isAuthTimerSet()
+			default:
+				if c.argBuf != nil {
+					c.argBuf = append(c.argBuf, b)
+				}
 			}
 		case OP_M:
 			switch b {
@@ -449,6 +503,11 @@ func (c *client) parse(buf []byte) error {
 					return err
 				}
 				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
+
+				// jump ahead with the index. If this overruns
+				// what is left we fall out and process split
+				// buffer.
+				i = c.as + c.pa.size - 1
 			default:
 				if c.argBuf != nil {
 					c.argBuf = append(c.argBuf, b)
@@ -488,10 +547,21 @@ func (c *client) parse(buf []byte) error {
 			case '\r':
 				c.drop = 1
 			case '\n':
-				if err := c.processInfo(buf[c.as : i-c.drop]); err != nil {
+				var arg []byte
+				if c.argBuf != nil {
+					arg = c.argBuf
+					c.argBuf = nil
+				} else {
+					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.processInfo(arg); err != nil {
 					return err
 				}
-				c.drop, c.state = 0, OP_START
+				c.drop, c.as, c.state = 0, i+1, OP_START
+			default:
+				if c.argBuf != nil {
+					c.argBuf = append(c.argBuf, b)
+				}
 			}
 		case OP_PLUS:
 			switch b {
@@ -571,25 +641,54 @@ func (c *client) parse(buf []byte) error {
 			goto parseErr
 		}
 	}
+
 	// Check for split buffer scenarios for any ARG state.
-	if (c.state == SUB_ARG || c.state == UNSUB_ARG || c.state == PUB_ARG ||
-		c.state == MSG_ARG || c.state == MINUS_ERR_ARG) && c.argBuf == nil {
-		c.argBuf = c.scratch[:0]
-		c.argBuf = append(c.argBuf, buf[c.as:(i+1)-c.drop]...)
-		// FIXME, check max len
+	if c.state == SUB_ARG || c.state == UNSUB_ARG || c.state == PUB_ARG ||
+		c.state == MSG_ARG || c.state == MINUS_ERR_ARG ||
+		c.state == CONNECT_ARG || c.state == INFO_ARG {
+		// Setup a holder buffer to deal with split buffer scenario.
+		if c.argBuf == nil {
+			c.argBuf = c.scratch[:0]
+			c.argBuf = append(c.argBuf, buf[c.as:i-c.drop]...)
+		}
+		// Check for violations of control line length here. Note that this is not
+		// exact at all but the performance hit is too great to be precise, and
+		// catching here should prevent memory exhaustion attacks.
+		if len(c.argBuf) > mcl {
+			c.sendErr("Maximum Control Line Exceeded")
+			c.closeConnection()
+			return ErrMaxControlLine
+		}
 	}
+
 	// Check for split msg
 	if (c.state == MSG_PAYLOAD || c.state == MSG_END) && c.msgBuf == nil {
 		// We need to clone the pubArg if it is still referencing the
 		// read buffer and we are not able to process the msg.
 		if c.argBuf == nil {
+			// Works also for MSG_ARG, when message comes from ROUTE.
 			c.clonePubArg()
 		}
-		// FIXME: copy better here? Make whole buf if large?
-		//c.msgBuf = c.scratch[:0]
-		c.msgBuf = c.scratch[len(c.argBuf):len(c.argBuf)]
-		c.msgBuf = append(c.msgBuf, (buf[c.as:])...)
+
+		// If we will overflow the scratch buffer, just create a
+		// new buffer to hold the split message.
+		if c.pa.size > cap(c.scratch)-len(c.argBuf) {
+			lrem := len(buf[c.as:])
+
+			// Consider it a protocol error when the remaining payload
+			// is larger than the reported size for PUB. It can happen
+			// when processing incomplete messages from rogue clients.
+			if lrem > c.pa.size+LEN_CR_LF {
+				goto parseErr
+			}
+			c.msgBuf = make([]byte, lrem, c.pa.size+LEN_CR_LF)
+			copy(c.msgBuf, buf[c.as:])
+		} else {
+			c.msgBuf = c.scratch[len(c.argBuf):len(c.argBuf)]
+			c.msgBuf = append(c.msgBuf, (buf[c.as:])...)
+		}
 	}
+
 	return nil
 
 authErr:
@@ -606,8 +705,12 @@ parseErr:
 
 func protoSnippet(start int, buf []byte) string {
 	stop := start + PROTO_SNIPPET_SIZE
-	if stop > len(buf) {
-		stop = len(buf) - 1
+	bufSize := len(buf)
+	if start >= bufSize {
+		return `""`
+	}
+	if stop > bufSize {
+		stop = bufSize - 1
 	}
 	return fmt.Sprintf("%q", buf[start:stop])
 }
@@ -618,10 +721,18 @@ func (c *client) clonePubArg() {
 	c.argBuf = c.scratch[:0]
 	c.argBuf = append(c.argBuf, c.pa.subject...)
 	c.argBuf = append(c.argBuf, c.pa.reply...)
+	c.argBuf = append(c.argBuf, c.pa.sid...)
 	c.argBuf = append(c.argBuf, c.pa.szb...)
+
 	c.pa.subject = c.argBuf[:len(c.pa.subject)]
+
 	if c.pa.reply != nil {
 		c.pa.reply = c.argBuf[len(c.pa.subject) : len(c.pa.subject)+len(c.pa.reply)]
 	}
-	c.pa.szb = c.argBuf[len(c.pa.subject)+len(c.pa.reply):]
+
+	if c.pa.sid != nil {
+		c.pa.sid = c.argBuf[len(c.pa.subject)+len(c.pa.reply) : len(c.pa.subject)+len(c.pa.reply)+len(c.pa.sid)]
+	}
+
+	c.pa.szb = c.argBuf[len(c.pa.subject)+len(c.pa.reply)+len(c.pa.sid):]
 }
