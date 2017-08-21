@@ -6,8 +6,6 @@ import (
 	"github.com/golang/glog"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +37,14 @@ func (s *location) equals(other *location) bool {
 		s.Port == other.Port
 }
 
+func (s *location) isFullyDefined() bool {
+	return s.Host != "" && s.Port != 0
+}
+
+type ServiceConfig struct {
+	Robots string `json:"robots"`
+}
+
 type Service struct {
 	index      string
 	nodeKey    string
@@ -46,6 +52,7 @@ type Service struct {
 	domain     string
 	name       string
 	status     *Status
+	config     *ServiceConfig
 	lastAccess *time.Time
 }
 
@@ -54,14 +61,14 @@ type IoEtcdResolver struct {
 	watcher         *watcher
 	domains         map[string]*Domain
 	services        map[string]*ServiceCluster
-	dest2ProxyCache map[string]http.Handler
+	dest2ProxyCache map[string]*ServiceMux
 	watchIndex      uint64
 }
 
 func NewEtcdResolver(c *Config) (*IoEtcdResolver, error) {
 	domains := make(map[string]*Domain)
 	services := make(map[string]*ServiceCluster)
-	dest2ProxyCache := make(map[string]http.Handler)
+	dest2ProxyCache := make(map[string]*ServiceMux)
 	w, error := NewEtcdWatcher(c, domains, services)
 
 	if error != nil {
@@ -84,6 +91,15 @@ func (domain *Domain) equals(other *Domain) bool {
 		domain.typ == other.typ && domain.value == other.value
 }
 
+func (config *ServiceConfig) equals(other *ServiceConfig) bool {
+	if config == nil && other == nil {
+		return true
+	}
+
+	return config != nil && other != nil &&
+		config.Robots == other.Robots
+}
+
 func (service *Service) equals(other *Service) bool {
 	if service == nil && other == nil {
 		return true
@@ -91,7 +107,9 @@ func (service *Service) equals(other *Service) bool {
 
 	return service != nil && other != nil &&
 		service.location.equals(other.location) &&
-		service.status.equals(other.status)
+		service.status.equals(other.status) &&
+		service.config.equals(other.config)
+
 }
 
 func (r *IoEtcdResolver) resolve(domainName string) (http.Handler, error) {
@@ -106,18 +124,18 @@ func (r *IoEtcdResolver) resolve(domainName string) (http.Handler, error) {
 		switch domain.typ {
 
 		case SERVICE_DOMAINTYTPE:
-			if service, err := r.services[domain.value].Next(); err == nil {
-
+			service, err := r.services[domain.value].Next()
+			if err == nil && service.location.isFullyDefined() {
 				addr := net.JoinHostPort(service.location.Host, strconv.Itoa(service.location.Port))
 				uri := fmt.Sprintf("http://%s/", addr)
 				r.setLastAccessTime(service)
-				return r.getOrCreateProxyFor(uri), nil
+				return r.getOrCreateProxyFor(service, uri), nil
 
 			} else {
 				return nil, err
 			}
 		case URI_DOMAINTYPE:
-			return r.getOrCreateProxyFor(domain.value), nil
+			return r.getOrCreateProxyFor(nil, domain.value), nil
 		}
 
 	}
@@ -151,42 +169,12 @@ func (r *IoEtcdResolver) setLastAccessTime(service *Service) {
 
 }
 
-func (r *IoEtcdResolver) getOrCreateProxyFor(uri string) http.Handler {
-	if _, ok := r.dest2ProxyCache[uri]; !ok {
-		dest, _ := url.Parse(uri)
-		r.dest2ProxyCache[uri] = r.NewSingleHostReverseProxy(dest)
+func (r *IoEtcdResolver) getOrCreateProxyFor(s *Service, uri string) http.Handler {
+	if serviceMux, ok := r.dest2ProxyCache[uri]; !ok || !serviceMux.service.equals(s) {
+		glog.Infof("Creating a new muxer for : %s", s.name)
+		r.dest2ProxyCache[uri] = NewServiceMux(r.config, s, uri)
 	}
 	return r.dest2ProxyCache[uri]
-}
-
-func (r *IoEtcdResolver) NewSingleHostReverseProxy(target *url.URL) *httputil.ReverseProxy {
-	targetQuery := target.RawQuery
-	director := func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
-		if targetQuery == "" || req.URL.RawQuery == "" {
-			req.URL.RawQuery = targetQuery + req.URL.RawQuery
-		} else {
-			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
-		}
-
-		// FIXME : Nuxeo hack to be able to add a virtual-host header param.
-		// To be removed as soon as possible
-		if r.config.UrlHeaderParam != "" {
-			scheme := req.Header.Get("x-forwarded-proto")
-			host := req.Host
-			port := req.Header.Get("x-forwarded-port")
-			url := ""
-			if ("https" == scheme && "443" == port) || ("http" == scheme && "80" == port) {
-				url = fmt.Sprintf("%s://%s/", scheme, host)
-			} else {
-				url = fmt.Sprintf("%s://%s:%s/", scheme, host, port)
-			}
-			req.Header.Add(r.config.UrlHeaderParam, url)
-		}
-	}
-	return &httputil.ReverseProxy{Director: director}
 }
 
 func singleJoiningSlash(a, b string) string {

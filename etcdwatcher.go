@@ -6,6 +6,7 @@ import (
 	"github.com/golang/glog"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // A watcher loads and watch the etcd hierarchy for domains and services.
@@ -38,10 +39,24 @@ func (w *watcher) init() {
 // etc... The register function is passed the etcd Node that has been loaded.
 func (w *watcher) loadAndWatch(etcdDir string, registerFunc func(*etcd.Node, string)) {
 	w.loadPrefix(etcdDir, registerFunc)
+	stop := make(chan struct{})
 
-	updateChannel := make(chan *etcd.Response, 10)
-	go w.watch(updateChannel, registerFunc)
-	w.client.Watch(etcdDir, (uint64)(0), true, updateChannel, nil)
+	for {
+		glog.Infof("Start watching %s", etcdDir)
+
+		updateChannel := make(chan *etcd.Response, 10)
+		go w.watch(updateChannel, stop, etcdDir, registerFunc)
+
+		_, err := w.client.Watch(etcdDir, (uint64)(0), true, updateChannel, nil)
+
+		//If we are here, this means etcd watch ended in an error
+		stop <- struct{}{}
+		glog.Errorf("Error when watching %s : %v", etcdDir, err)
+		glog.Errorf("Waiting 1 second and relaunch watch")
+		time.Sleep(time.Second)
+
+	}
+
 }
 
 func (w *watcher) loadPrefix(etcDir string, registerFunc func(*etcd.Node, string)) {
@@ -54,13 +69,20 @@ func (w *watcher) loadPrefix(etcDir string, registerFunc func(*etcd.Node, string
 	}
 }
 
-func (w *watcher) watch(updateChannel chan *etcd.Response, registerFunc func(*etcd.Node, string)) {
+func (w *watcher) watch(updateChannel chan *etcd.Response, stop chan struct{}, key string, registerFunc func(*etcd.Node, string)) {
 	for {
-		response := <-updateChannel
-		if response != nil {
-			registerFunc(response.Node, response.Action)
+		select {
+		case <-stop:
+			glog.Warningf("Gracefully closing the etcd watch for %s", key)
+			return
+		case response := <-updateChannel:
+			if response != nil {
+				registerFunc(response.Node, response.Action)
+			}
+		default:
+			// Don't slam the etcd server
+			time.Sleep(time.Second)
 		}
-
 	}
 }
 
@@ -95,7 +117,6 @@ func (w *watcher) registerDomain(node *etcd.Node, action string) {
 
 		}
 	}
-
 }
 
 func (w *watcher) RemoveDomain(key string) {
@@ -124,78 +145,96 @@ func (w *watcher) RemoveEnv(serviceName string) {
 
 func (w *watcher) registerService(node *etcd.Node, action string) {
 	serviceName := w.getEnvForNode(node)
+	serviceNodeKey := w.config.servicePrefix + "/" + serviceName
+
+	if action == "delete" && serviceNodeKey == node.Key {
+		glog.Infof("Removing service %s", serviceName)
+		w.RemoveEnv(serviceName)
+		return
+	}
 
 	// Get service's root node instead of changed node.
-	serviceNode, _ := w.client.Get(w.config.servicePrefix+"/"+serviceName, true, true)
+	serviceNode, err := w.client.Get(serviceNodeKey, true, true)
 
-	for _, indexNode := range serviceNode.Node.Nodes {
+	if err == nil {
 
-		serviceIndex := w.getEnvIndexForNode(indexNode)
-		serviceKey := w.config.servicePrefix + "/" + serviceName + "/" + serviceIndex
-		statusKey := serviceKey + "/status"
+		for _, indexNode := range serviceNode.Node.Nodes {
 
-		response, err := w.client.Get(serviceKey, true, true)
+			serviceIndex := w.getEnvIndexForNode(indexNode)
+			serviceKey := w.config.servicePrefix + "/" + serviceName + "/" + serviceIndex
+			statusKey := serviceKey + "/status"
+			configKey := serviceKey + "/config"
 
-		if err == nil {
+			response, err := w.client.Get(serviceKey, true, true)
 
-			if w.services[serviceName] == nil {
-				w.services[serviceName] = &ServiceCluster{}
-			}
+			if err == nil {
 
-			service := &Service{}
-			service.location = &location{}
-			service.index = serviceIndex
-			service.nodeKey = serviceKey
-			service.name = serviceName
+				if w.services[serviceName] == nil {
+					w.services[serviceName] = &ServiceCluster{}
+				}
 
-			if action == "delete" {
-				glog.Infof("Removing service %s", serviceName)
-				w.RemoveEnv(serviceName)
-				return
-			}
+				service := &Service{}
+				service.location = &location{}
+				service.config = &ServiceConfig{Robots: ""}
+				service.index = serviceIndex
+				service.nodeKey = serviceKey
+				service.name = serviceName
 
-			for _, node := range response.Node.Nodes {
-				switch node.Key {
-				case serviceKey + "/location":
-					location := &location{}
-					err := json.Unmarshal([]byte(node.Value), location)
-					if err != nil {
-						glog.Errorf("Registering service %s has failed - Location is wrong or missing information", serviceName)
-						break
-					}
+				for _, node := range response.Node.Nodes {
+					switch node.Key {
+					case serviceKey + "/location":
+						location := &location{}
+						err := json.Unmarshal([]byte(node.Value), location)
+						if err == nil {
+							service.location.Host = location.Host
+							service.location.Port = location.Port
+						}
 
-					service.location.Host = location.Host
-					service.location.Port = location.Port
-				case serviceKey + "/domain":
-					service.domain = node.Value
+					case configKey:
+						for _, subNode := range node.Nodes {
+							switch subNode.Key {
+							case configKey + "/gogeta":
+								serviceConfig := &ServiceConfig{}
+								err := json.Unmarshal([]byte(subNode.Value), serviceConfig)
+								if err == nil {
+									service.config = serviceConfig
+								}
+							}
+						}
 
-				case statusKey:
-					service.status = &Status{}
-					service.status.service = service
-					for _, subNode := range node.Nodes {
-						switch subNode.Key {
-						case statusKey + "/alive":
-							service.status.alive = subNode.Value
-						case statusKey + "/current":
-							service.status.current = subNode.Value
-						case statusKey + "/expected":
-							service.status.expected = subNode.Value
+					case serviceKey + "/domain":
+						service.domain = node.Value
+
+					case statusKey:
+						service.status = &Status{}
+						service.status.service = service
+						for _, subNode := range node.Nodes {
+							switch subNode.Key {
+							case statusKey + "/alive":
+								service.status.alive = subNode.Value
+							case statusKey + "/current":
+								service.status.current = subNode.Value
+							case statusKey + "/expected":
+								service.status.expected = subNode.Value
+							}
 						}
 					}
 				}
-			}
 
-			actualEnv := w.services[serviceName].Get(service.index)
+				actualEnv := w.services[serviceName].Get(service.index)
 
-			if !actualEnv.equals(service) && service.location != nil {
-
-				if service.location.Host != "" && service.location.Port != 0 {
+				if !actualEnv.equals(service) {
 					w.services[serviceName].Add(service)
-					glog.Infof("Registering service %s with location : http://%s:%d/", serviceName, service.location.Host, service.location.Port)
+					if service.location.Host != "" && service.location.Port != 0 {
+						glog.Infof("Registering service %s with location : http://%s:%d/", serviceName, service.location.Host, service.location.Port)
+					} else {
+						glog.Infof("Registering service %s without location", serviceName)
+					}
 
 				}
-
 			}
 		}
+	} else {
+		glog.Errorf("Unable to get information for service %s from etcd", serviceName)
 	}
 }
