@@ -16,6 +16,7 @@ import (
 
 var (
 	address string
+	prefix  = ""
 
 	addressConfig chan *etcd.Response
 	outgoing      = make(chan []byte, 100000)
@@ -24,6 +25,23 @@ var (
 
 	conn net.Conn
 )
+
+func InitWithPrefixAndStaticConfig(metricPrefix, addr string) {
+	prefix = metricPrefix + "."
+	InitWithStaticConfig(addr)
+}
+
+func InitWithStaticConfig(addr string) {
+	address = addr
+	connect()
+
+	go processOutgoing()
+}
+
+func InitWithPrefixAndDynamicConfig(metricPrefix string, client *etcd.Client, hostname string) {
+	prefix = metricPrefix + "."
+	InitWithDynamicConfig(client, hostname)
+}
 
 func InitWithDynamicConfig(client *etcd.Client, hostname string) {
 	addressConfig = make(chan *etcd.Response)
@@ -201,7 +219,7 @@ func Set(name string, value float64) {
 
 func createPayload(name string, value float64, suffix string) string {
 	// we spend a lot of time in this code
-	return name + ":" + strconv.FormatFloat(value, 'f', -1, 64) + "|" + suffix
+	return prefix + name + ":" + strconv.FormatFloat(value, 'f', -1, 64) + "|" + suffix
 	//return fmt.Sprintf("%s:%f|%s", name, value, suffix)
 }
 
