@@ -1,13 +1,21 @@
 cloud-ssh
 =========
 
-Wrapper for ssh which enchance work with cloud providers.
+Cloud enhanced SSH client replacement with host auto-completion.
 
 In times of digital clouds, servers come and go, and you barely remember its names and addresses. This tiny tool provide fuzzy search (yeah like SublimeText) for your instances list, based on tags, security groups and names. 
 
-Check releases for latest version: https://github.com/buger/cloud-ssh/releases
+Official site: https://buger.github.io/cloud-ssh/
 
-Here is few examples:
+## Installation
+Automatic installation. Just run following code in your terminal
+```
+  bash <(curl -# https://buger.github.io/cloud-ssh/install.sh)
+```
+
+Manual installation - download and unpack latest release: http://github.com/buger/cloud-ssh/releases
+
+## Examples
 
 ```
 sh-3.2$ # Lets say i want connect to server called stage-matching
@@ -57,6 +65,11 @@ gran_digital:
     client_id: 111111111111111111
     api_key: 22222222222222222
 ```
+
+## Faq
+
+### Can it be drop-in replacement for SSH?
+Totally yes! Actually it just SSH wrapper, so all SSH command options will work as before.
 
 
 ## Contributing
