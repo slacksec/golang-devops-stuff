@@ -20,6 +20,8 @@ var SYSTEM_FILESYSTEMS = []string{
 	"devpts",
 	"tmpfs",
 	"fuse",
+	"pstore",
+	"cgroup",
 }
 
 const MTAB = "/etc/mtab"
