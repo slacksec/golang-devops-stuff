@@ -1,70 +1,142 @@
 {{template "base/head" .}}
-{{template "base/navbar" .}}
-{{template "repo/nav" .}}
-{{template "repo/toolbar" .}}
-<div id="body" class="container">
-    <div id="release">
-        <h4 id="release-head">New Release</h4>
-        {{template "base/alert" .}}
-        <form id="release-new-form" action="{{.RepoLink}}/releases/new" method="post" class="form form-inline">
-            {{.CsrfTokenHtml}}
-            <div class="form-group">
-                <input id="tag-name" name="tag_name" type="text" class="form-control" placeholder="tag name" value="{{.tag_name}}" />
-                <span class="target-at">@</span>
-                <div class="btn-group" id="release-new-target-select">
-                    <button type="button" class="btn btn-default"><i class="fa fa-code-fork fa-lg fa-m"></i>
-                        <span class="target-text">Target : </span>
-                        <strong id="release-new-target-name"> {{.Repository.DefaultBranch}}</strong>
-                    </button>
-                    <button type="button" class="btn btn-default dropdown-toggle" data-toggle="dropdown">
-                        <span class="caret"></span>
-                    </button>
-                    <div class="dropdown-menu clone-group-btn" id="release-new-target-branch-list">
-                        <ul class="list-group">
-                            {{range .Branches}}
-                            <li class="list-group-item">
-                                <a href="#" rel="{{.}}"><i class="fa fa-code-fork"></i>{{.}}</a>
-                            </li>
-                            {{end}}
-                        </ul>
-                    </div>
-                    <input id="tag-target" type="hidden" name="tag_target" value="{{.Repository.DefaultBranch}}"/>
-                </div>
-                <p class="help-block">Choose an existing tag, or create a new tag on publish</p>
-            </div>
-            <div class="form-group" style="display: block">
-                <input class="form-control input-lg" id="release-new-title" name="title" type="text" placeholder="release title" value="{{.title}}" />
-            </div>
-            <div class="form-group col-md-8" style="display: block" id="release-new-content-div">
-                <div class="md-help pull-right">
-                    Content with <a href="https://help.github.com/articles/markdown-basics">Markdown</a>
-                </div>
-                <ul class="nav nav-tabs" data-init="tabs">
-                    <li class="release-write active"><a href="#release-textarea" data-toggle="tab">Write</a></li>
-                    <li class="release-preview"><a href="#release-preview" data-toggle="tab" data-ajax="/api/v1/markdown" data-ajax-name="release-preview" data-ajax-context="{{.RepoLink}}" data-ajax-method="post" data-preview="#release-preview">Preview</a></li>
-                </ul>
-                <div class="tab-content">
-                    <div class="tab-pane active" id="release-textarea">
-                        <div class="form-group">
-                            <textarea class="form-control" name="content" id="release-new-content" rows="10" placeholder="Write some content" data-ajax-rel="release-preview" data-ajax-val="val" data-ajax-field="text">{{.content}}</textarea>
-                        </div>
-                    </div>
-                    <div class="tab-pane release-preview-content" id="release-preview">loading...</div>
-                </div>
-            </div>
-            <div class="text-right form-group col-md-8" style="display: block">
-                <hr/>
-                <label for="release-new-pre-release">
-                    <input id="release-new-pre-release" type="checkbox" name="prerelease" {{if .prerelease}}checked{{end}}/>
-                    <strong>This is a pre-release</strong>
-                </label>
-                <p class="help-block">We’ll point out that this release is identified as non-production ready.</p>
-            </div>
-            <div class="text-right form-group col-md-8" style="display: block">
-                <button class="btn-success btn">Publish release</button>
-                <input class="btn btn-default" type="submit" name="draft" value="Save draft"/>
-            </div>
-        </form>
-    </div>
+<div class="repository new release">
+	{{template "repo/header" .}}
+	<div class="ui container">
+		<h2 class="ui dividing header">
+			{{if .PageIsEditRelease}}
+				{{.i18n.Tr "repo.release.edit_release"}}
+				<div class="sub header">{{.i18n.Tr "repo.release.edit_subheader"}}</div>
+			{{else}}
+				{{.i18n.Tr "repo.release.new_release"}}
+				<div class="sub header">{{.i18n.Tr "repo.release.new_subheader"}}</div>
+			{{end}}
+		</h2>
+		{{template "base/alert" .}}
+		<form class="ui form grid" action="{{.Link}}" method="post">
+			{{.CSRFTokenHTML}}
+			<div class="ui seven wide column target">
+				<div class="inline field {{if .Err_TagName}}error{{end}}">
+					{{if .PageIsEditRelease}}
+						<b>{{.tag_name}}</b><span class="at">@</span><strong>{{.tag_target}}</strong>
+					{{else}}
+						<input id="tag-name" name="tag_name" value="{{.tag_name}}" placeholder="{{.i18n.Tr "repo.release.tag_name"}}" autofocus required>
+						<span class="at">@</span>
+						<div class="ui selection dropdown">
+							<input type="hidden" name="tag_target" value="{{.tag_target}}"/>
+							<i class="octicon octicon-git-branch"></i>
+							<div class="text">
+								{{.i18n.Tr "repo.release.target"}} :
+								<strong id="repo-branch-current">{{.Repository.DefaultBranch}}</strong>
+							</div>
+							<i class="dropdown icon"></i>
+							<div class="menu">
+								{{range .Branches}}
+									<div class="item" data-value="{{.}}">{{.}}</div>
+								{{end}}
+							</div>
+						</div>
+						<span class="help">{{.i18n.Tr "repo.release.tag_helper"}}</span>
+					{{end}}
+				</div>
+			</div>
+			<div class="eleven wide column">
+				<div class="field {{if .Err_Title}}error{{end}}">
+					<label>{{.i18n.Tr "repo.release.title"}}</label>
+					<input name="title" placeholder="{{.i18n.Tr "repo.release.title"}}" value="{{.title}}" autofocus required>
+				</div>
+				<div class="field">
+					<label>{{.i18n.Tr "repo.release.content"}}</label>
+					<textarea name="content">{{.content}}</textarea>
+				</div>
+				<div class="field">
+					{{if .attachments}}
+						<table class="ui table">
+							<tbody>
+								{{range .attachments}}
+									<tr>
+										<td>
+											<a target="_blank" href="{{AppSubURL}}/attachments/{{.UUID}}" rel="nofollow">{{.Name}}</a>
+											<a class="ui text red right delete-attachment-button" href="#"><i class="octicon octicon-x" data-uuid="{{.UUID}}"></i></a>
+											<input name="files" type="hidden" value="{{.UUID}}">
+										</td>
+									</tr>
+								{{end}}
+							</tbody>
+						</table>
+					{{end}}
+				</div>
+				{{if .IsAttachmentEnabled}}
+					<div class="files"></div>
+					<div class="ui basic button dropzone" id="dropzone" data-upload-url="{{AppSubURL}}/releases/attachments" data-accepts="{{.AttachmentAllowedTypes}}" data-max-file="{{.AttachmentMaxFiles}}" data-max-size="{{.AttachmentMaxSize}}" data-default-message="{{.i18n.Tr "dropzone.default_message"}}" data-invalid-input-type="{{.i18n.Tr "dropzone.invalid_input_type"}}" data-file-too-big="{{.i18n.Tr "dropzone.file_too_big"}}" data-remove-file="{{.i18n.Tr "dropzone.remove_file"}}"></div>
+				{{end}}
+			</div>
+			<div class="ui container">
+				<div class="prerelease field">
+					<div class="ui checkbox">
+						<input type="checkbox" name="prerelease" {{if .prerelease}}checked{{end}}>
+						<label><strong>{{.i18n.Tr "repo.release.prerelease_desc"}}</strong></label>
+					</div>
+				</div>
+				<span class="help">{{.i18n.Tr "repo.release.prerelease_helper"}}</span>
+				<div class="ui divider"></div>
+				<div class="field">
+					{{if .PageIsEditRelease}}
+						<button class="ui green button">
+							{{if .IsDraft}}
+								{{.i18n.Tr "repo.release.publish"}}
+							{{else}}
+								{{.i18n.Tr "repo.release.edit_release"}}
+							{{end}}
+						</button>
+						<a class="ui red button delete-button" data-url="{{$.RepoLink}}/releases/delete" data-id="{{.ID}}">
+							{{$.i18n.Tr "repo.release.delete_release"}}
+						</a>
+					{{else}}
+						<button class="ui green button">
+							{{.i18n.Tr "repo.release.publish"}}
+						</button>
+					{{end}}
+					{{/* Release didn't save as draft at first time is not possible to be draft again because the Git tag had been created. */}}
+					{{if or (not .PageIsEditRelease) .IsDraft}}
+						<input class="ui grey button" type="submit" name="draft" value="{{.i18n.Tr "repo.release.save_draft"}}"/>
+					{{end}}
+					<a class="ui basic button" href="{{.RepoLink}}/releases">
+						{{.i18n.Tr "repo.release.cancel"}}
+					</a>
+				</div>
+			</div>
+		</form>
+	</div>
 </div>
+
+{{if .PageIsEditRelease}}
+	<div class="ui small basic delete modal">
+		<div class="ui icon header">
+			<i class="trash icon"></i>
+			{{.i18n.Tr "repo.release.deletion"}}
+		</div>
+		<div class="content">
+			<p>{{.i18n.Tr "repo.release.deletion_desc"}}</p>
+		</div>
+		{{template "base/delete_modal_actions" .}}
+	</div>
+{{end}}
+
+<script>
+	// Delete attachment row
+	$('.delete-attachment-button').click(function (e) {
+		var $row = $(this).parentsUntil('tbody');
+		var $tbody = $row.parentsUntil('table');
+
+		$row.remove();
+
+		// Remove the entire table if this was the last row
+		if ($tbody.children().length == 0) {
+			$tbody.parentsUntil('.field').remove();
+		}
+
+		e.preventDefault();
+	})
+</script>
+
 {{template "base/footer" .}}
