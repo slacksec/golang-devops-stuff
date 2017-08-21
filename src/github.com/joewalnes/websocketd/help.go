@@ -51,14 +51,21 @@ Options:
   --sslcert=FILE                 All three options must be used or all of
   --sslkey=FILE                  them should be omitted. 
 
+  --redirport=PORT               Open alternative port and redirect HTTP traffic
+                                 from it to canonical address (mostly useful
+                                 for HTTPS-only configurations to redirect HTTP
+                                 traffic)
+
   --passenv VAR[,VAR...]         Lists environment variables allowed to be
                                  passed to executed scripts.
 
-  --basepath=PATH                Base path in URLs to serve from. 
-                                 Default: / (root of domain)
+  --binary={true,false}          Switches communication to binary, process reads
+                                 send to browser as blobs and all reads from the
+                                 browser are immediately flushed to the process.
+                                 Default: false
 
   --reverselookup={true,false}   Perform DNS reverse lookups on remote clients.
-                                 Default: true
+                                 Default: false
 
   --dir=DIR                      Allow all scripts in the local directory
                                  to be accessed as WebSockets. If using this,
@@ -68,6 +75,30 @@ Options:
   --staticdir=DIR                Serve static files in this directory over HTTP.
 
   --cgidir=DIR                   Serve CGI scripts in this directory over HTTP.
+
+  --maxforks=N                   Limit number of processes that websocketd is 
+                                 able to execute with WS and CGI handlers.
+                                 When maxforks reached the server will be 
+                                 rejecting requests that require executing 
+                                 another process (unlimited when 0 or negative).
+                                 Default: 0
+
+  --closems=milliseconds         Specifies additional time process needs to gracefully
+                                 finish before websocketd will send termination signals 
+                                 to it. Default: 0 (signals sent after 100ms, 250ms, 
+                                 and 500ms of waiting)
+
+  --header="..."                 Set custom HTTP header to each answer. For
+                                 example: --header="Server: someserver/0.0.1"
+
+  --header-ws="...."             Same as --header, just applies to only those
+                                 responses that indicate upgrade of TCP connection
+                                 to a WebSockets protocol.
+
+  --header-http="...."           Same as --header, just applies to only to plain
+                                 HTTP responses that do not indicate WebSockets
+                                 upgrade
+
 
   --help                         Print help and exit.
 

@@ -9,61 +9,105 @@ import (
 	"bufio"
 	"io"
 	"syscall"
+	"time"
 )
 
 type ProcessEndpoint struct {
-	process    *LaunchedProcess
-	bufferedIn *bufio.Writer
-	output     chan string
-	log        *LogScope
+	process   *LaunchedProcess
+	closetime time.Duration
+	output    chan []byte
+	log       *LogScope
+	bin       bool
 }
 
-func NewProcessEndpoint(process *LaunchedProcess, log *LogScope) *ProcessEndpoint {
+func NewProcessEndpoint(process *LaunchedProcess, bin bool, log *LogScope) *ProcessEndpoint {
 	return &ProcessEndpoint{
-		process:    process,
-		bufferedIn: bufio.NewWriter(process.stdin),
-		output:     make(chan string),
-		log:        log}
+		process: process,
+		output:  make(chan []byte),
+		log:     log,
+		bin:     bin,
+	}
 }
 
 func (pe *ProcessEndpoint) Terminate() {
+	terminated := make(chan struct{})
+	go func() { pe.process.cmd.Wait(); terminated <- struct{}{} }()
+
+	// for some processes this is enough to finish them...
 	pe.process.stdin.Close()
+
+	// a bit verbose to create good debugging trail
+	select {
+	case <-terminated:
+		pe.log.Debug("process", "Process %v terminated after stdin was closed", pe.process.cmd.Process.Pid)
+		return // means process finished
+	case <-time.After(100*time.Millisecond + pe.closetime):
+	}
 
 	err := pe.process.cmd.Process.Signal(syscall.SIGINT)
 	if err != nil {
-		pe.log.Debug("process", "Failed to Interrupt process %v: %s, attempting to kill", pe.process.cmd.Process.Pid, err)
-		err = pe.process.cmd.Process.Kill()
-		if err != nil {
-			pe.log.Debug("process", "Failed to Kill process %v: %s", pe.process.cmd.Process.Pid, err)
-		}
+		// process is done without this, great!
+		pe.log.Error("process", "SIGINT unsuccessful to %v: %s", pe.process.cmd.Process.Pid, err)
 	}
 
-	pe.process.cmd.Wait()
-	if err != nil {
-		pe.log.Debug("process", "Failed to reap process %v: %s", pe.process.cmd.Process.Pid, err)
+	select {
+	case <-terminated:
+		pe.log.Debug("process", "Process %v terminated after SIGINT", pe.process.cmd.Process.Pid)
+		return // means process finished
+	case <-time.After(250*time.Millisecond + pe.closetime):
 	}
+
+	err = pe.process.cmd.Process.Signal(syscall.SIGTERM)
+	if err != nil {
+		// process is done without this, great!
+		pe.log.Error("process", "SIGTERM unsuccessful to %v: %s", pe.process.cmd.Process.Pid, err)
+	}
+
+	select {
+	case <-terminated:
+		pe.log.Debug("process", "Process %v terminated after SIGTERM", pe.process.cmd.Process.Pid)
+		return // means process finished
+	case <-time.After(500*time.Millisecond + pe.closetime):
+	}
+
+	err = pe.process.cmd.Process.Kill()
+	if err != nil {
+		pe.log.Error("process", "SIGKILL unsuccessful to %v: %s", pe.process.cmd.Process.Pid, err)
+		return
+	}
+
+	select {
+	case <-terminated:
+		pe.log.Debug("process", "Process %v terminated after SIGKILL", pe.process.cmd.Process.Pid)
+		return // means process finished
+	case <-time.After(1000 * time.Millisecond):
+	}
+
+	pe.log.Error("process", "SIGKILL did not terminate %v!", pe.process.cmd.Process.Pid)
 }
 
-func (pe *ProcessEndpoint) Output() chan string {
+func (pe *ProcessEndpoint) Output() chan []byte {
 	return pe.output
 }
 
-func (pe *ProcessEndpoint) Send(msg string) bool {
-	pe.bufferedIn.WriteString(msg)
-	pe.bufferedIn.WriteString("\n")
-	pe.bufferedIn.Flush()
+func (pe *ProcessEndpoint) Send(msg []byte) bool {
+	pe.process.stdin.Write(msg)
 	return true
 }
 
 func (pe *ProcessEndpoint) StartReading() {
 	go pe.log_stderr()
-	go pe.process_stdout()
+	if pe.bin {
+		go pe.process_binout()
+	} else {
+		go pe.process_txtout()
+	}
 }
 
-func (pe *ProcessEndpoint) process_stdout() {
+func (pe *ProcessEndpoint) process_txtout() {
 	bufin := bufio.NewReader(pe.process.stdout)
 	for {
-		str, err := bufin.ReadString('\n')
+		buf, err := bufin.ReadBytes('\n')
 		if err != nil {
 			if err != io.EOF {
 				pe.log.Error("process", "Unexpected error while reading STDOUT from process: %s", err)
@@ -72,7 +116,24 @@ func (pe *ProcessEndpoint) process_stdout() {
 			}
 			break
 		}
-		pe.output <- trimEOL(str)
+		pe.output <- trimEOL(buf)
+	}
+	close(pe.output)
+}
+
+func (pe *ProcessEndpoint) process_binout() {
+	buf := make([]byte, 10*1024*1024)
+	for {
+		n, err := pe.process.stdout.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				pe.log.Error("process", "Unexpected error while reading STDOUT from process: %s", err)
+			} else {
+				pe.log.Debug("process", "Process STDOUT closed")
+			}
+			break
+		}
+		pe.output <- append(make([]byte, 0, n), buf[:n]...) // cloned buffer
 	}
 	close(pe.output)
 }
@@ -80,7 +141,7 @@ func (pe *ProcessEndpoint) process_stdout() {
 func (pe *ProcessEndpoint) log_stderr() {
 	bufstderr := bufio.NewReader(pe.process.stderr)
 	for {
-		str, err := bufstderr.ReadString('\n')
+		buf, err := bufstderr.ReadSlice('\n')
 		if err != nil {
 			if err != io.EOF {
 				pe.log.Error("process", "Unexpected error while reading STDERR from process: %s", err)
@@ -89,18 +150,18 @@ func (pe *ProcessEndpoint) log_stderr() {
 			}
 			break
 		}
-		pe.log.Error("stderr", "%s", trimEOL(str))
+		pe.log.Error("stderr", "%s", string(trimEOL(buf)))
 	}
 }
 
 // trimEOL cuts unixy style \n and windowsy style \r\n suffix from the string
-func trimEOL(s string) string {
-	lns := len(s)
-	if lns > 0 && s[lns-1] == '\n' {
+func trimEOL(b []byte) []byte {
+	lns := len(b)
+	if lns > 0 && b[lns-1] == '\n' {
 		lns--
-		if lns > 0 && s[lns-1] == '\r' {
+		if lns > 0 && b[lns-1] == '\r' {
 			lns--
 		}
 	}
-	return s[0:lns]
+	return b[:lns]
 }

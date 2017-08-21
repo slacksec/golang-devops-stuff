@@ -1,7 +1,6 @@
 package libwebsocketd
 
 import (
-	"code.google.com/p/go.net/websocket"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 var ScriptNotFoundError = errors.New("script not found")
@@ -77,8 +78,12 @@ func (wsh *WebsocketdHandler) accept(ws *websocket.Conn, log *LogScope) {
 
 	log.Associate("pid", strconv.Itoa(launched.cmd.Process.Pid))
 
-	process := NewProcessEndpoint(launched, log)
-	wsEndpoint := NewWebSocketEndpoint(ws, log)
+	binary := wsh.server.Config.Binary
+	process := NewProcessEndpoint(launched, binary, log)
+	if cms := wsh.server.Config.CloseMs; cms != 0 {
+		process.closetime += time.Duration(cms) * time.Millisecond
+	}
+	wsEndpoint := NewWebSocketEndpoint(ws, binary, log)
 
 	PipeEndpoints(process, wsEndpoint)
 }

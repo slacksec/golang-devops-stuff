@@ -6,12 +6,13 @@
 package libwebsocketd
 
 import (
-	"code.google.com/p/go.net/websocket"
 	"errors"
 	"fmt"
+	"golang.org/x/net/websocket"
 	"net"
 	"net/http"
 	"net/http/cgi"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path"
@@ -44,7 +45,35 @@ func NewWebsocketdServer(config *Config, log *LogScope, maxforks int) *Websocket
 // wshandshake returns closure to verify websocket origin header according to configured rules
 func (h *WebsocketdServer) wshandshake(log *LogScope) func(*websocket.Config, *http.Request) error {
 	return func(wsconf *websocket.Config, req *http.Request) error {
+		if len(h.Config.Headers)+len(h.Config.HeadersWs) > 0 {
+			if wsconf.Header == nil {
+				wsconf.Header = http.Header(make(map[string][]string))
+			}
+			pushHeaders(wsconf.Header, h.Config.Headers)
+			pushHeaders(wsconf.Header, h.Config.HeadersWs)
+		}
 		return checkOrigin(wsconf, req, h.Config, log)
+	}
+}
+
+func splitMimeHeader(s string) (string, string) {
+	p := strings.IndexByte(s, ':')
+	if p < 0 {
+		return s, ""
+	}
+	key := textproto.CanonicalMIMEHeaderKey(s[:p])
+
+	for p = p + 1; p < len(s); p++ {
+		if s[p] != ' ' {
+			break
+		}
+	}
+	return key, s[p:]
+}
+
+func pushHeaders(h http.Header, hdrs []string) {
+	for _, hstr := range hdrs {
+		h.Add(splitMimeHeader(hstr))
 	}
 }
 
@@ -54,6 +83,7 @@ func (h *WebsocketdServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	log := h.Log.NewLevel(h.Log.LogFunc)
 	log.Associate("url", h.TellURL("http", req.Host, req.RequestURI))
 
+	pushHeaders(w.Header(), h.Config.Headers)
 	if h.Config.CommandName != "" || h.Config.UsingScriptDir {
 		hdrs := req.Header
 		upgradeRe := regexp.MustCompile("(?i)(^|[,\\s])Upgrade($|[,\\s])")
@@ -87,6 +117,8 @@ func (h *WebsocketdServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+
+	pushHeaders(w.Header(), h.Config.HeadersHTTP)
 
 	// Dev console (if enabled)
 	if h.Config.DevConsole {
@@ -143,8 +175,20 @@ func (h *WebsocketdServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	http.NotFound(w, req)
 }
 
+var canonicalHostname string
+
 // TellURL is a helper function that changes http to https or ws to wss in case if SSL is used
 func (h *WebsocketdServer) TellURL(scheme, host, path string) string {
+	if len(host) > 0 && host[0] == ':' {
+		if canonicalHostname == "" {
+			var err error
+			canonicalHostname, err = os.Hostname()
+			if err != nil {
+				canonicalHostname = "UNKNOWN"
+			}
+		}
+		host = canonicalHostname + host
+	}
 	if h.Config.Ssl {
 		return scheme + "s://" + host + path
 	}

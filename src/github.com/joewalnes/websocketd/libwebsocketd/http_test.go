@@ -2,9 +2,9 @@ package libwebsocketd
 
 import (
 	"bufio"
-	"code.google.com/p/go.net/websocket"
 	"crypto/tls"
 	"fmt"
+	"golang.org/x/net/websocket"
 	"net/http"
 	"strings"
 	"testing"
@@ -72,6 +72,8 @@ var CheckOriginTests = []struct {
 	{"server.example.com", ReqHTTP, "http://example.com", OriginCouldDiffer, []string{"example.com:81"}, ReturnsError, "origin allowed port mismatch"},
 	{"server.example.com", ReqHTTP, "http://example.com", OriginCouldDiffer, []string{"example.com:81"}, ReturnsError, "origin allowed port mismatch"},
 	{"server.example.com", ReqHTTP, "http://example.com:81", OriginCouldDiffer, []string{"example.com:81"}, ReturnsPass, "origin allowed port 81 match"},
+	{"server.example.com", ReqHTTP, "null", OriginCouldDiffer, NoOriginList, ReturnsPass, "any origin allowed, even null"},
+	{"server.example.com", ReqHTTP, "", OriginCouldDiffer, NoOriginList, ReturnsPass, "any origin allowed, even empty"},
 }
 
 func TestCheckOrigin(t *testing.T) {
@@ -113,6 +115,20 @@ Sec-WebSocket-Version: 13
 			t.Errorf("Test case %#v did not get an error", testcase.name)
 		} else if testcase.getsErr == ReturnsPass && err != nil {
 			t.Errorf("Test case %#v got error while should've", testcase.name)
+		}
+	}
+}
+
+var mimetest = [][3]string{
+	{"Content-type: text/plain", "Content-type", "text/plain"},
+	{"Content-type:    ", "Content-type", ""},
+}
+
+func TestSplitMimeHeader(t *testing.T) {
+	for _, tst := range mimetest {
+		s, v := splitMimeHeader(tst[0])
+		if tst[1] != s || tst[2] != v {
+			t.Errorf("%v and %v  are not same as expexted %v and %v", s, v, tst[1], tst[2])
 		}
 	}
 }

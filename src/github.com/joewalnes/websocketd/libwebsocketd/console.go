@@ -93,6 +93,7 @@ Full documentation at http://websocketd.com/
 		margin-left: 90px;
 		display: block;
 		word-wrap: break-word;
+		white-space: pre;
 	}
 	.type-input,
 	.type-send {
@@ -195,8 +196,8 @@ Full documentation at http://websocketd.com/
 				moveThroughSendHistory(-1);
 			}
 		});
-
 		window.addEventListener('popstate', updateWebSocketUrl);
+		updateWebSocketUrl();
 	}
 
 	function updatePageUrl() {
@@ -252,7 +253,15 @@ Full documentation at http://websocketd.com/
 				select('.url').focus();
 			});
 			ws.addEventListener('message', function(ev) {
-				appendMessage('onmessage', ev.data);
+				if (typeof(ev.data) == "object") { 
+					var rd = new FileReader();
+					rd.onload = function(ev){
+						appendMessage('onmessage', "BLOB: "+rd.result);
+					};
+					rd.readAsBinaryString(ev.data);
+				} else {
+					appendMessage('onmessage', ev.data);
+				}
 			});
 			ws.addEventListener('error', function(ev) {
 				appendMessage('onerror');

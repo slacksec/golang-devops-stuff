@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joewalnes/websocketd/libwebsocketd"
@@ -51,7 +52,7 @@ func main() {
 
 	os.Clearenv() // it's ok to wipe it clean, we already read env variables from passenv into config
 	handler := libwebsocketd.NewWebsocketdServer(config.Config, log, config.MaxForks)
-	http.Handle(config.BasePath, handler)
+	http.Handle("/", handler)
 
 	if config.UsingScriptDir {
 		log.Info("server", "Serving from directory      : %s", config.ScriptDir)
@@ -67,7 +68,7 @@ func main() {
 
 	rejects := make(chan error, 1)
 	for _, addrSingle := range config.Addr {
-		log.Info("server", "Starting WebSocket server   : %s", handler.TellURL("ws", addrSingle, config.BasePath))
+		log.Info("server", "Starting WebSocket server   : %s", handler.TellURL("ws", addrSingle, "/"))
 		if config.DevConsole {
 			log.Info("server", "Developer console enabled   : %s", handler.TellURL("http", addrSingle, "/"))
 		} else if config.StaticDir != "" || config.CgiDir != "" {
@@ -76,6 +77,7 @@ func main() {
 		// ListenAndServe is blocking function. Let's run it in
 		// go routine, reporting result to control channel.
 		// Since it's blocking it'll never return non-error.
+
 		go func(addr string) {
 			if config.Ssl {
 				rejects <- http.ListenAndServeTLS(addr, config.CertFile, config.KeyFile, nil)
@@ -83,6 +85,26 @@ func main() {
 				rejects <- http.ListenAndServe(addr, nil)
 			}
 		}(addrSingle)
+
+		if config.RedirPort != 0 {
+			go func(addr string) {
+				pos := strings.IndexByte(addr, ':')
+				rediraddr := addr[:pos] + ":" + strconv.Itoa(config.RedirPort) // it would be silly to optimize this one
+				redir := &http.Server{Addr: rediraddr, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+					// redirect to same hostname as in request but different port and probably schema
+					uri := "https://"
+					if !config.Ssl {
+						uri = "http://"
+					}
+					uri += r.Host[:strings.IndexByte(r.Host, ':')] + addr[pos:] + "/"
+
+					http.Redirect(w, r, uri, http.StatusMovedPermanently)
+				})}
+				log.Info("server", "Starting redirect server   : http://%s/", rediraddr)
+				rejects <- redir.ListenAndServe()
+			}(addrSingle)
+		}
 	}
 	select {
 	case err := <-rejects:
