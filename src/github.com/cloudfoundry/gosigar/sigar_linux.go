@@ -84,22 +84,22 @@ func (self *Mem) Get() error {
 }
 
 func (self *Swap) Get() error {
-	sysinfo := syscall.Sysinfo_t{}
+	table := map[string]*uint64{
+		"SwapTotal": &self.Total,
+		"SwapFree":  &self.Free,
+	}
 
-	if err := syscall.Sysinfo(&sysinfo); err != nil {
+	if err := parseMeminfo(table); err != nil {
 		return err
 	}
 
-	self.Total = sysinfo.Totalswap
-	self.Free = sysinfo.Freeswap
 	self.Used = self.Total - self.Free
-
 	return nil
 }
 
 func (self *Cpu) Get() error {
 	return readFile(Procd+"/stat", func(line string) bool {
-		if line[0:4] == "cpu " {
+		if len(line) > 4 && line[0:4] == "cpu " {
 			parseCpuStat(self, line)
 			return false
 		}
@@ -116,7 +116,7 @@ func (self *CpuList) Get() error {
 	list := make([]Cpu, 0, capacity)
 
 	err := readFile(Procd+"/stat", func(line string) bool {
-		if line[0:3] == "cpu" && line[3] != ' ' {
+		if len(line) > 3 && line[0:3] == "cpu" && line[3] != ' ' {
 			cpu := Cpu{}
 			parseCpuStat(&cpu, line)
 			list = append(list, cpu)
