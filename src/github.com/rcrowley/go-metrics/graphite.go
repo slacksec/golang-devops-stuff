@@ -38,11 +38,20 @@ func Graphite(r Registry, d time.Duration, prefix string, addr *net.TCPAddr) {
 // GraphiteWithConfig is a blocking exporter function just like Graphite,
 // but it takes a GraphiteConfig instead.
 func GraphiteWithConfig(c GraphiteConfig) {
+	log.Printf("WARNING: This go-metrics client has been DEPRECATED! It has been moved to https://github.com/cyberdelia/go-metrics-graphite and will be removed from rcrowley/go-metrics on August 12th 2015")
 	for _ = range time.Tick(c.FlushInterval) {
 		if err := graphite(&c); nil != err {
 			log.Println(err)
 		}
 	}
+}
+
+// GraphiteOnce performs a single submission to Graphite, returning a
+// non-nil error on failed connections. This can be used in a loop
+// similar to GraphiteWithConfig for custom error handling.
+func GraphiteOnce(c GraphiteConfig) error {
+	log.Printf("WARNING: This go-metrics client has been DEPRECATED! It has been moved to https://github.com/cyberdelia/go-metrics-graphite and will be removed from rcrowley/go-metrics on August 12th 2015")
+	return graphite(&c)
 }
 
 func graphite(c *GraphiteConfig) error {
@@ -85,10 +94,10 @@ func graphite(c *GraphiteConfig) error {
 			t := metric.Snapshot()
 			ps := t.Percentiles(c.Percentiles)
 			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, t.Count(), now)
-			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, int64(du)*t.Min(), now)
-			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, int64(du)*t.Max(), now)
-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, du*t.Mean(), now)
-			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, du*t.StdDev(), now)
+			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, t.Min()/int64(du), now)
+			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, t.Max()/int64(du), now)
+			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, t.Mean()/du, now)
+			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, t.StdDev()/du, now)
 			for psIdx, psKey := range c.Percentiles {
 				key := strings.Replace(strconv.FormatFloat(psKey*100.0, 'f', -1, 64), ".", "", 1)
 				fmt.Fprintf(w, "%s.%s.%s-percentile %.2f %d\n", c.Prefix, name, key, ps[psIdx], now)
