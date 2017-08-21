@@ -5,20 +5,20 @@
 package hook
 
 import (
-	"github.com/tsuru/config"
-	"github.com/tsuru/gandalf/fs"
-	"io"
 	"os"
 	"strings"
+
+	"github.com/tsuru/config"
+	"github.com/tsuru/gandalf/fs"
 )
 
-func createHookFile(path string, body io.Reader) error {
-	file, err := fs.Filesystem().OpenFile(path, os.O_WRONLY|os.O_CREATE, 0755)
+func createHookFile(path string, content []byte) error {
+	file, err := fs.Filesystem().OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	_, err = io.Copy(file, body)
+	_, err = file.Write(content)
 	if err != nil {
 		return err
 	}
@@ -26,29 +26,35 @@ func createHookFile(path string, body io.Reader) error {
 }
 
 // Adds a hook script.
-func Add(name string, repos []string, body io.Reader) error {
-	config_param := "git:bare:template"
+func Add(name string, repos []string, content []byte) error {
+	configParam := "git:bare:template"
 	if len(repos) > 0 {
-		config_param = "git:bare:location"
+		configParam = "git:bare:location"
 	}
-	path, err := config.GetString(config_param)
+	path, err := config.GetString(configParam)
 	if err != nil {
 		return err
 	}
-	s := []string{path, "hooks", name}
-	scriptPath := strings.Join(s, "/")
 	if len(repos) > 0 {
 		for _, repo := range repos {
 			repo += ".git"
-			s = []string{path, repo, "hooks", name}
-			scriptPath = strings.Join(s, "/")
-			err := createHookFile(scriptPath, body)
+			s := []string{path, repo, "hooks"}
+			dirPath := strings.Join(s, "/")
+			err = fs.Filesystem().MkdirAll(dirPath, 0755)
+			if err != nil {
+				return err
+			}
+			s = []string{dirPath, name}
+			scriptPath := strings.Join(s, "/")
+			err = createHookFile(scriptPath, content)
 			if err != nil {
 				return err
 			}
 		}
 	} else {
-		return createHookFile(scriptPath, body)
+		s := []string{path, "hooks", name}
+		scriptPath := strings.Join(s, "/")
+		return createHookFile(scriptPath, content)
 	}
 	return nil
 }

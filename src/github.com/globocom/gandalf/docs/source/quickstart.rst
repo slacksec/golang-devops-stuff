@@ -4,8 +4,8 @@ Quickstart Guide
 
 Before starting, make sure Gandalf is :doc:`installed </install>` and :doc:`configured </config>`.
 
-Creating an user and a repository
-=================================
+Creating a user and a repository
+================================
 
 Create a user:
 
@@ -57,10 +57,10 @@ Now we already have access to myproject, let's create a git repository locally t
     $ git commit -m "first commit"
     $ git push gandalf master
 
-You ould see the usual git output.
+You should see the usual git output.
 
-Removing an user and a repository
-=================================
+Removing a user and a repository
+================================
 
 In order to delete a repository, execute the following:
 

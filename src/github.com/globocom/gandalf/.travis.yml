@@ -1,19 +1,30 @@
 language: go
+sudo: required
 go:
-  - 1.2.2
-  - 1.3
+  - 1.6.3
+  - 1.7.1
   - tip
 env:
-  - GOARCH=amd64
-before_install:
-  - sudo apt-get update -qq > apt-get.out 2>&1  || (cat apt-get.out && exit 1)
-  - sudo apt-get install bzr mercurial git -qq > apt-get.out 2>&1 || (cat apt-get.out && exit 1)
-install:
-  - export PATH="$HOME/gopath/bin:$PATH"
-  - make get GO_EXTRAFLAGS=-x
+  global:
+    - GOARCH=amd64
+    - GO_FOR_RELEASE=1.7.1
+    - IMAGE_NAME=tsuru/gandalf
+addons:
+  apt:
+    packages:
+      - rsyslog
 before_script:
-  - if [ "$TRAVIS_REPO_SLUG" != "tsuru/gandalf" ]; then cd ..; mv gandalf ../tsuru; cd ../tsuru/gandalf; fi
+  - rsyslogd &
 script:
-  - make test GO_EXTRAFLAGS=-x
+  - make test
   - ./check-fmt.sh
-services: mongodb
+  - go build -o build/gandalf-webserver -ldflags "-linkmode external -extldflags -static" webserver/main.go
+  - go build -o build/gandalf-ssh -ldflags "-linkmode external -extldflags -static" bin/gandalf.go
+services:
+  - docker
+  - mongodb
+matrix:
+  allow_failures:
+    - go: tip
+after_success:
+  - curl https://raw.githubusercontent.com/tsuru/push-to-docker/master/push.sh | bash
