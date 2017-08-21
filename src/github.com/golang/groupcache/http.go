@@ -17,22 +17,21 @@ limitations under the License.
 package groupcache
 
 import (
+	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 
-	"code.google.com/p/goprotobuf/proto"
 	"github.com/golang/groupcache/consistenthash"
 	pb "github.com/golang/groupcache/groupcachepb"
+	"github.com/golang/protobuf/proto"
 )
 
-// TODO: make this configurable?
 const defaultBasePath = "/_groupcache/"
 
-// TODO: make this configurable as well.
 const defaultReplicas = 50
 
 // HTTPPool implements PeerPicker for a pool of HTTP peers.
@@ -47,31 +46,69 @@ type HTTPPool struct {
 	// If nil, the client uses http.DefaultTransport.
 	Transport func(Context) http.RoundTripper
 
-	// base path including leading and trailing slash, e.g. "/_groupcache/"
-	basePath string
-
 	// this peer's base URL, e.g. "https://example.net:8000"
 	self string
 
-	mu    sync.Mutex
-	peers *consistenthash.Map
+	// opts specifies the options.
+	opts HTTPPoolOptions
+
+	mu          sync.Mutex // guards peers and httpGetters
+	peers       *consistenthash.Map
+	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
+}
+
+// HTTPPoolOptions are the configurations of a HTTPPool.
+type HTTPPoolOptions struct {
+	// BasePath specifies the HTTP path that will serve groupcache requests.
+	// If blank, it defaults to "/_groupcache/".
+	BasePath string
+
+	// Replicas specifies the number of key replicas on the consistent hash.
+	// If blank, it defaults to 50.
+	Replicas int
+
+	// HashFn specifies the hash function of the consistent hash.
+	// If blank, it defaults to crc32.ChecksumIEEE.
+	HashFn consistenthash.Hash
+}
+
+// NewHTTPPool initializes an HTTP pool of peers, and registers itself as a PeerPicker.
+// For convenience, it also registers itself as an http.Handler with http.DefaultServeMux.
+// The self argument should be a valid base URL that points to the current server,
+// for example "http://example.net:8000".
+func NewHTTPPool(self string) *HTTPPool {
+	p := NewHTTPPoolOpts(self, nil)
+	http.Handle(p.opts.BasePath, p)
+	return p
 }
 
 var httpPoolMade bool
 
-// NewHTTPPool initializes an HTTP pool of peers.
-// It registers itself as a PeerPicker and as an HTTP handler with the
-// http.DefaultServeMux.
-// The self argument be a valid base URL that points to the current server,
-// for example "http://example.net:8000".
-func NewHTTPPool(self string) *HTTPPool {
+// NewHTTPPoolOpts initializes an HTTP pool of peers with the given options.
+// Unlike NewHTTPPool, this function does not register the created pool as an HTTP handler.
+// The returned *HTTPPool implements http.Handler and must be registered using http.Handle.
+func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	if httpPoolMade {
 		panic("groupcache: NewHTTPPool must be called only once")
 	}
 	httpPoolMade = true
-	p := &HTTPPool{basePath: defaultBasePath, self: self, peers: consistenthash.New(defaultReplicas, nil)}
+
+	p := &HTTPPool{
+		self:        self,
+		httpGetters: make(map[string]*httpGetter),
+	}
+	if o != nil {
+		p.opts = *o
+	}
+	if p.opts.BasePath == "" {
+		p.opts.BasePath = defaultBasePath
+	}
+	if p.opts.Replicas == 0 {
+		p.opts.Replicas = defaultReplicas
+	}
+	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+
 	RegisterPeerPicker(func() PeerPicker { return p })
-	http.Handle(defaultBasePath, p)
 	return p
 }
 
@@ -81,8 +118,12 @@ func NewHTTPPool(self string) *HTTPPool {
 func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.peers = consistenthash.New(defaultReplicas, nil)
+	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
 	p.peers.Add(peers...)
+	p.httpGetters = make(map[string]*httpGetter, len(peers))
+	for _, peer := range peers {
+		p.httpGetters[peer] = &httpGetter{transport: p.Transport, baseURL: peer + p.opts.BasePath}
+	}
 }
 
 func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
@@ -92,19 +133,17 @@ func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
 		return nil, false
 	}
 	if peer := p.peers.Get(key); peer != p.self {
-		// TODO: pre-build a slice of *httpGetter when Set()
-		// is called to avoid these two allocations.
-		return &httpGetter{p.Transport, peer + p.basePath}, true
+		return p.httpGetters[peer], true
 	}
 	return nil, false
 }
 
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse request.
-	if !strings.HasPrefix(r.URL.Path, p.basePath) {
+	if !strings.HasPrefix(r.URL.Path, p.opts.BasePath) {
 		panic("HTTPPool serving unexpected path: " + r.URL.Path)
 	}
-	parts := strings.SplitN(r.URL.Path[len(p.basePath):], "/", 2)
+	parts := strings.SplitN(r.URL.Path[len(p.opts.BasePath):], "/", 2)
 	if len(parts) != 2 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -146,6 +185,10 @@ type httpGetter struct {
 	baseURL   string
 }
 
+var bufferPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
+
 func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
@@ -169,12 +212,14 @@ func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse
 	if res.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned: %v", res.Status)
 	}
-	// TODO: avoid this garbage.
-	b, err := ioutil.ReadAll(res.Body)
+	b := bufferPool.Get().(*bytes.Buffer)
+	b.Reset()
+	defer bufferPool.Put(b)
+	_, err = io.Copy(b, res.Body)
 	if err != nil {
 		return fmt.Errorf("reading response body: %v", err)
 	}
-	err = proto.Unmarshal(b, out)
+	err = proto.Unmarshal(b.Bytes(), out)
 	if err != nil {
 		return fmt.Errorf("decoding response body: %v", err)
 	}
