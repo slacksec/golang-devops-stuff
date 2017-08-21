@@ -1,7 +1,6 @@
 *.o
 build
 bin
-pkg
 *.tar.gz
 *.rpm
 *.deb
@@ -17,11 +16,14 @@ vendor/libsodium/*/
 vendor/zlib/*/
 nacl.public
 nacl.secret
-.lumberjack
+.logstash-forwarder
 .lumberjack.new
 .rbx
-lumberjack
 logstash-forwarder
 *.DS_Store
 *.idea
 *.iml
+*.crt
+*.key
+*.json
+*.lock

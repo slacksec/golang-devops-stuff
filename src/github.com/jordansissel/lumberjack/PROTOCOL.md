@@ -1,8 +1,16 @@
 # The Lumberjack Protocol
 
+# DISCLAIMER
+
+The lumberjack protocol is actively in development at Elastic.
+
+However, this document (the protocol documentation) has fallen out of date with respect to the actual implementation of Elastic Beats project and the Logstash Beats input. It may be inaccurate in places, and we have not yet documented the changes between v1 and v2 protocols. This document is therefore deprecated and should not be used as reference.
+
+# END DISCLAIMER
+
 The needs that lead to this protocol are:
 
-* Encryption amd Authentication to protect 
+* Encryption amd Authentication to protect
 * Compression should be used to reduce bandwidth
 * Round-trip latency should not damage throughput
 * Application-level message acknowledgement
@@ -59,6 +67,8 @@ Payload:
 * 32bit unsigned value length followed by that many bytes for the value
 * repeat key/value 'count' times.
 
+Note all numeric values are network (big-endian) byte order.
+
 Sequence number roll-over: If you receive a sequence number less than the
 previous value, this signals that the sequence number has rolled over.
 
@@ -94,8 +104,8 @@ data frames the writer will send before blocking for acks.
 
 Payload:
 
-* 32bit unsigned payload length 
-* 'length' bytes of compressed payload
+* 32bit unsigned payload length
+* 'length' bytes of zlib compressed 'data' frames.
 
 This frame type allows you to compress many frames into a single compressed
 envelope and is useful for efficiently compressing many small data frames.
