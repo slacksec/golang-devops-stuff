@@ -1,99 +1,95 @@
 package resource
 
 import (
-	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
 
-func FailedStateRefreshFunc() StateRefreshFunc {
-	return func() (interface{}, string, error) {
-		return nil, "", errors.New("failed")
-	}
-}
+func TestRetry(t *testing.T) {
+	t.Parallel()
 
-func TimeoutStateRefreshFunc() StateRefreshFunc {
-	return func() (interface{}, string, error) {
-		time.Sleep(100 * time.Second)
-		return nil, "", errors.New("failed")
-	}
-}
+	tries := 0
+	f := func() *RetryError {
+		tries++
+		if tries == 3 {
+			return nil
+		}
 
-func SuccessfulStateRefreshFunc() StateRefreshFunc {
-	return func() (interface{}, string, error) {
-		return struct{}{}, "running", nil
-	}
-}
-
-func TestWaitForState_timeout(t *testing.T) {
-	conf := &StateChangeConf{
-		Pending: []string{"pending", "incomplete"},
-		Target:  "running",
-		Refresh: TimeoutStateRefreshFunc(),
-		Timeout: 1 * time.Millisecond,
+		return RetryableError(fmt.Errorf("error"))
 	}
 
-	obj, err := conf.WaitForState()
-
-	if err == nil && err.Error() != "timeout while waiting for state to become 'running'" {
-		t.Fatalf("err: %s", err)
-	}
-
-	if obj != nil {
-		t.Fatalf("should not return obj")
-	}
-
-}
-
-func TestWaitForState_success(t *testing.T) {
-	conf := &StateChangeConf{
-		Pending: []string{"pending", "incomplete"},
-		Target:  "running",
-		Refresh: SuccessfulStateRefreshFunc(),
-		Timeout: 200 * time.Second,
-	}
-
-	obj, err := conf.WaitForState()
+	err := Retry(10*time.Second, f)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	if obj == nil {
-		t.Fatalf("should return obj")
-	}
 }
 
-func TestWaitForState_successEmpty(t *testing.T) {
-	conf := &StateChangeConf{
-		Pending: []string{"pending", "incomplete"},
-		Target:  "",
-		Refresh: func() (interface{}, string, error) {
-			return nil, "", nil
-		},
-		Timeout: 200 * time.Second,
+// make sure a slow StateRefreshFunc is allowed to complete after timeout
+func TestRetry_grace(t *testing.T) {
+	t.Parallel()
+
+	f := func() *RetryError {
+		time.Sleep(1 * time.Second)
+		return nil
 	}
 
-	obj, err := conf.WaitForState()
+	err := Retry(10*time.Millisecond, f)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	if obj != nil {
-		t.Fatalf("obj should be nil")
+}
+
+func TestRetry_timeout(t *testing.T) {
+	t.Parallel()
+
+	f := func() *RetryError {
+		return RetryableError(fmt.Errorf("always"))
+	}
+
+	err := Retry(1*time.Second, f)
+	if err == nil {
+		t.Fatal("should error")
 	}
 }
 
-func TestWaitForState_failure(t *testing.T) {
-	conf := &StateChangeConf{
-		Pending: []string{"pending", "incomplete"},
-		Target:  "running",
-		Refresh: FailedStateRefreshFunc(),
-		Timeout: 200 * time.Second,
+func TestRetry_hang(t *testing.T) {
+	old := refreshGracePeriod
+	refreshGracePeriod = 50 * time.Millisecond
+	defer func() {
+		refreshGracePeriod = old
+	}()
+
+	f := func() *RetryError {
+		time.Sleep(2 * time.Second)
+		return nil
 	}
 
-	obj, err := conf.WaitForState()
-	if err == nil && err.Error() != "failed" {
-		t.Fatalf("err: %s", err)
+	err := Retry(50*time.Millisecond, f)
+	if err == nil {
+		t.Fatal("should error")
 	}
-	if obj != nil {
-		t.Fatalf("should not return obj")
+}
+
+func TestRetry_error(t *testing.T) {
+	t.Parallel()
+
+	expected := fmt.Errorf("nope")
+	f := func() *RetryError {
+		return NonRetryableError(expected)
+	}
+
+	errCh := make(chan error)
+	go func() {
+		errCh <- Retry(1*time.Second, f)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != expected {
+			t.Fatalf("bad: %#v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
 	}
 }

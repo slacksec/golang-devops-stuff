@@ -1,74 +1,122 @@
 package file
 
 import (
+	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"time"
 
-	"github.com/hashicorp/terraform/helper/config"
-	helper "github.com/hashicorp/terraform/helper/ssh"
+	"github.com/hashicorp/terraform/communicator"
+	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/terraform"
+	"github.com/mitchellh/go-homedir"
 )
 
-type ResourceProvisioner struct{}
+func Provisioner() terraform.ResourceProvisioner {
+	return &schema.Provisioner{
+		Schema: map[string]*schema.Schema{
+			"source": &schema.Schema{
+				Type:          schema.TypeString,
+				Optional:      true,
+				ConflictsWith: []string{"content"},
+			},
 
-func (p *ResourceProvisioner) Apply(s *terraform.ResourceState,
-	c *terraform.ResourceConfig) error {
-	// Ensure the connection type is SSH
-	if err := helper.VerifySSH(s); err != nil {
-		return err
+			"content": &schema.Schema{
+				Type:          schema.TypeString,
+				Optional:      true,
+				ConflictsWith: []string{"source"},
+			},
+
+			"destination": &schema.Schema{
+				Type:     schema.TypeString,
+				Required: true,
+			},
+		},
+
+		ApplyFunc:    applyFn,
+		ValidateFunc: validateFn,
 	}
+}
 
-	// Get the SSH configuration
-	conf, err := helper.ParseSSHConfig(s)
+func applyFn(ctx context.Context) error {
+	connState := ctx.Value(schema.ProvRawStateKey).(*terraform.InstanceState)
+	data := ctx.Value(schema.ProvConfigDataKey).(*schema.ResourceData)
+
+	// Get a new communicator
+	comm, err := communicator.New(connState)
 	if err != nil {
 		return err
 	}
 
-	// Get the source and destination
-	sRaw := c.Config["source"]
-	src, ok := sRaw.(string)
-	if !ok {
-		return fmt.Errorf("Unsupported 'source' type! Must be string.")
+	// Get the source
+	src, deleteSource, err := getSrc(data)
+	if err != nil {
+		return err
+	}
+	if deleteSource {
+		defer os.Remove(src)
 	}
 
-	dRaw := c.Config["destination"]
-	dst, ok := dRaw.(string)
-	if !ok {
-		return fmt.Errorf("Unsupported 'destination' type! Must be string.")
+	// Begin the file copy
+	dst := data.Get("destination").(string)
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- copyFiles(comm, src, dst)
+	}()
+
+	// Allow the file copy to complete unless there is an interrupt.
+	// If there is an interrupt we make no attempt to cleanly close
+	// the connection currently. We just abruptly exit. Because Terraform
+	// taints the resource, this is fine.
+	select {
+	case err := <-resultCh:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("file transfer interrupted")
 	}
-	return p.copyFiles(conf, src, dst)
 }
 
-func (p *ResourceProvisioner) Validate(c *terraform.ResourceConfig) (ws []string, es []error) {
-	v := &config.Validator{
-		Required: []string{
-			"source",
-			"destination",
-		},
+func validateFn(c *terraform.ResourceConfig) (ws []string, es []error) {
+	if !c.IsSet("source") && !c.IsSet("content") {
+		es = append(es, fmt.Errorf("Must provide one of 'source' or 'content'"))
 	}
-	return v.Validate(c)
+
+	return ws, es
+}
+
+// getSrc returns the file to use as source
+func getSrc(data *schema.ResourceData) (string, bool, error) {
+	src := data.Get("source").(string)
+	if content, ok := data.GetOk("content"); ok {
+		file, err := ioutil.TempFile("", "tf-file-content")
+		if err != nil {
+			return "", true, err
+		}
+
+		if _, err = file.WriteString(content.(string)); err != nil {
+			return "", true, err
+		}
+
+		return file.Name(), true, nil
+	}
+
+	expansion, err := homedir.Expand(src)
+	return expansion, false, err
 }
 
 // copyFiles is used to copy the files from a source to a destination
-func (p *ResourceProvisioner) copyFiles(conf *helper.SSHConfig, src, dst string) error {
-	// Get the SSH client config
-	config, err := helper.PrepareConfig(conf)
-	if err != nil {
-		return err
-	}
-
-	// Wait and retry until we establish the SSH connection
-	var comm *helper.SSHCommunicator
-	err = retryFunc(conf.TimeoutVal, func() error {
-		host := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
-		comm, err = helper.New(host, config)
+func copyFiles(comm communicator.Communicator, src, dst string) error {
+	// Wait and retry until we establish the connection
+	err := retryFunc(comm.Timeout(), func() error {
+		err := comm.Connect(nil)
 		return err
 	})
 	if err != nil {
 		return err
 	}
+	defer comm.Disconnect()
 
 	info, err := os.Stat(src)
 	if err != nil {
@@ -77,7 +125,7 @@ func (p *ResourceProvisioner) copyFiles(conf *helper.SSHConfig, src, dst string)
 
 	// If we're uploading a directory, short circuit and do that
 	if info.IsDir() {
-		if err := comm.UploadDir(dst, src, nil); err != nil {
+		if err := comm.UploadDir(dst, src); err != nil {
 			return fmt.Errorf("Upload failed: %v", err)
 		}
 		return nil

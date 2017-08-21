@@ -1,28 +1,28 @@
 variable "foo" {
-    default = "bar";
-    description = "bar";
+    default = "bar"
+    description = "bar"
 }
 
 variable "amis" {
     default = {
-        "east": "foo",
+        east = "foo"
     }
 }
 
 provider "aws" {
-  access_key = "foo";
-  secret_key = "bar";
+  access_key = "foo"
+  secret_key = "bar"
 }
 
 provider "do" {
-  api_key = "${var.foo}";
+  api_key = "${var.foo}"
 }
 
 resource "aws_security_group" "firewall" {
 }
 
 resource aws_instance "web" {
-    ami = "${var.amis.east}"
+    ami = "${var.amis["east"]}"
     security_groups = [
         "foo",
         "${aws_security_group.firewall.foo}"

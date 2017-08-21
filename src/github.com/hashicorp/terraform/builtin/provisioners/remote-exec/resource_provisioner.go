@@ -1,42 +1,71 @@
 package remoteexec
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	helper "github.com/hashicorp/terraform/helper/ssh"
+	"github.com/hashicorp/terraform/communicator"
+	"github.com/hashicorp/terraform/communicator/remote"
+	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/terraform"
+	"github.com/mitchellh/go-linereader"
 )
 
-const (
-	// DefaultShebang is added at the top of the script file
-	DefaultShebang = "#!/bin/sh"
-)
+// maxBackoffDealy is the maximum delay between retry attempts
+var maxBackoffDelay = 10 * time.Second
+var initialBackoffDelay = time.Second
 
-type ResourceProvisioner struct{}
+func Provisioner() terraform.ResourceProvisioner {
+	return &schema.Provisioner{
+		Schema: map[string]*schema.Schema{
+			"inline": {
+				Type:          schema.TypeList,
+				Elem:          &schema.Schema{Type: schema.TypeString},
+				PromoteSingle: true,
+				Optional:      true,
+				ConflictsWith: []string{"script", "scripts"},
+			},
 
-func (p *ResourceProvisioner) Apply(s *terraform.ResourceState,
-	c *terraform.ResourceConfig) error {
-	// Ensure the connection type is SSH
-	if err := helper.VerifySSH(s); err != nil {
-		return err
+			"script": {
+				Type:          schema.TypeString,
+				Optional:      true,
+				ConflictsWith: []string{"inline", "scripts"},
+			},
+
+			"scripts": {
+				Type:          schema.TypeList,
+				Elem:          &schema.Schema{Type: schema.TypeString},
+				Optional:      true,
+				ConflictsWith: []string{"script", "inline"},
+			},
+		},
+
+		ApplyFunc: applyFn,
 	}
+}
 
-	// Get the SSH configuration
-	conf, err := helper.ParseSSHConfig(s)
+// Apply executes the remote exec provisioner
+func applyFn(ctx context.Context) error {
+	connState := ctx.Value(schema.ProvRawStateKey).(*terraform.InstanceState)
+	data := ctx.Value(schema.ProvConfigDataKey).(*schema.ResourceData)
+	o := ctx.Value(schema.ProvOutputKey).(terraform.UIOutput)
+
+	// Get a new communicator
+	comm, err := communicator.New(connState)
 	if err != nil {
 		return err
 	}
 
 	// Collect the scripts
-	scripts, err := p.collectScripts(c)
+	scripts, err := collectScripts(data)
 	if err != nil {
 		return err
 	}
@@ -45,101 +74,63 @@ func (p *ResourceProvisioner) Apply(s *terraform.ResourceState,
 	}
 
 	// Copy and execute each script
-	if err := p.runScripts(conf, scripts); err != nil {
+	if err := runScripts(ctx, o, comm, scripts); err != nil {
 		return err
 	}
+
 	return nil
 }
 
-func (p *ResourceProvisioner) Validate(c *terraform.ResourceConfig) (ws []string, es []error) {
-	num := 0
-	for name := range c.Raw {
-		switch name {
-		case "scripts":
-			fallthrough
-		case "script":
-			fallthrough
-		case "inline":
-			num++
-		default:
-			es = append(es, fmt.Errorf("Unknown configuration '%s'", name))
+// generateScripts takes the configuration and creates a script from each inline config
+func generateScripts(d *schema.ResourceData) ([]string, error) {
+	var lines []string
+	for _, l := range d.Get("inline").([]interface{}) {
+		line, ok := l.(string)
+		if !ok {
+			return nil, fmt.Errorf("Error parsing %v as a string", l)
 		}
-	}
-	if num != 1 {
-		es = append(es, fmt.Errorf("Must provide one of 'scripts', 'script' or 'inline' to remote-exec"))
-	}
-	return
-}
-
-// generateScript takes the configuration and creates a script to be executed
-// from the inline configs
-func (p *ResourceProvisioner) generateScript(c *terraform.ResourceConfig) (string, error) {
-	lines := []string{DefaultShebang}
-	command, ok := c.Config["inline"]
-	if ok {
-		switch cmd := command.(type) {
-		case string:
-			lines = append(lines, cmd)
-		case []string:
-			lines = append(lines, cmd...)
-		case []interface{}:
-			for _, l := range cmd {
-				lStr, ok := l.(string)
-				if ok {
-					lines = append(lines, lStr)
-				} else {
-					return "", fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
-				}
-			}
-		default:
-			return "", fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
-		}
+		lines = append(lines, line)
 	}
 	lines = append(lines, "")
-	return strings.Join(lines, "\n"), nil
+
+	return []string{strings.Join(lines, "\n")}, nil
 }
 
 // collectScripts is used to collect all the scripts we need
 // to execute in preparation for copying them.
-func (p *ResourceProvisioner) collectScripts(c *terraform.ResourceConfig) ([]io.ReadCloser, error) {
+func collectScripts(d *schema.ResourceData) ([]io.ReadCloser, error) {
 	// Check if inline
-	_, ok := c.Config["inline"]
-	if ok {
-		script, err := p.generateScript(c)
+	if _, ok := d.GetOk("inline"); ok {
+		scripts, err := generateScripts(d)
 		if err != nil {
 			return nil, err
 		}
-		rc := ioutil.NopCloser(bytes.NewReader([]byte(script)))
-		return []io.ReadCloser{rc}, nil
+
+		var r []io.ReadCloser
+		for _, script := range scripts {
+			r = append(r, ioutil.NopCloser(bytes.NewReader([]byte(script))))
+		}
+
+		return r, nil
 	}
 
 	// Collect scripts
 	var scripts []string
-	s, ok := c.Config["script"]
-	if ok {
-		sStr, ok := s.(string)
+	if script, ok := d.GetOk("script"); ok {
+		scr, ok := script.(string)
 		if !ok {
-			return nil, fmt.Errorf("Unsupported 'script' type! Must be a string.")
+			return nil, fmt.Errorf("Error parsing script %v as string", script)
 		}
-		scripts = append(scripts, sStr)
+		scripts = append(scripts, scr)
 	}
 
-	sl, ok := c.Config["scripts"]
-	if ok {
-		switch slt := sl.(type) {
-		case []string:
-			scripts = append(scripts, slt...)
-		case []interface{}:
-			for _, l := range slt {
-				lStr, ok := l.(string)
-				if ok {
-					scripts = append(scripts, lStr)
-				} else {
-					return nil, fmt.Errorf("Unsupported 'scripts' type! Must be list of strings.")
-				}
+	if scriptList, ok := d.GetOk("scripts"); ok {
+		for _, script := range scriptList.([]interface{}) {
+			scr, ok := script.(string)
+			if !ok {
+				return nil, fmt.Errorf("Error parsing script %v as string", script)
 			}
-		default:
-			return nil, fmt.Errorf("Unsupported 'scripts' type! Must be list of strings.")
+			scripts = append(scripts, scr)
 		}
 	}
 
@@ -161,18 +152,25 @@ func (p *ResourceProvisioner) collectScripts(c *terraform.ResourceConfig) ([]io.
 }
 
 // runScripts is used to copy and execute a set of scripts
-func (p *ResourceProvisioner) runScripts(conf *helper.SSHConfig, scripts []io.ReadCloser) error {
-	// Get the SSH client config
-	config, err := helper.PrepareConfig(conf)
-	if err != nil {
-		return err
-	}
+func runScripts(
+	ctx context.Context,
+	o terraform.UIOutput,
+	comm communicator.Communicator,
+	scripts []io.ReadCloser) error {
+	// Wrap out context in a cancelation function that we use to
+	// kill the connection.
+	ctx, cancelFunc := context.WithCancel(ctx)
+	defer cancelFunc()
 
-	// Wait and retry until we establish the SSH connection
-	var comm *helper.SSHCommunicator
-	err = retryFunc(conf.TimeoutVal, func() error {
-		host := fmt.Sprintf("%s:%d", conf.Host, conf.Port)
-		comm, err = helper.New(host, config)
+	// Wait for the context to end and then disconnect
+	go func() {
+		<-ctx.Done()
+		comm.Disconnect()
+	}()
+
+	// Wait and retry until we establish the connection
+	err := retryFunc(ctx, comm.Timeout(), func() error {
+		err := comm.Connect(o)
 		return err
 	})
 	if err != nil {
@@ -180,77 +178,145 @@ func (p *ResourceProvisioner) runScripts(conf *helper.SSHConfig, scripts []io.Re
 	}
 
 	for _, script := range scripts {
-		var cmd *helper.RemoteCmd
-		err := retryFunc(conf.TimeoutVal, func() error {
-			if err := comm.Upload(conf.ScriptPath, script); err != nil {
+		var cmd *remote.Cmd
+		outR, outW := io.Pipe()
+		errR, errW := io.Pipe()
+		outDoneCh := make(chan struct{})
+		errDoneCh := make(chan struct{})
+		go copyOutput(o, outR, outDoneCh)
+		go copyOutput(o, errR, errDoneCh)
+
+		remotePath := comm.ScriptPath()
+		err = retryFunc(ctx, comm.Timeout(), func() error {
+			if err := comm.UploadScript(remotePath, script); err != nil {
 				return fmt.Errorf("Failed to upload script: %v", err)
 			}
-			cmd = &helper.RemoteCmd{
-				Command: fmt.Sprintf("chmod 0777 %s", conf.ScriptPath),
-			}
-			if err := comm.Start(cmd); err != nil {
-				return fmt.Errorf(
-					"Error chmodding script file to 0777 in remote "+
-						"machine: %s", err)
-			}
-			cmd.Wait()
 
-			rPipe1, wPipe1 := io.Pipe()
-			rPipe2, wPipe2 := io.Pipe()
-			go streamLogs(rPipe1, "stdout")
-			go streamLogs(rPipe2, "stderr")
-
-			cmd = &helper.RemoteCmd{
-				Command: conf.ScriptPath,
-				Stdout:  wPipe1,
-				Stderr:  wPipe2,
+			cmd = &remote.Cmd{
+				Command: remotePath,
+				Stdout:  outW,
+				Stderr:  errW,
 			}
 			if err := comm.Start(cmd); err != nil {
 				return fmt.Errorf("Error starting script: %v", err)
 			}
+
 			return nil
 		})
-		if err != nil {
-			return err
+		if err == nil {
+			cmd.Wait()
+			if cmd.ExitStatus != 0 {
+				err = fmt.Errorf("Script exited with non-zero exit status: %d", cmd.ExitStatus)
+			}
 		}
 
-		cmd.Wait()
-		if cmd.ExitStatus != 0 {
-			return fmt.Errorf("Script exited with non-zero exit status: %d", cmd.ExitStatus)
+		// If we have an error, end our context so the disconnect happens.
+		// This has to happen before the output cleanup below since during
+		// an interrupt this will cause the outputs to end.
+		if err != nil {
+			cancelFunc()
+		}
+
+		// Wait for output to clean up
+		outW.Close()
+		errW.Close()
+		<-outDoneCh
+		<-errDoneCh
+
+		// Upload a blank follow up file in the same path to prevent residual
+		// script contents from remaining on remote machine
+		empty := bytes.NewReader([]byte(""))
+		if err := comm.Upload(remotePath, empty); err != nil {
+			// This feature is best-effort.
+			log.Printf("[WARN] Failed to upload empty follow up script: %v", err)
+		}
+
+		// If we have an error, return it out now that we've cleaned up
+		if err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-// retryFunc is used to retry a function for a given duration
-func retryFunc(timeout time.Duration, f func() error) error {
-	finish := time.After(timeout)
-	for {
-		err := f()
-		if err == nil {
-			return nil
-		}
-		log.Printf("Retryable error: %v", err)
-
-		select {
-		case <-finish:
-			return err
-		case <-time.After(3 * time.Second):
-		}
+func copyOutput(
+	o terraform.UIOutput, r io.Reader, doneCh chan<- struct{}) {
+	defer close(doneCh)
+	lr := linereader.New(r)
+	for line := range lr.Ch {
+		o.Output(line)
 	}
 }
 
-// streamLogs is used to stream lines from stdout/stderr
-// of a remote command to log output for users.
-func streamLogs(r io.ReadCloser, name string) {
-	defer r.Close()
-	bufR := bufio.NewReader(r)
-	for {
-		line, err := bufR.ReadString('\n')
-		if err != nil {
-			return
-		}
-		log.Printf("remote-exec: %s: %s", name, line)
+// retryFunc is used to retry a function for a given duration
+func retryFunc(ctx context.Context, timeout time.Duration, f func() error) error {
+	// Build a new context with the timeout
+	ctx, done := context.WithTimeout(ctx, timeout)
+	defer done()
+
+	// container for atomic error value
+	type errWrap struct {
+		E error
 	}
+
+	// Try the function in a goroutine
+	var errVal atomic.Value
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+
+		delay := time.Duration(0)
+		for {
+			// If our context ended, we want to exit right away.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+
+			// Try the function call
+			err := f()
+			errVal.Store(&errWrap{err})
+
+			if err == nil {
+				return
+			}
+
+			log.Printf("[WARN] retryable error: %v", err)
+
+			delay *= 2
+
+			if delay == 0 {
+				delay = initialBackoffDelay
+			}
+
+			if delay > maxBackoffDelay {
+				delay = maxBackoffDelay
+			}
+
+			log.Printf("[INFO] sleeping for %s", delay)
+		}
+	}()
+
+	// Wait for completion
+	select {
+	case <-ctx.Done():
+	case <-doneCh:
+	}
+
+	// Check if we have a context error to check if we're interrupted or timeout
+	switch ctx.Err() {
+	case context.Canceled:
+		return fmt.Errorf("interrupted")
+	case context.DeadlineExceeded:
+		return fmt.Errorf("timeout")
+	}
+
+	// Check if we got an error executing
+	if ev, ok := errVal.Load().(errWrap); ok {
+		return ev.E
+	}
+
+	return nil
 }

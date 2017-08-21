@@ -1,35 +1,34 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
+	"github.com/hashicorp/hil/ast"
 	"github.com/mitchellh/reflectwalk"
 )
 
 func TestInterpolationWalker_detect(t *testing.T) {
 	cases := []struct {
 		Input  interface{}
-		Result []Interpolation
+		Result []string
 	}{
 		{
 			Input: map[string]interface{}{
 				"foo": "$${var.foo}",
 			},
-			Result: nil,
+			Result: []string{
+				"Literal(TypeString, ${var.foo})",
+			},
 		},
 
 		{
 			Input: map[string]interface{}{
 				"foo": "${var.foo}",
 			},
-			Result: []Interpolation{
-				&VariableInterpolation{
-					Variable: &UserVariable{
-						Name: "foo",
-						key:  "var.foo",
-					},
-				},
+			Result: []string{
+				"Variable(var.foo)",
 			},
 		},
 
@@ -37,19 +36,8 @@ func TestInterpolationWalker_detect(t *testing.T) {
 			Input: map[string]interface{}{
 				"foo": "${aws_instance.foo.*.num}",
 			},
-			Result: []Interpolation{
-				&VariableInterpolation{
-					Variable: &ResourceVariable{
-						Type:  "aws_instance",
-						Name:  "foo",
-						Field: "num",
-
-						Multi: true,
-						Index: -1,
-
-						key: "aws_instance.foo.*.num",
-					},
-				},
+			Result: []string{
+				"Variable(aws_instance.foo.*.num)",
 			},
 		},
 
@@ -57,18 +45,8 @@ func TestInterpolationWalker_detect(t *testing.T) {
 			Input: map[string]interface{}{
 				"foo": "${lookup(var.foo)}",
 			},
-			Result: []Interpolation{
-				&FunctionInterpolation{
-					Func: nil,
-					Args: []Interpolation{
-						&VariableInterpolation{
-							Variable: &UserVariable{
-								Name: "foo",
-								key:  "var.foo",
-							},
-						},
-					},
-				},
+			Result: []string{
+				"Call(lookup, Variable(var.foo))",
 			},
 		},
 
@@ -76,38 +54,49 @@ func TestInterpolationWalker_detect(t *testing.T) {
 			Input: map[string]interface{}{
 				"foo": `${file("test.txt")}`,
 			},
-			Result: []Interpolation{
-				&FunctionInterpolation{
-					Func: nil,
-					Args: []Interpolation{
-						&LiteralInterpolation{
-							Literal: "test.txt",
-						},
-					},
-				},
+			Result: []string{
+				"Call(file, Literal(TypeString, test.txt))",
+			},
+		},
+
+		{
+			Input: map[string]interface{}{
+				"foo": `${file("foo/bar.txt")}`,
+			},
+			Result: []string{
+				"Call(file, Literal(TypeString, foo/bar.txt))",
+			},
+		},
+
+		{
+			Input: map[string]interface{}{
+				"foo": `${join(",", foo.bar.*.id)}`,
+			},
+			Result: []string{
+				"Call(join, Literal(TypeString, ,), Variable(foo.bar.*.id))",
+			},
+		},
+
+		{
+			Input: map[string]interface{}{
+				"foo": `${concat("localhost", ":8080")}`,
+			},
+			Result: []string{
+				"Call(concat, Literal(TypeString, localhost), Literal(TypeString, :8080))",
 			},
 		},
 	}
 
 	for i, tc := range cases {
-		var actual []Interpolation
-
-		detectFn := func(i Interpolation) (string, error) {
-			actual = append(actual, i)
+		var actual []string
+		detectFn := func(root ast.Node) (interface{}, error) {
+			actual = append(actual, fmt.Sprintf("%s", root))
 			return "", nil
 		}
 
 		w := &interpolationWalker{F: detectFn}
 		if err := reflectwalk.Walk(tc.Input, w); err != nil {
 			t.Fatalf("err: %s", err)
-		}
-
-		for _, a := range actual {
-			// This is jank, but reflect.DeepEqual never has functions
-			// being the same.
-			if f, ok := a.(*FunctionInterpolation); ok {
-				f.Func = nil
-			}
 		}
 
 		if !reflect.DeepEqual(actual, tc.Result) {
@@ -120,14 +109,16 @@ func TestInterpolationWalker_replace(t *testing.T) {
 	cases := []struct {
 		Input  interface{}
 		Output interface{}
+		Value  interface{}
 	}{
 		{
 			Input: map[string]interface{}{
 				"foo": "$${var.foo}",
 			},
 			Output: map[string]interface{}{
-				"foo": "$${var.foo}",
+				"foo": "bar",
 			},
+			Value: "bar",
 		},
 
 		{
@@ -135,23 +126,74 @@ func TestInterpolationWalker_replace(t *testing.T) {
 				"foo": "hello, ${var.foo}",
 			},
 			Output: map[string]interface{}{
-				"foo": "hello, bar",
+				"foo": "bar",
 			},
+			Value: "bar",
+		},
+
+		{
+			Input: map[string]interface{}{
+				"foo": map[string]interface{}{
+					"${var.foo}": "bar",
+				},
+			},
+			Output: map[string]interface{}{
+				"foo": map[string]interface{}{
+					"bar": "bar",
+				},
+			},
+			Value: "bar",
+		},
+
+		{
+			Input: map[string]interface{}{
+				"foo": []interface{}{
+					"${var.foo}",
+					"bing",
+				},
+			},
+			Output: map[string]interface{}{
+				"foo": []interface{}{
+					"bar",
+					"baz",
+					"bing",
+				},
+			},
+			Value: []interface{}{"bar", "baz"},
+		},
+
+		{
+			Input: map[string]interface{}{
+				"foo": []interface{}{
+					"${var.foo}",
+					"bing",
+				},
+			},
+			Output: map[string]interface{}{
+				"foo": []interface{}{
+					UnknownVariableValue,
+					"baz",
+					"bing",
+				},
+			},
+			Value: []interface{}{UnknownVariableValue, "baz"},
 		},
 	}
 
 	for i, tc := range cases {
-		fn := func(i Interpolation) (string, error) {
-			return "bar", nil
+		fn := func(ast.Node) (interface{}, error) {
+			return tc.Value, nil
 		}
 
-		w := &interpolationWalker{F: fn, Replace: true}
-		if err := reflectwalk.Walk(tc.Input, w); err != nil {
-			t.Fatalf("err: %s", err)
-		}
+		t.Run(fmt.Sprintf("walk-%d", i), func(t *testing.T) {
+			w := &interpolationWalker{F: fn, Replace: true}
+			if err := reflectwalk.Walk(tc.Input, w); err != nil {
+				t.Fatalf("err: %s", err)
+			}
 
-		if !reflect.DeepEqual(tc.Input, tc.Output) {
-			t.Fatalf("%d: bad:\n\n%#v", i, tc.Input)
-		}
+			if !reflect.DeepEqual(tc.Input, tc.Output) {
+				t.Fatalf("%d: bad:\n\nexpected:%#v\ngot:%#v", i, tc.Output, tc.Input)
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/hil/ast"
 	"github.com/hashicorp/terraform/config"
 	"github.com/hashicorp/terraform/terraform"
 )
@@ -21,7 +22,12 @@ func testConfig(
 	}
 
 	if len(vs) > 0 {
-		if err := rc.Interpolate(vs); err != nil {
+		vars := make(map[string]ast.Variable)
+		for k, v := range vs {
+			vars[k] = ast.Variable{Value: v, Type: ast.TypeString}
+		}
+
+		if err := rc.Interpolate(vars); err != nil {
 			t.Fatalf("err: %s", err)
 		}
 	}
@@ -29,7 +35,7 @@ func testConfig(
 	return terraform.NewResourceConfig(rc)
 }
 
-func testResourceDiffStr(rd *terraform.ResourceDiff) string {
+func testResourceDiffStr(rd *terraform.InstanceDiff) string {
 	var buf bytes.Buffer
 
 	crud := "UPDATE"

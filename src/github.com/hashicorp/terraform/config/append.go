@@ -21,12 +21,35 @@ func Append(c1, c2 *Config) (*Config, error) {
 			c.unknownKeys = append(c.unknownKeys, k)
 		}
 	}
+
 	for _, k := range c2.unknownKeys {
 		_, present := unknowns[k]
 		if !present {
 			unknowns[k] = struct{}{}
 			c.unknownKeys = append(c.unknownKeys, k)
 		}
+	}
+
+	c.Atlas = c1.Atlas
+	if c2.Atlas != nil {
+		c.Atlas = c2.Atlas
+	}
+
+	// merge Terraform blocks
+	if c1.Terraform != nil {
+		c.Terraform = c1.Terraform
+		if c2.Terraform != nil {
+			c.Terraform.Merge(c2.Terraform)
+		}
+	} else {
+		c.Terraform = c2.Terraform
+	}
+
+	if len(c1.Modules) > 0 || len(c2.Modules) > 0 {
+		c.Modules = make(
+			[]*Module, 0, len(c1.Modules)+len(c2.Modules))
+		c.Modules = append(c.Modules, c1.Modules...)
+		c.Modules = append(c.Modules, c2.Modules...)
 	}
 
 	if len(c1.Outputs) > 0 || len(c2.Outputs) > 0 {

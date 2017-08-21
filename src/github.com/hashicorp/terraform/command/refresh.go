@@ -1,11 +1,12 @@
 package command
 
 import (
+	"context"
 	"fmt"
-	"log"
-	"os"
 	"strings"
 
+	"github.com/hashicorp/terraform/backend"
+	"github.com/hashicorp/terraform/config"
 	"github.com/hashicorp/terraform/terraform"
 )
 
@@ -16,112 +17,78 @@ type RefreshCommand struct {
 }
 
 func (c *RefreshCommand) Run(args []string) int {
-	var statePath, stateOutPath, backupPath string
-
-	args = c.Meta.process(args, true)
+	args, err := c.Meta.process(args, true)
+	if err != nil {
+		return 1
+	}
 
 	cmdFlags := c.Meta.flagSet("refresh")
-	cmdFlags.StringVar(&statePath, "state", DefaultStateFilename, "path")
-	cmdFlags.StringVar(&stateOutPath, "state-out", "", "path")
-	cmdFlags.StringVar(&backupPath, "backup", "", "path")
+	cmdFlags.StringVar(&c.Meta.statePath, "state", DefaultStateFilename, "path")
+	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", 0, "parallelism")
+	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
+	cmdFlags.StringVar(&c.Meta.backupPath, "backup", "", "path")
+	cmdFlags.BoolVar(&c.Meta.stateLock, "lock", true, "lock state")
+	cmdFlags.DurationVar(&c.Meta.stateLockTimeout, "lock-timeout", 0, "lock timeout")
 	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
 	if err := cmdFlags.Parse(args); err != nil {
 		return 1
 	}
 
-	var configPath string
-	args = cmdFlags.Args()
-	if len(args) > 1 {
-		c.Ui.Error("The apply command expacts at most one argument.")
-		cmdFlags.Usage()
-		return 1
-	} else if len(args) == 1 {
-		configPath = args[0]
-	} else {
-		var err error
-		configPath, err = os.Getwd()
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error getting pwd: %s", err))
-		}
-	}
-
-	// If we don't specify an output path, default to out normal state
-	// path.
-	if stateOutPath == "" {
-		stateOutPath = statePath
-	}
-
-	// If we don't specify a backup path, default to state out with
-	// the extension
-	if backupPath == "" {
-		backupPath = stateOutPath + DefaultBackupExtention
-	}
-
-	// Verify that the state path exists. The "ContextArg" function below
-	// will actually do this, but we want to provide a richer error message
-	// if possible.
-	if _, err := os.Stat(statePath); err != nil {
-		if os.IsNotExist(err) {
-			c.Ui.Error(fmt.Sprintf(
-				"The Terraform state file for your infrastructure does not\n"+
-					"exist. The 'refresh' command only works and only makes sense\n"+
-					"when there is existing state that Terraform is managing. Please\n"+
-					"double-check the value given below and try again. If you\n"+
-					"haven't created infrastructure with Terraform yet, use the\n"+
-					"'terraform apply' command.\n\n"+
-					"Path: %s",
-				statePath))
-			return 1
-		}
-
-		c.Ui.Error(fmt.Sprintf(
-			"There was an error reading the Terraform state that is needed\n"+
-				"for refreshing. The path and error are shown below.\n\n"+
-				"Path: %s\n\nError: %s",
-			statePath,
-			err))
-		return 1
-	}
-
-	// Build the context based on the arguments given
-	ctx, _, err := c.Context(configPath, statePath)
+	configPath, err := ModulePath(cmdFlags.Args())
 	if err != nil {
 		c.Ui.Error(err.Error())
 		return 1
 	}
-	if !validateContext(ctx, c.Ui) {
-		return 1
-	}
 
-	// Create a backup of the state before updating
-	if backupPath != "-" && c.state != nil {
-		log.Printf("[INFO] Writing backup state to: %s", backupPath)
-		f, err := os.Create(backupPath)
-		if err == nil {
-			err = terraform.WriteState(c.state, f)
-			f.Close()
-		}
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error writing backup state file: %s", err))
-			return 1
-		}
-	}
-
-	state, err := ctx.Refresh()
+	// Load the module
+	mod, err := c.Module(configPath)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error refreshing state: %s", err))
+		c.Ui.Error(fmt.Sprintf("Failed to load root config module: %s", err))
 		return 1
 	}
 
-	log.Printf("[INFO] Writing state output to: %s", stateOutPath)
-	f, err := os.Create(stateOutPath)
-	if err == nil {
-		defer f.Close()
-		err = terraform.WriteState(state, f)
-	}
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error writing state file: %s", err))
+	// Check for user-supplied plugin path
+	if c.pluginPath, err = c.loadPluginPath(); err != nil {
+		c.Ui.Error(fmt.Sprintf("Error loading plugin path: %s", err))
 		return 1
+	}
+
+	var conf *config.Config
+	if mod != nil {
+		conf = mod.Config()
+	}
+
+	// Load the backend
+	b, err := c.Backend(&BackendOpts{
+		Config: conf,
+	})
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+		return 1
+	}
+
+	// Build the operation
+	opReq := c.Operation()
+	opReq.Type = backend.OperationTypeRefresh
+	opReq.Module = mod
+
+	// Perform the operation
+	op, err := b.Operation(context.Background(), opReq)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error starting operation: %s", err))
+		return 1
+	}
+
+	// Wait for the operation to complete
+	<-op.Done()
+	if err := op.Err; err != nil {
+		c.Ui.Error(err.Error())
+		return 1
+	}
+
+	// Output the outputs
+	if outputs := outputsAsString(op.State, terraform.RootModulePath, nil, true); outputs != "" {
+		c.Ui.Output(c.Colorize().Color(outputs))
 	}
 
 	return 0
@@ -144,6 +111,12 @@ Options:
                       modifying. Defaults to the "-state-out" path with
                       ".backup" extension. Set to "-" to disable backup.
 
+  -input=true         Ask for input for variables if not directly set.
+
+  -lock=true          Lock the state file when locking is supported.
+
+  -lock-timeout=0s    Duration to retry a state lock.
+
   -no-color           If specified, output won't contain any color.
 
   -state=path         Path to read and save state (unless state-out
@@ -152,12 +125,16 @@ Options:
   -state-out=path     Path to write updated state file. By default, the
                       "-state" path will be used.
 
+  -target=resource    Resource to target. Operation will be limited to this
+                      resource and its dependencies. This flag can be used
+                      multiple times.
+
   -var 'foo=bar'      Set a variable in the Terraform configuration. This
                       flag can be set multiple times.
 
   -var-file=foo       Set variables in the Terraform configuration from
-                      a file. If "terraform.tfvars" is present, it will be
-                      automatically loaded if this flag is not specified.
+                      a file. If "terraform.tfvars" or any ".auto.tfvars"
+                      files are present, they will be automatically loaded.
 
 `
 	return strings.TrimSpace(helpText)

@@ -1,120 +1,84 @@
 package resource
 
 import (
-	"errors"
-	"fmt"
-	"log"
-	"math"
+	"sync"
 	"time"
 )
 
-// StateRefreshFunc is a function type used for StateChangeConf that is
-// responsible for refreshing the item being watched for a state change.
-//
-// It returns three results. `result` is any object that will be returned
-// as the final object after waiting for state change. This allows you to
-// return the final updated object, for example an EC2 instance after refreshing
-// it.
-//
-// `state` is the latest state of that object. And `err` is any error that
-// may have happened while refreshing the state.
-type StateRefreshFunc func() (result interface{}, state string, err error)
+// Retry is a basic wrapper around StateChangeConf that will just retry
+// a function until it no longer returns an error.
+func Retry(timeout time.Duration, f RetryFunc) error {
+	// These are used to pull the error out of the function; need a mutex to
+	// avoid a data race.
+	var resultErr error
+	var resultErrMu sync.Mutex
 
-// StateChangeConf is the configuration struct used for `WaitForState`.
-type StateChangeConf struct {
-	Delay      time.Duration    // Wait this time before starting checks
-	Pending    []string         // States that are "allowed" and will continue trying
-	Refresh    StateRefreshFunc // Refreshes the current state
-	Target     string           // Target state
-	Timeout    time.Duration    // The amount of time to wait before timeout
-	MinTimeout time.Duration    // Smallest time to wait before refreshes
+	c := &StateChangeConf{
+		Pending:    []string{"retryableerror"},
+		Target:     []string{"success"},
+		Timeout:    timeout,
+		MinTimeout: 500 * time.Millisecond,
+		Refresh: func() (interface{}, string, error) {
+			rerr := f()
+
+			resultErrMu.Lock()
+			defer resultErrMu.Unlock()
+
+			if rerr == nil {
+				resultErr = nil
+				return 42, "success", nil
+			}
+
+			resultErr = rerr.Err
+
+			if rerr.Retryable {
+				return 42, "retryableerror", nil
+			}
+			return nil, "quit", rerr.Err
+		},
+	}
+
+	_, waitErr := c.WaitForState()
+
+	// Need to acquire the lock here to be able to avoid race using resultErr as
+	// the return value
+	resultErrMu.Lock()
+	defer resultErrMu.Unlock()
+
+	// resultErr may be nil because the wait timed out and resultErr was never
+	// set; this is still an error
+	if resultErr == nil {
+		return waitErr
+	}
+	// resultErr takes precedence over waitErr if both are set because it is
+	// more likely to be useful
+	return resultErr
 }
 
-// WaitForState watches an object and waits for it to achieve the state
-// specified in the configuration using the specified Refresh() func,
-// waiting the number of seconds specified in the timeout configuration.
-func (conf *StateChangeConf) WaitForState() (interface{}, error) {
-	log.Printf("[DEBUG] Waiting for state to become: %s", conf.Target)
+// RetryFunc is the function retried until it succeeds.
+type RetryFunc func() *RetryError
 
-	notfoundTick := 0
+// RetryError is the required return type of RetryFunc. It forces client code
+// to choose whether or not a given error is retryable.
+type RetryError struct {
+	Err       error
+	Retryable bool
+}
 
-	var result interface{}
-	var resulterr error
-
-	doneCh := make(chan struct{})
-	go func() {
-		defer close(doneCh)
-
-		// Wait for the delay
-		time.Sleep(conf.Delay)
-
-		var err error
-		for tries := 0; ; tries++ {
-			// Wait between refreshes using an exponential backoff
-			wait := time.Duration(math.Pow(2, float64(tries))) *
-				100 * time.Millisecond
-			if wait < conf.MinTimeout {
-				wait = conf.MinTimeout
-			} else if wait > 10*time.Second {
-				wait = 10 * time.Second
-			}
-
-			log.Printf("[TRACE] Waiting %s before next try", wait)
-			time.Sleep(wait)
-
-			var currentState string
-			result, currentState, err = conf.Refresh()
-			if err != nil {
-				resulterr = err
-				return
-			}
-
-			// If we're waiting for the absence of a thing, then return
-			if result == nil && conf.Target == "" {
-				return
-			}
-
-			if result == nil {
-				// If we didn't find the resource, check if we have been
-				// not finding it for awhile, and if so, report an error.
-				notfoundTick += 1
-				if notfoundTick > 20 {
-					resulterr = errors.New("couldn't find resource")
-					return
-				}
-			} else {
-				// Reset the counter for when a resource isn't found
-				notfoundTick = 0
-
-				if currentState == conf.Target {
-					return
-				}
-
-				found := false
-				for _, allowed := range conf.Pending {
-					if currentState == allowed {
-						found = true
-						break
-					}
-				}
-
-				if !found {
-					resulterr = fmt.Errorf(
-						"unexpected state '%s', wanted target '%s'",
-						currentState,
-						conf.Target)
-					return
-				}
-			}
-		}
-	}()
-
-	select {
-	case <-doneCh:
-		return result, resulterr
-	case <-time.After(conf.Timeout):
-		return nil, fmt.Errorf(
-			"timeout while waiting for state to become '%s'",
-			conf.Target)
+// RetryableError is a helper to create a RetryError that's retryable from a
+// given error.
+func RetryableError(err error) *RetryError {
+	if err == nil {
+		return nil
 	}
+	return &RetryError{Err: err, Retryable: true}
+}
+
+// NonRetryableError is a helper to create a RetryError that's _not)_ retryable
+// from a given error.
+func NonRetryableError(err error) *RetryError {
+	if err == nil {
+		return nil
+	}
+	return &RetryError{Err: err, Retryable: false}
 }

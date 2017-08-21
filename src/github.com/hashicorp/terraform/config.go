@@ -1,14 +1,14 @@
+//go:generate go run ./scripts/generate-plugins.go
 package main
 
 import (
-	"os/exec"
-	"path/filepath"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
 
-	"github.com/hashicorp/terraform/plugin"
-	"github.com/hashicorp/terraform/rpc"
-	"github.com/hashicorp/terraform/terraform"
-	"github.com/mitchellh/go-libucl"
-	"github.com/mitchellh/osext"
+	"github.com/hashicorp/hcl"
+	"github.com/hashicorp/terraform/command"
 )
 
 // Config is the structure of the configuration for the Terraform CLI.
@@ -18,58 +18,61 @@ import (
 type Config struct {
 	Providers    map[string]string
 	Provisioners map[string]string
+
+	DisableCheckpoint          bool `hcl:"disable_checkpoint"`
+	DisableCheckpointSignature bool `hcl:"disable_checkpoint_signature"`
 }
 
 // BuiltinConfig is the built-in defaults for the configuration. These
 // can be overridden by user configurations.
 var BuiltinConfig Config
 
-// ContextOpts are the global ContextOpts we use to initialize the CLI.
-var ContextOpts terraform.ContextOpts
+// PluginOverrides are paths that override discovered plugins, set from
+// the config file.
+var PluginOverrides command.PluginOverrides
 
-// Put the parse flags we use for libucl in a constant so we can get
-// equally behaving parsing everywhere.
-const libuclParseFlags = libucl.ParserNoTime
+// ConfigFile returns the default path to the configuration file.
+//
+// On Unix-like systems this is the ".terraformrc" file in the home directory.
+// On Windows, this is the "terraform.rc" file in the application data
+// directory.
+func ConfigFile() (string, error) {
+	return configFile()
+}
 
-func init() {
-	BuiltinConfig.Providers = map[string]string{
-		"aws":          "terraform-provider-aws",
-		"digitalocean": "terraform-provider-digitalocean",
-		"heroku":       "terraform-provider-heroku",
-		"dnsimple":     "terraform-provider-dnsimple",
-		"consul":       "terraform-provider-consul",
-		"cloudflare":   "terraform-provider-cloudflare",
-	}
-	BuiltinConfig.Provisioners = map[string]string{
-		"local-exec":  "terraform-provisioner-local-exec",
-		"remote-exec": "terraform-provisioner-remote-exec",
-		"file":        "terraform-provisioner-file",
-	}
+// ConfigDir returns the configuration directory for Terraform.
+func ConfigDir() (string, error) {
+	return configDir()
 }
 
 // LoadConfig loads the CLI configuration from ".terraformrc" files.
 func LoadConfig(path string) (*Config, error) {
-	var obj *libucl.Object
-
-	// Parse the file and get the root object.
-	parser := libucl.NewParser(libuclParseFlags)
-	err := parser.AddFile(path)
-	if err == nil {
-		obj = parser.Object()
-		defer obj.Close()
-	}
-	defer parser.Close()
-
-	// If there was an error parsing, return now.
+	// Read the HCL file and prepare for parsing
+	d, err := ioutil.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf(
+			"Error reading %s: %s", path, err)
+	}
+
+	// Parse it
+	obj, err := hcl.Parse(string(d))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"Error parsing %s: %s", path, err)
 	}
 
 	// Build up the result
 	var result Config
-
-	if err := obj.Decode(&result); err != nil {
+	if err := hcl.DecodeObject(&result, obj); err != nil {
 		return nil, err
+	}
+
+	// Replace all env vars
+	for k, v := range result.Providers {
+		result.Providers[k] = os.ExpandEnv(v)
+	}
+	for k, v := range result.Provisioners {
+		result.Provisioners[k] = os.ExpandEnv(v)
 	}
 
 	return &result, nil
@@ -85,118 +88,22 @@ func (c1 *Config) Merge(c2 *Config) *Config {
 		result.Providers[k] = v
 	}
 	for k, v := range c2.Providers {
+		if v1, ok := c1.Providers[k]; ok {
+			log.Printf("[INFO] Local %s provider configuration '%s' overrides '%s'", k, v, v1)
+		}
 		result.Providers[k] = v
 	}
 	for k, v := range c1.Provisioners {
 		result.Provisioners[k] = v
 	}
 	for k, v := range c2.Provisioners {
+		if v1, ok := c1.Provisioners[k]; ok {
+			log.Printf("[INFO] Local %s provisioner configuration '%s' overrides '%s'", k, v, v1)
+		}
 		result.Provisioners[k] = v
 	}
+	result.DisableCheckpoint = c1.DisableCheckpoint || c2.DisableCheckpoint
+	result.DisableCheckpointSignature = c1.DisableCheckpointSignature || c2.DisableCheckpointSignature
 
 	return &result
-}
-
-// ProviderFactories returns the mapping of prefixes to
-// ResourceProviderFactory that can be used to instantiate a
-// binary-based plugin.
-func (c *Config) ProviderFactories() map[string]terraform.ResourceProviderFactory {
-	result := make(map[string]terraform.ResourceProviderFactory)
-	for k, v := range c.Providers {
-		result[k] = c.providerFactory(v)
-	}
-
-	return result
-}
-
-func (c *Config) providerFactory(path string) terraform.ResourceProviderFactory {
-	return func() (terraform.ResourceProvider, error) {
-		// Build the plugin client configuration and init the plugin
-		var config plugin.ClientConfig
-		config.Cmd = pluginCmd(path)
-		config.Managed = true
-		client := plugin.NewClient(&config)
-
-		// Request the RPC client and service name from the client
-		// so we can build the actual RPC-implemented provider.
-		rpcClient, err := client.Client()
-		if err != nil {
-			return nil, err
-		}
-
-		service, err := client.Service()
-		if err != nil {
-			return nil, err
-		}
-
-		return &rpc.ResourceProvider{
-			Client: rpcClient,
-			Name:   service,
-		}, nil
-	}
-}
-
-// ProvisionerFactories returns the mapping of prefixes to
-// ResourceProvisionerFactory that can be used to instantiate a
-// binary-based plugin.
-func (c *Config) ProvisionerFactories() map[string]terraform.ResourceProvisionerFactory {
-	result := make(map[string]terraform.ResourceProvisionerFactory)
-	for k, v := range c.Provisioners {
-		result[k] = c.provisionerFactory(v)
-	}
-
-	return result
-}
-
-func (c *Config) provisionerFactory(path string) terraform.ResourceProvisionerFactory {
-	return func() (terraform.ResourceProvisioner, error) {
-		// Build the plugin client configuration and init the plugin
-		var config plugin.ClientConfig
-		config.Cmd = pluginCmd(path)
-		config.Managed = true
-		client := plugin.NewClient(&config)
-
-		// Request the RPC client and service name from the client
-		// so we can build the actual RPC-implemented provider.
-		rpcClient, err := client.Client()
-		if err != nil {
-			return nil, err
-		}
-
-		service, err := client.Service()
-		if err != nil {
-			return nil, err
-		}
-
-		return &rpc.ResourceProvisioner{
-			Client: rpcClient,
-			Name:   service,
-		}, nil
-	}
-}
-
-func pluginCmd(path string) *exec.Cmd {
-	originalPath := path
-
-	// First look for the provider on the PATH.
-	path, err := exec.LookPath(path)
-	if err != nil {
-		// If that doesn't work, look for it in the same directory
-		// as the executable that is running.
-		exePath, err := osext.Executable()
-		if err == nil {
-			path = filepath.Join(
-				filepath.Dir(exePath),
-				filepath.Base(originalPath))
-		}
-	}
-
-	// If we still don't have a path set, then set it to the
-	// original path and let any errors that happen bubble out.
-	if path == "" {
-		path = originalPath
-	}
-
-	// Build the command to execute the plugin
-	return exec.Command(path)
 }
