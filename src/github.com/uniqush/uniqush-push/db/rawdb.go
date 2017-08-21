@@ -18,7 +18,8 @@
 package db
 
 import (
-	. "github.com/uniqush/uniqush-push/push"
+	"github.com/uniqush/log"
+	"github.com/uniqush/uniqush-push/push"
 )
 
 // In general, an push database stores the relationships between
@@ -46,10 +47,11 @@ import (
 
 // Danger: writing wrong data may leads to inconsistent
 type pushRawDatabaseWriter interface {
-	SetDeliveryPoint(dp *DeliveryPoint) error
-	SetPushServiceProvider(psp *PushServiceProvider) error
+	SetDeliveryPoint(dp *push.DeliveryPoint) error
+	SetPushServiceProvider(psp *push.PushServiceProvider) error
 	RemoveDeliveryPoint(dp string) error
 	RemovePushServiceProvider(psp string) error
+	RebuildServiceSet() error
 
 	AddDeliveryPointToServiceSubscriber(srv, sub, dp string) error
 	RemoveDeliveryPointFromServiceSubscriber(srv, sub, dp string) error
@@ -64,8 +66,11 @@ type pushRawDatabaseWriter interface {
 
 // These methods should be fast!
 type pushRawDatabaseReader interface {
-	GetDeliveryPoint(name string) (*DeliveryPoint, error)
-	GetPushServiceProvider(name string) (*PushServiceProvider, error)
+	GetDeliveryPoint(name string) (*push.DeliveryPoint, error)
+	GetPushServiceProvider(name string) (*push.PushServiceProvider, error)
+	GetServiceNames() ([]string, error)
+	GetPushServiceProviderConfigs([]string) ([]*push.PushServiceProvider, []error)
+	GetSubscriptions(queryServices []string, subscriber string, logger log.Logger) ([]map[string]string, error)
 
 	GetDeliveryPointsNameByServiceSubscriber(srv, sub string) (map[string][]string, error)
 	GetPushServiceProviderNameByServiceDeliveryPoint(srv, dp string) (string, error)

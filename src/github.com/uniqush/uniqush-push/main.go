@@ -22,19 +22,20 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	. "github.com/uniqush/uniqush-push/srv"
+
+	"github.com/uniqush/uniqush-push/srv"
 )
 
 var uniqushPushConfFlags = flag.String("config", "/etc/uniqush/uniqush-push.conf", "Config file path")
 var uniqushPushShowVersionFlag = flag.Bool("version", false, "Version info")
 
-var uniqushPushVersion = "uniqush-push 1.5.2"
+var uniqushPushVersion = "uniqush-push 2.3.0"
 
-func installPushSrvices() {
-	InstallGCM()
-	InstallC2DM()
-	InstallAPNS()
-	InstallADM()
+func installPushServices() {
+	srv.InstallGCM()
+	srv.InstallFCM()
+	srv.InstallAPNS()
+	srv.InstallADM()
 }
 
 func main() {
@@ -44,7 +45,7 @@ func main() {
 		return
 	}
 	runtime.GOMAXPROCS(runtime.NumCPU() + 1)
-	installPushSrvices()
+	installPushServices()
 
 	err := Run(*uniqushPushConfFlags, uniqushPushVersion)
 	if err != nil {

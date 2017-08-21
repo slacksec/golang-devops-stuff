@@ -1,0 +1,17 @@
+language: go
+
+# Compile with the latest OS image (previously 12.04, now 14.04)
+# `sudo: required` is the default for repositories enabled before 2015 (we don't need it and it's slower)
+dist: trusty
+sudo: false
+
+# Compile with go 1.8.3 (or newer). It takes a long time to install `tip`
+go:
+  - 1.8.3
+
+# install step default is `go get ./...`
+# script default is `go test ./...`
+# (Could include apns-test.sh, but that doesn't have expected output written yet)
+script:
+  - go tool vet -printfuncs debugf,infof,configf,warnf,errorf,alertf,fatalf .
+  - go test ./... -race
