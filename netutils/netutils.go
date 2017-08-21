@@ -20,6 +20,37 @@ func CopyUrl(in *url.URL) *url.URL {
 	return out
 }
 
+// RawPath returns escaped url path section
+func RawPath(in string) (string, error) {
+	u, err := url.ParseRequestURI(in)
+	if err != nil {
+		return "", err
+	}
+	path := ""
+	if u.Opaque != "" {
+		path = u.Opaque
+	} else if u.Host == "" {
+		path = in
+	} else {
+		vals := strings.SplitN(in, u.Host, 2)
+		if len(vals) != 2 {
+			return "", fmt.Errorf("failed to parse url")
+		}
+		path = vals[1]
+	}
+	idx := strings.IndexRune(path, '?')
+	if idx == -1 {
+		return path, nil
+	}
+	return path[:idx], nil
+}
+
+// RawURL returns URL built out of the provided request's Request-URI, to avoid un-escaping.
+// Note: it assumes that scheme and host for the provided request's URL are defined.
+func RawURL(request *http.Request) string {
+	return strings.Join([]string{request.URL.Scheme, "://", request.URL.Host, request.RequestURI}, "")
+}
+
 // Copies http headers from source to destination
 // does not overide, but adds multiple headers
 func CopyHeaders(dst, src http.Header) {
@@ -85,8 +116,7 @@ func ParseAuthHeader(header string) (*BasicAuth, error) {
 
 	values := strings.Fields(header)
 	if len(values) != 2 {
-		return nil, fmt.Errorf(
-			fmt.Sprintf("Failed to parse header '%s'", header))
+		return nil, fmt.Errorf(fmt.Sprintf("Failed to parse header '%s'", header))
 	}
 
 	auth_type := strings.ToLower(values[0])
@@ -97,16 +127,12 @@ func ParseAuthHeader(header string) (*BasicAuth, error) {
 	encoded_string := values[1]
 	decoded_string, err := base64.StdEncoding.DecodeString(encoded_string)
 	if err != nil {
-		err = fmt.Errorf(
-			"Failed to parse header '%s', base64 failed: %s", header, err)
-		return nil, err
+		return nil, fmt.Errorf("Failed to parse header '%s', base64 failed: %s", header, err)
 	}
 
 	values = strings.SplitN(string(decoded_string), ":", 2)
 	if len(values) != 2 {
-		err = fmt.Errorf(
-			"Failed to parse header '%s', expected separator ':'", header, err)
-		return nil, err
+		return nil, fmt.Errorf("Failed to parse header '%s', expected separator ':'", header)
 	}
 	return &BasicAuth{Username: values[0], Password: values[1]}, nil
 }

@@ -2,12 +2,14 @@ package metrics
 
 import (
 	"fmt"
-	timetools "github.com/mailgun/gotools-time"
-	. "github.com/mailgun/vulcan/endpoint"
-	. "github.com/mailgun/vulcan/request"
-	. "gopkg.in/check.v1"
 	"testing"
 	"time"
+
+	"github.com/mailgun/timetools"
+	. "github.com/mailgun/vulcan/endpoint"
+	. "github.com/mailgun/vulcan/request"
+
+	. "gopkg.in/check.v1"
 )
 
 func TestFailrate(t *testing.T) { TestingT(t) }

@@ -45,6 +45,7 @@ func (s *BufferSuite) TestSmallBuffer(c *C) {
 	bb, err := NewBodyBuffer(r)
 	c.Assert(err, IsNil)
 	c.Assert(hashOfReader(bb), Equals, hash)
+	bb.Close()
 }
 
 func (s *BufferSuite) TestBigBuffer(c *C) {
@@ -90,4 +91,50 @@ func (s *BufferSuite) TestSeekFirst(c *C) {
 	l, err = bb.TotalSize()
 	c.Assert(err, IsNil)
 	c.Assert(l, Equals, tlen)
+}
+
+func (s *BufferSuite) TestLimitDoesNotExceed(c *C) {
+	requestSize := int64(1057576)
+	r, hash := createReaderOfSize(requestSize)
+	bb, err := NewBodyBufferWithOptions(r, BodyBufferOptions{MemBufferBytes: 1024, MaxSizeBytes: requestSize + 1})
+	c.Assert(err, IsNil)
+	c.Assert(hashOfReader(bb), Equals, hash)
+	size, err := bb.TotalSize()
+	c.Assert(err, IsNil)
+	c.Assert(size, Equals, requestSize)
+	bb.Close()
+}
+
+func (s *BufferSuite) TestLimitExceeds(c *C) {
+	requestSize := int64(1057576)
+	r, _ := createReaderOfSize(requestSize)
+	bb, err := NewBodyBufferWithOptions(r, BodyBufferOptions{MemBufferBytes: 1024, MaxSizeBytes: requestSize - 1})
+	c.Assert(err, FitsTypeOf, &MaxSizeReachedError{})
+	c.Assert(bb, IsNil)
+}
+
+func (s *BufferSuite) TestWriteToBigBuffer(c *C) {
+	l := int64(13631488)
+	r, hash := createReaderOfSize(l)
+	bb, err := NewBodyBuffer(r)
+	c.Assert(err, IsNil)
+
+	other := &bytes.Buffer{}
+	wrote, err := bb.WriteTo(other)
+	c.Assert(err, IsNil)
+	c.Assert(wrote, Equals, l)
+	c.Assert(hashOfReader(other), Equals, hash)
+}
+
+func (s *BufferSuite) TestWriteToSmallBuffer(c *C) {
+	l := int64(1)
+	r, hash := createReaderOfSize(l)
+	bb, err := NewBodyBuffer(r)
+	c.Assert(err, IsNil)
+
+	other := &bytes.Buffer{}
+	wrote, err := bb.WriteTo(other)
+	c.Assert(err, IsNil)
+	c.Assert(wrote, Equals, l)
+	c.Assert(hashOfReader(other), Equals, hash)
 }
