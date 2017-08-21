@@ -2,7 +2,6 @@
 // vault and key cache.
 //
 // Copyright (c) 2013 CloudFlare, Inc.
-
 package cryptor
 
 import (
@@ -12,17 +11,102 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"errors"
-	"github.com/cloudflare/redoctober/keycache"
-	"github.com/cloudflare/redoctober/padding"
-	"github.com/cloudflare/redoctober/passvault"
-	"github.com/cloudflare/redoctober/symcrypt"
+	"log"
 	"sort"
 	"strconv"
+	"strings"
+
+	"github.com/cloudflare/redoctober/config"
+	"github.com/cloudflare/redoctober/keycache"
+	"github.com/cloudflare/redoctober/msp"
+	"github.com/cloudflare/redoctober/padding"
+	"github.com/cloudflare/redoctober/passvault"
+	"github.com/cloudflare/redoctober/persist"
+	"github.com/cloudflare/redoctober/symcrypt"
 )
 
 const (
 	DEFAULT_VERSION = 1
 )
+
+type Cryptor struct {
+	records *passvault.Records
+	cache   *keycache.Cache
+	persist persist.Store
+}
+
+func New(records *passvault.Records, cache *keycache.Cache, config *config.Config) (*Cryptor, error) {
+	if cache == nil {
+		c := keycache.NewCache()
+		cache = &c
+	}
+
+	store, err := persist.New(config.Delegations)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &Cryptor{
+		records: records,
+		cache:   cache,
+		persist: store,
+	}
+	return c, nil
+}
+
+// AccessStructure represents different possible access structures for
+// encrypted data.  If len(Names) > 0, then at least 2 of the users in the list
+// must be delegated to decrypt.  If len(LeftNames) > 0 & len(RightNames) > 0,
+// then at least one from each list must be delegated (if the same user is in
+// both, then he can decrypt it alone).  If a predicate is present, it must be
+// satisfied to decrypt.
+type AccessStructure struct {
+	Minimum int
+	Names   []string
+
+	LeftNames  []string
+	RightNames []string
+
+	Predicate string
+}
+
+// Implements msp.UserDatabase
+type UserDatabase struct {
+	names *[]string
+
+	records *passvault.Records
+	cache   *keycache.Cache
+
+	user     string
+	labels   []string
+	keySet   map[string]SingleWrappedKey
+	shareSet map[string][][]byte
+}
+
+func (u UserDatabase) ValidUser(name string) bool {
+	_, ok := u.records.GetRecord(name)
+	return ok
+}
+
+func (u UserDatabase) CanGetShare(name string) bool {
+	_, _, ok1 := u.cache.MatchUser(name, u.user, u.labels)
+	_, ok2 := u.shareSet[name]
+	_, ok3 := u.keySet[name]
+
+	return ok1 && ok2 && ok3
+}
+
+func (u UserDatabase) GetShare(name string) ([][]byte, error) {
+	*u.names = append(*u.names, name)
+
+	return u.cache.DecryptShares(
+		u.shareSet[name],
+		name,
+		u.user,
+		u.labels,
+		u.keySet[name].Key,
+	)
+}
 
 // MultiWrappedKey is a structure containing a 16-byte key encrypted
 // once for each of the keys corresponding to the names of the users
@@ -43,180 +127,65 @@ type SingleWrappedKey struct {
 // keys necessary to decrypt it when delegated.
 type EncryptedData struct {
 	Version   int
-	VaultId   int
-	KeySet    []MultiWrappedKey
-	KeySetRSA map[string]SingleWrappedKey
-	IV        []byte
+	VaultId   int                         `json:",omitempty"`
+	Labels    []string                    `json:",omitempty"`
+	Predicate string                      `json:",omitempty"`
+	KeySet    []MultiWrappedKey           `json:",omitempty"`
+	KeySetRSA map[string]SingleWrappedKey `json:",omitempty"`
+	ShareSet  map[string][][]byte         `json:",omitempty"`
+	IV        []byte                      `json:",omitempty"`
 	Data      []byte
 	Signature []byte
 }
 
-// encryptKey encrypts data with the key associated with name inner,
-// then name outer
-func encryptKey(nameInner, nameOuter string, clearKey []byte, pubKeys map[string]SingleWrappedKey) (out MultiWrappedKey, err error) {
-	out.Name = []string{nameOuter, nameInner}
-
-	recInner, ok := passvault.GetRecord(nameInner)
-	if !ok {
-		err = errors.New("Missing user on disk")
-		return
-	}
-
-	recOuter, ok := passvault.GetRecord(nameOuter)
-	if !ok {
-		err = errors.New("Missing user on disk")
-		return
-	}
-
-	if recInner.Type != recOuter.Type {
-		err = errors.New("Mismatched record types")
-		return
-	}
-
-	var keyBytes []byte
-	var overrideInner SingleWrappedKey
-	var overrideOuter SingleWrappedKey
-
-	// For AES records, use the live user key
-	// For RSA and ECC records, use the public key from the passvault
-	switch recInner.Type {
-	case passvault.RSARecord, passvault.ECCRecord:
-		if overrideInner, ok = pubKeys[nameInner]; !ok {
-			err = errors.New("Missing user in file")
-			return
-		}
-
-		if overrideOuter, ok = pubKeys[nameOuter]; !ok {
-			err = errors.New("Missing user in file")
-			return
-		}
-	case passvault.AESRecord:
-		break
-
-	default:
-		return out, errors.New("Unknown record type inner")
-	}
-
-	// double-wrap the keys
-	if keyBytes, err = keycache.EncryptKey(clearKey, nameInner, overrideInner.aesKey); err != nil {
-		return out, err
-	}
-	if keyBytes, err = keycache.EncryptKey(keyBytes, nameOuter, overrideOuter.aesKey); err != nil {
-		return out, err
-	}
-
-	out.Key = keyBytes
-
-	return
+type pair struct {
+	name string
+	key  []byte
 }
 
-// unwrapKey decrypts first key in keys whose encryption keys are in keycache
-func unwrapKey(keys []MultiWrappedKey, pubKeys map[string]SingleWrappedKey) (unwrappedKey []byte, err error) {
-	var (
-		keyFound  error
-		fullMatch bool = false
-	)
+type mwkSlice []MultiWrappedKey
+type swkSlice []pair
 
-	for _, mwKey := range keys {
-		if err != nil {
-			return nil, err
-		}
-
-		tmpKeyValue := mwKey.Key
-
-		for _, mwName := range mwKey.Name {
-			pubEncrypted := pubKeys[mwName]
-			// if this is null, it's an AES encrypted key
-			if tmpKeyValue, keyFound = keycache.DecryptKey(tmpKeyValue, mwName, pubEncrypted.Key); keyFound != nil {
-				break
-			}
-		}
-		if keyFound == nil {
-			fullMatch = true
-			// concatenate all the decrypted bytes
-			unwrappedKey = tmpKeyValue
-			break
-		}
-	}
-
-	if !fullMatch {
-		err = errors.New("Need more delegated keys")
-	}
-	return
-}
-
-// mwkSorter describes a slice of MultiWrappedKeys to be sorted.
-type mwkSorter struct {
-	keySet []MultiWrappedKey
-}
-
-// Len is part of sort.Interface.
-func (s *mwkSorter) Len() int {
-	return len(s.keySet)
-}
-
-// Swap is part of sort.Interface.
-func (s *mwkSorter) Swap(i, j int) {
-	s.keySet[i], s.keySet[j] = s.keySet[j], s.keySet[i]
-}
-
-// Less is part of sort.Interface, it sorts lexicographically
-// based on the list of names
-func (s *mwkSorter) Less(i, j int) bool {
+func (s mwkSlice) Len() int             { return len(s) }
+func (s mwkSlice) Swap(i, j int)        { s[i], s[j] = s[j], s[i] }
+func (s mwkSlice) Less(i, j int) bool { // Alphabetic order
 	var shorter = i
-	if len(s.keySet[i].Name) > len(s.keySet[j].Name) {
+	if len(s[i].Name) > len(s[j].Name) {
 		shorter = j
 	}
-	for index := range s.keySet[shorter].Name {
-		if s.keySet[i].Name[index] != s.keySet[j].Name[index] {
-			return s.keySet[i].Name[index] < s.keySet[j].Name[index]
+
+	for index := range s[shorter].Name {
+		if s[i].Name[index] != s[j].Name[index] {
+			return s[i].Name[index] < s[j].Name[index]
 		}
 	}
 
 	return false
 }
 
-// swkSorter joins a slice of names with SingleWrappedKeys to be sorted.
-type pair struct {
-	name string
-	key  []byte
-}
-
-type swkSorter []pair
-
-// Len is part of sort.Interface.
-func (s swkSorter) Len() int {
-	return len(s)
-}
-
-// Swap is part of sort.Interface.
-func (s swkSorter) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-// Less is part of sort.Interface.
-func (s swkSorter) Less(i, j int) bool {
-	return s[i].name < s[j].name
-}
+func (s swkSlice) Len() int           { return len(s) }
+func (s swkSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s swkSlice) Less(i, j int) bool { return s[i].name < s[j].name }
 
 // computeHmac computes the signature of the encrypted data structure
 // the signature takes into account every element of the EncryptedData
 // structure, with all keys sorted alphabetically by name
-func computeHmac(key []byte, encrypted EncryptedData) []byte {
+func (encrypted *EncryptedData) computeHmac(key []byte) []byte {
 	mac := hmac.New(sha1.New, key)
 
 	// sort the multi-wrapped keys
-	mwks := &mwkSorter{
-		keySet: encrypted.KeySet,
-	}
+	mwks := mwkSlice(encrypted.KeySet)
 	sort.Sort(mwks)
 
 	// sort the singly-wrapped keys
-	var swks swkSorter
+	var swks swkSlice
 	for name, val := range encrypted.KeySetRSA {
 		swks = append(swks, pair{name, val.Key})
 	}
 	sort.Sort(&swks)
+
+	// sort the labels
+	sort.Strings(encrypted.Labels)
 
 	// start hashing
 	mac.Write([]byte(strconv.Itoa(encrypted.Version)))
@@ -240,79 +209,311 @@ func computeHmac(key []byte, encrypted EncryptedData) []byte {
 	mac.Write(encrypted.IV)
 	mac.Write(encrypted.Data)
 
+	// hash the labels
+	for index := range encrypted.Labels {
+		mac.Write([]byte(encrypted.Labels[index]))
+	}
+
 	return mac.Sum(nil)
 }
 
-// Encrypt encrypts data with the keys associated with names. This
-// requires a minimum of min keys to decrypt.  NOTE: as currently
-// implemented, the maximum value for min is 2.
-func Encrypt(in []byte, names []string, min int) (resp []byte, err error) {
-	if min > 2 {
-		return nil, errors.New("Minimum restricted to 2")
-	}
-
-	var encrypted EncryptedData
-	encrypted.Version = DEFAULT_VERSION
-	if encrypted.VaultId, err = passvault.GetVaultId(); err != nil {
-		return
-	}
-
-	// Generate random IV and encryption key
-	ivBytes, err := symcrypt.MakeRandom(16)
+func (encrypted *EncryptedData) lock(key []byte) (err error) {
+	payload, err := json.Marshal(encrypted)
 	if err != nil {
 		return
 	}
 
-	// append used here to make a new slice from ivBytes and assign to
-	// encrypted.IV
+	mac := hmac.New(sha1.New, key)
+	mac.Write(payload)
+	sig := mac.Sum(nil)
 
-	encrypted.IV = append([]byte{}, ivBytes...)
-	clearKey, err := symcrypt.MakeRandom(16)
-	if err != nil {
+	*encrypted = EncryptedData{
+		Version:   -1,
+		Data:      payload,
+		Signature: sig,
+	}
+
+	return
+}
+
+func (encrypted *EncryptedData) unlock(key []byte) (err error) {
+	if encrypted.Version != -1 {
 		return
 	}
 
-	// Allocate set of keys to be able to cover all ordered subsets of
-	// length 2 of names
+	mac := hmac.New(sha1.New, key)
+	mac.Write(encrypted.Data)
+	sig := mac.Sum(nil)
 
-	encrypted.KeySet = make([]MultiWrappedKey, len(names)*(len(names)-1))
-	encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+	if !hmac.Equal(encrypted.Signature, sig) {
+		err = errors.New("Signature mismatch")
+		return
+	}
 
-	var singleWrappedKey SingleWrappedKey
-	for _, name := range names {
-		rec, ok := passvault.GetRecord(name)
+	return json.Unmarshal(encrypted.Data, encrypted)
+}
+
+// wrapKey encrypts the clear key according to an access structure.
+func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []byte, access AccessStructure) (err error) {
+	generateRandomKey := func(name string) (singleWrappedKey SingleWrappedKey, err error) {
+		rec, ok := records.GetRecord(name)
 		if !ok {
 			err = errors.New("Missing user on disk")
 			return
 		}
 
-		if rec.GetType() == passvault.RSARecord || rec.GetType() == passvault.ECCRecord {
-			// only wrap key with RSA key if found
-			if singleWrappedKey.aesKey, err = symcrypt.MakeRandom(16); err != nil {
-				return nil, err
-			}
-
-			if singleWrappedKey.Key, err = rec.EncryptKey(singleWrappedKey.aesKey); err != nil {
-				return nil, err
-			}
-			encrypted.KeySetRSA[name] = singleWrappedKey
-		} else {
-			err = nil
+		if singleWrappedKey.aesKey, err = symcrypt.MakeRandom(16); err != nil {
+			return
 		}
+
+		if singleWrappedKey.Key, err = rec.EncryptKey(singleWrappedKey.aesKey); err != nil {
+			return
+		}
+
+		return
 	}
 
-	// encrypt file key with every combination of two keys
-	var n int
-	for _, nameOuter := range names {
-		for _, nameInner := range names {
-			if nameInner != nameOuter {
-				encrypted.KeySet[n], err = encryptKey(nameInner, nameOuter, clearKey, encrypted.KeySetRSA)
-				n += 1
-			}
+	encryptKey := func(keyNames []string, clearKey []byte) (keyBytes []byte, err error) {
+		keyBytes = make([]byte, 16)
+		copy(keyBytes, clearKey)
+		for _, keyName := range keyNames {
+			var keyCrypt cipher.Block
+			keyCrypt, err = aes.NewCipher(encrypted.KeySetRSA[keyName].aesKey)
 			if err != nil {
 				return
 			}
+
+			keyCrypt.Encrypt(keyBytes, keyBytes)
 		}
+
+		return
+	}
+
+	if len(access.Names) > 0 && access.Minimum > 0 {
+		// Generate a random AES key for each user and RSA/ECIES encrypt it
+		encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+
+		for _, name := range access.Names {
+			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			if err != nil {
+				return err
+			}
+
+			if access.Minimum == 1 {
+				keyBytes, err := encryptKey([]string{access.Names[0]}, clearKey)
+				if err != nil {
+					return err
+				}
+
+				encrypted.KeySet = append(encrypted.KeySet, MultiWrappedKey{
+					Name: []string{access.Names[0]},
+					Key:  keyBytes,
+				})
+			}
+		}
+
+		if access.Minimum == 2 {
+			for i := 0; i < len(access.Names); i++ {
+				for j := i + 1; j < len(access.Names); j++ {
+					keyBytes, err := encryptKey([]string{access.Names[j], access.Names[i]}, clearKey)
+					if err != nil {
+						return err
+					}
+
+					out := MultiWrappedKey{
+						Name: []string{access.Names[i], access.Names[j]},
+						Key:  keyBytes,
+					}
+
+					encrypted.KeySet = append(encrypted.KeySet, out)
+				}
+			}
+		} else if access.Minimum > 2 {
+			err = errors.New("Encryption to a list of owners with minimum > 2 is not implemented")
+			return err
+		}
+	} else if len(access.LeftNames) > 0 && len(access.RightNames) > 0 {
+		// Generate a random AES key for each user and RSA/ECIES encrypt it
+		encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+
+		for _, name := range access.LeftNames {
+			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			if err != nil {
+				return err
+			}
+		}
+
+		for _, name := range access.RightNames {
+			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			if err != nil {
+				return err
+			}
+		}
+
+		// encrypt file key with every combination of one left key and one right key
+		encrypted.KeySet = make([]MultiWrappedKey, 0)
+
+		for _, leftName := range access.LeftNames {
+			for _, rightName := range access.RightNames {
+				if leftName == rightName {
+					continue
+				}
+
+				keyBytes, err := encryptKey([]string{rightName, leftName}, clearKey)
+				if err != nil {
+					return err
+				}
+
+				out := MultiWrappedKey{
+					Name: []string{leftName, rightName},
+					Key:  keyBytes,
+				}
+
+				encrypted.KeySet = append(encrypted.KeySet, out)
+			}
+		}
+	} else if len(access.Predicate) > 0 {
+		encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+
+		sss, err := msp.StringToMSP(access.Predicate)
+		if err != nil {
+			return err
+		}
+
+		db := UserDatabase{records: records}
+		shareSet, err := sss.DistributeShares(clearKey, &db)
+		if err != nil {
+			return err
+		}
+
+		for name := range shareSet {
+			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			if err != nil {
+				return err
+			}
+			crypt, err := aes.NewCipher(encrypted.KeySetRSA[name].aesKey)
+			if err != nil {
+				return err
+			}
+
+			for i := range shareSet[name] {
+				tmp := make([]byte, 16)
+				crypt.Encrypt(tmp, shareSet[name][i])
+				shareSet[name][i] = tmp
+			}
+		}
+
+		encrypted.ShareSet = shareSet
+		encrypted.Predicate = access.Predicate
+	} else {
+		return errors.New("Invalid access structure.")
+	}
+
+	return nil
+}
+
+// unwrapKey decrypts first key in keys whose encryption keys are in keycache
+func (encrypted *EncryptedData) unwrapKey(cache *keycache.Cache, user string) (unwrappedKey []byte, names []string, err error) {
+	var (
+		decryptErr error
+		fullMatch  bool = false
+		nameSet         = map[string]bool{}
+	)
+
+	if len(encrypted.Predicate) == 0 {
+		for _, mwKey := range encrypted.KeySet {
+			// validate the size of the keys
+			if len(mwKey.Key) != 16 {
+				err = errors.New("Invalid Input")
+			}
+
+			if err != nil {
+				return nil, nil, err
+			}
+
+			// loop through users to see if they are all delegated
+			fullMatch = true
+			for _, mwName := range mwKey.Name {
+				if valid := cache.Valid(mwName, user, encrypted.Labels); !valid {
+					fullMatch = false
+					break
+				}
+				nameSet[mwName] = true
+			}
+
+			// if the keys are delegated, decrypt the mwKey with them
+			if fullMatch == true {
+				tmpKeyValue := mwKey.Key
+				for _, mwName := range mwKey.Name {
+					pubEncrypted := encrypted.KeySetRSA[mwName]
+					if tmpKeyValue, decryptErr = cache.DecryptKey(tmpKeyValue, mwName, user, encrypted.Labels, pubEncrypted.Key); decryptErr != nil {
+						break
+					}
+				}
+				unwrappedKey = tmpKeyValue
+				break
+			}
+		}
+
+		if !fullMatch {
+			err = ErrNotEnoughDelegations
+			return
+		}
+
+		if decryptErr != nil {
+			err = errors.New("Failed to decrypt with all keys in keyset")
+			return
+		}
+
+		names = make([]string, 0, len(nameSet))
+		for name := range nameSet {
+			names = append(names, name)
+		}
+		return
+	}
+	var sss msp.MSP
+	sss, err = msp.StringToMSP(encrypted.Predicate)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	db := UserDatabase{
+		names:    &names,
+		cache:    cache,
+		user:     user,
+		labels:   encrypted.Labels,
+		keySet:   encrypted.KeySetRSA,
+		shareSet: encrypted.ShareSet,
+	}
+	unwrappedKey, err = sss.RecoverSecret(&db)
+
+	return
+}
+
+// Encrypt encrypts data with the keys associated with names. This
+// requires a minimum of min keys to decrypt.  NOTE: as currently
+// implemented, the maximum value for min is 2.
+func (c *Cryptor) Encrypt(in []byte, labels []string, access AccessStructure) (resp []byte, err error) {
+	var encrypted EncryptedData
+	encrypted.Version = DEFAULT_VERSION
+	if encrypted.VaultId, err = c.records.GetVaultID(); err != nil {
+		return
+	}
+
+	// Generate random IV and encryption key
+	encrypted.IV, err = symcrypt.MakeRandom(16)
+	if err != nil {
+		return
+	}
+
+	clearKey, err := symcrypt.MakeRandom(16)
+	if err != nil {
+		return
+	}
+
+	err = encrypted.wrapKey(c.records, clearKey, access)
+	if err != nil {
+		return
 	}
 
 	// encrypt file with clear key
@@ -324,54 +525,59 @@ func Encrypt(in []byte, names []string, min int) (resp []byte, err error) {
 	clearFile := padding.AddPadding(in)
 
 	encryptedFile := make([]byte, len(clearFile))
-	aesCBC := cipher.NewCBCEncrypter(aesCrypt, ivBytes)
+	aesCBC := cipher.NewCBCEncrypter(aesCrypt, encrypted.IV)
 	aesCBC.CryptBlocks(encryptedFile, clearFile)
 
 	encrypted.Data = encryptedFile
+	encrypted.Labels = labels
 
-	hmacKey, err := passvault.GetHmacKey()
+	hmacKey, err := c.records.GetHMACKey()
 	if err != nil {
 		return
 	}
-	encrypted.Signature = computeHmac(hmacKey, encrypted)
+	encrypted.Signature = encrypted.computeHmac(hmacKey)
+	encrypted.lock(hmacKey)
 
 	return json.Marshal(encrypted)
 }
 
 // Decrypt decrypts a file using the keys in the key cache.
-func Decrypt(in []byte) (resp []byte, err error) {
+func (c *Cryptor) Decrypt(in []byte, user string) (resp []byte, labels, names []string, secure bool, err error) {
+	return c.decrypt(c.cache, in, user)
+}
+
+func (c *Cryptor) decrypt(cache *keycache.Cache, in []byte, user string) (resp []byte, labels, names []string, secure bool, err error) {
 	// unwrap encrypted file
 	var encrypted EncryptedData
 	if err = json.Unmarshal(in, &encrypted); err != nil {
 		return
 	}
-	if encrypted.Version != DEFAULT_VERSION {
-		return nil, errors.New("Unknown version")
+	if encrypted.Version != DEFAULT_VERSION && encrypted.Version != -1 {
+		return nil, nil, nil, secure, errors.New("Unknown version")
+	}
+
+	secure = encrypted.Version == -1
+
+	hmacKey, err := c.records.GetHMACKey()
+	if err != nil {
+		return
+	}
+
+	if err = encrypted.unlock(hmacKey); err != nil {
+		return
 	}
 
 	// make sure file was encrypted with the active vault
-	vaultId, err := passvault.GetVaultId()
+	vaultId, err := c.records.GetVaultID()
 	if err != nil {
 		return
 	}
 	if encrypted.VaultId != vaultId {
-		return nil, errors.New("Wrong vault")
-	}
-
-	// validate the size of the keys
-	for _, multiKey := range encrypted.KeySet {
-		if len(multiKey.Key) != 16 {
-			err = errors.New("Invalid Input")
-			return
-		}
+		return nil, nil, nil, secure, errors.New("Wrong vault")
 	}
 
 	// compute HMAC
-	hmacKey, err := passvault.GetHmacKey()
-	if err != nil {
-		return
-	}
-	expectedMAC := computeHmac(hmacKey, encrypted)
+	expectedMAC := encrypted.computeHmac(hmacKey)
 	if !hmac.Equal(encrypted.Signature, expectedMAC) {
 		err = errors.New("Signature mismatch")
 		return
@@ -379,7 +585,8 @@ func Decrypt(in []byte) (resp []byte, err error) {
 
 	// decrypt file key with delegate keys
 	var unwrappedKey = make([]byte, 16)
-	if unwrappedKey, err = unwrapKey(encrypted.KeySet, encrypted.KeySetRSA); err != nil {
+	unwrappedKey, names, err = encrypted.unwrapKey(cache, user)
+	if err != nil {
 		return
 	}
 
@@ -393,5 +600,206 @@ func Decrypt(in []byte) (resp []byte, err error) {
 	// decrypt contents of file
 	aesCBC.CryptBlocks(clearData, encrypted.Data)
 
-	return padding.RemovePadding(clearData)
+	resp, err = padding.RemovePadding(clearData)
+	labels = encrypted.Labels
+	return
+}
+
+// GetOwners returns the list of users that can delegate their passwords
+// to decrypt the given encrypted secret.
+func (c *Cryptor) GetOwners(in []byte) (names, labels []string, predicate string, err error) {
+	// unwrap encrypted file
+	var encrypted EncryptedData
+	if err = json.Unmarshal(in, &encrypted); err != nil {
+		return
+	}
+	if encrypted.Version != DEFAULT_VERSION && encrypted.Version != -1 {
+		err = errors.New("Unknown version")
+		return
+	}
+
+	hmacKey, err := c.records.GetHMACKey()
+	if err != nil {
+		return
+	}
+
+	if err = encrypted.unlock(hmacKey); err != nil {
+		return
+	}
+
+	// make sure file was encrypted with the active vault
+	vaultId, err := c.records.GetVaultID()
+	if err != nil {
+		return
+	}
+	if encrypted.VaultId != vaultId {
+		err = errors.New("Wrong vault")
+		return
+	}
+
+	// compute HMAC
+	expectedMAC := encrypted.computeHmac(hmacKey)
+	if !hmac.Equal(encrypted.Signature, expectedMAC) {
+		err = errors.New("Signature mismatch")
+		return
+	}
+
+	addedNames := make(map[string]bool)
+	for _, mwKey := range encrypted.KeySet { // names from the combinatorial method
+		for _, mwName := range mwKey.Name {
+			if !addedNames[mwName] {
+				names = append(names, mwName)
+				addedNames[mwName] = true
+			}
+		}
+	}
+
+	for name := range encrypted.ShareSet { // names from the secret splitting method
+		if !addedNames[name] {
+			names = append(names, name)
+			addedNames[name] = true
+		}
+	}
+	predicate = encrypted.Predicate
+	labels = encrypted.Labels
+
+	return
+}
+
+// LiveSummary returns a list of the users currently delegated.
+func (c *Cryptor) LiveSummary() map[string]keycache.ActiveUser {
+	return c.cache.GetSummary()
+}
+
+// Refresh purges all expired or fully-used delegations in the
+// crypto's key cache. It returns an error if the delegations
+// should have been stored, but couldn't be.
+func (c *Cryptor) Refresh() error {
+	n := c.cache.Refresh()
+	if n != 0 {
+		return c.store()
+	}
+	return nil
+}
+
+// Flush removes all delegations.
+func (c *Cryptor) Flush() error {
+	if c.cache.Flush() {
+		return c.store()
+	}
+	return nil
+}
+
+// Delegate attempts to decrypt a key for the specified user and add
+// the key to the key cache.
+func (c *Cryptor) Delegate(record passvault.PasswordRecord, name, password string, users, labels []string, uses int, slot, durationString string) (err error) {
+	err = c.cache.AddKeyFromRecord(record, name, password, users, labels, uses, slot, durationString)
+	if err != nil {
+		return err
+	}
+
+	return c.store()
+}
+
+// DelegateStatus will return a list of admins who have delegated to a particular user, for a particular label.
+// This is useful information to have when determining the status of an order and conveying order progress.
+func (c *Cryptor) DelegateStatus(name string, labels, admins []string) (adminsDelegated []string, hasDelegated int) {
+	return c.cache.DelegateStatus(name, labels, admins)
+}
+
+// store serialises the key cache, encrypts it, and writes it to disk.
+func (c *Cryptor) store() error {
+	// If the store isn't currently active, we shouldn't attempt
+	// to persist the store.
+	st := c.persist.Status()
+	if st.State != persist.Active {
+		return nil
+	}
+
+	cache, err := json.Marshal(c.cache.GetSummary())
+	if err != nil {
+		return err
+	}
+
+	access := AccessStructure{
+		Names:     c.persist.Users(),
+		Predicate: c.persist.Policy(),
+	}
+
+	cache, err = c.Encrypt(cache, persist.Labels, access)
+	if err != nil {
+		return err
+	}
+
+	return c.persist.Store(cache)
+}
+
+// ErrRestoreDelegations is a sentinal value returned when more
+// delegations are needed for the restore to continue.
+var ErrRestoreDelegations = errors.New("cryptor: need more delegations")
+
+// ErrNotEnoughDelegations is a error returned by Decrypt.
+var ErrNotEnoughDelegations = errors.New("need more delegated keys")
+
+// Restore delegates the named user to the persistence key cache. If
+// enough delegations are present to restore the cache, the current
+// Red October key cache is replaced with the persisted one.
+func (c *Cryptor) Restore(name, password string, uses int, slot, durationString string) error {
+	// If the persistence store is already active, don't proceed.
+	if st := c.persist.Status(); st != nil && st.State == persist.Active {
+		return nil
+	}
+
+	record, ok := c.records.GetRecord(name)
+	if !ok {
+		return errors.New("Missing user on disk")
+	}
+
+	err := c.persist.Delegate(record, name, password, c.persist.Users(), persist.Labels, uses, slot, durationString)
+	if err != nil {
+		return err
+	}
+
+	// A failure to decrypt isn't a restore error, it (most often)
+	// just means there aren't enough delegations yet; the
+	// sentinal value ErrRestoreDelegations is returned to
+	// indicate this. However, the error
+	cache, _, names, _, err := c.decrypt(c.persist.Cache(), c.persist.Blob(), name)
+	if err != nil {
+		if err == msp.ErrNotEnoughShares {
+			return ErrRestoreDelegations
+		}
+		return err
+	}
+
+	log.Printf("cryptor.restore success: names=%s", strings.Join(names, ","))
+
+	var uk map[string]keycache.ActiveUser
+	err = json.Unmarshal(cache, &uk)
+	if err != nil {
+		return err
+	}
+
+	rcache := keycache.NewFrom(uk)
+	err = rcache.Restore()
+	if err != nil {
+		return err
+	}
+
+	c.cache = rcache
+	c.persist.Persist()
+	c.persist.Cache().Flush()
+	return nil
+}
+
+// Status returns the status of the underlying persistence store.
+func (c *Cryptor) Status() *persist.Status {
+	return c.persist.Status()
+}
+
+// ResetPersisted clears any persisted delegations and returns the
+// vault to an active delegation state if configured.
+func (c *Cryptor) ResetPersisted() (*persist.Status, error) {
+	err := c.persist.Purge()
+	return c.persist.Status(), err
 }

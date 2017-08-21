@@ -7,16 +7,16 @@ encryption and decryption server.
 
 ## Building
 
-[![Build Status](https://travis-ci.org/cloudflare/redoctober.png?branch=master)](https://travis-ci.org/cloudflare/redoctober) [![Build Status](https://drone.io/github.com/cloudflare/redoctober/status.png)](https://drone.io/github.com/cloudflare/redoctober/latest)
+[![Build Status](https://travis-ci.org/cloudflare/redoctober.png?branch=master)](https://travis-ci.org/cloudflare/redoctober)[![Coverage Status](http://codecov.io/github/cloudflare/redoctober/coverage.svg?branch=master)](http://codecov.io/github/cloudflare/redoctober?branch=master)
 
-This project requires [Go 1.2](http://golang.org/doc/install#download)
+This project requires [Go 1.4](http://golang.org/doc/install#download)
 or later to compile. Verify your go version by running `go version`:
 
     $ go version
-    go version go1.2
+    go version go1.4
 
 As with any Go program you do need to set the
-[GOPATH enviroment variable](http://golang.org/doc/code.html#GOPATH)
+[GOPATH environment variable](http://golang.org/doc/code.html#GOPATH)
 accordingly. With Go set up you can download and compile sources:
 
     $ go get github.com/cloudflare/redoctober
@@ -35,7 +35,7 @@ secure) way is to skip the
 [Certificate Authority](https://en.wikipedia.org/wiki/Certificate_authority#Issuing_a_certificate)
 verification and generate a self-signed TLS certificate. Read this
 [detailed guide](http://www.akadia.com/services/ssh_test_certificate.html)
-or, alternatively, follow these unsecure commands:
+or, alternatively, follow these insecure commands:
 
     $ mkdir cert
     $ chmod 700 cert
@@ -56,8 +56,8 @@ You're ready to run the server:
 
     $ ./bin/redoctober -addr=localhost:8080 \
                        -vaultpath=diskrecord.json \
-                       -cert=cert/server.crt \
-                       -key=cert/server.pem
+                       -certs=cert/server.crt \
+                       -keys=cert/server.pem
 
 ## Quick start: example webapp
 
@@ -72,9 +72,11 @@ format is POSTed and JSON is returned.
 
  - `/create`: Create the first admin account.
  - `/delegate`: Delegate a password to Red October
+ - `/create-user`: Create a user
  - `/modify`: Modify permissions
  - `/encrypt`: Encrypt
  - `/decrypt`: Decrypt
+ - `/owners`: List owners of an encrypted secret.
  - `/summary`: Display summary of the delegates
  - `/password`: Change password
  - `/index`: Optionally, the server can host a static HTML file.
@@ -109,11 +111,24 @@ Example query:
            -d '{"Name":"Dodo","Password":"Dodgson","Time":"2h34m","Uses":3}'
     {"Status":"ok"}
 
+### Create User
+
+Create Users creates a new user account. Allows an optional "UserType"
+to be specified which controls how the record is encrypted. This can have
+a value of either "RSA" or "ECC" and if none is provided will default to
+"RSA".
+
+Example query:
+
+    $ curl --cacert cert/server.crt https://localhost:8080/create-user \
+           -d '{"Name":"Bill","Password":"Lizard","UserType":"ECC"}'
+    {"Status":"ok"}
+
 ### Summary
 
 Summary provides a list of the users with keys on the system, and a
 list of users who have currently delegated their key to the
-server. Only Admins are allowed to call summary.
+server.
 
 Example query:
 
@@ -144,7 +159,7 @@ Example query:
 
 ### Encrypt
 
-Encrypt allows an admin to encrypt a piece of data. A list of valid
+Encrypt allows a user to encrypt a piece of data. A list of valid
 users is provided and a minimum number of delegated users required to
 decrypt. The returned data can be decrypted as long as "Minimum"
 number users from the set of "Owners" have delegated their keys to the
@@ -152,30 +167,49 @@ server.
 
 Example query:
 
-    $ echo "Why is a raven like a writing desk?"|python -c "print raw_input().encode('base64')"
-    V2h5IGlzIGEgcmF2ZW4gbGlrZSBhIHdyaXRpbmcgZGVzaz8=
+    $ echo "Why is a raven like a writing desk?" | openssl base64
+    V2h5IGlzIGEgcmF2ZW4gbGlrZSBhIHdyaXRpbmcgZGVzaz8K
 
     $ curl --cacert cert/server.crt https://localhost:8080/encrypt  \
-            -d '{"Name":"Alice","Password":"Lewis","Minimum":2, "Owners":["Alice","Bill","Cat","Dodo"],"Data":"V2h5IGlzIGEgcmF2ZW4gbGlrZSBhIHdyaXRpbmcgZGVzaz8="}'
+            -d '{"Name":"Alice","Password":"Lewis","Minimum":2, "Owners":["Alice","Bill","Cat","Dodo"],"Data":"V2h5IGlzIGEgcmF2ZW4gbGlrZSBhIHdyaXRpbmcgZGVzaz8K"}'
+    {"Status":"ok","Response":"eyJWZXJzaW9uIj...NSSllzPSJ9"}
+
+Example query with a predicate:
+
+    $ curl --cacert cert/server.crt https://localhost:8080/encrypt  \
+            -d '{"Name":"Alice","Password":"Lewis","Predicate":"Alice & (Bob | Carl)",
+            Data":"V2h5IGlzIGEgcmF2ZW4gbGlrZSBhIHdyaXRpbmcgZGVzaz8K"}'
     {"Status":"ok","Response":"eyJWZXJzaW9uIj...NSSllzPSJ9"}
 
 The data expansion is not tied to the size of the input.
 
 ### Decrypt
 
-Decrypt allows an admin to decrypt a piece of data. As long as
+Decrypt allows a user to decrypt a piece of data. As long as
 "Minimum" number users from the set of "Owners" have delegated their
-keys to the server, the clear data will be returned.
+keys to the server, a base64 encoded object with the clear data and the
+set of "Owners" whose private keys were used is returned.
 
 Example query:
 
     $ curl --cacert cert/server.crt https://localhost:8080/decrypt  \
-            -d {"Name":"Alice","Password":"Lewis","Data":"eyJWZXJzaW9uIj...NSSllzPSJ9"}
-    {"Status":"ok","Response":"V2h5IGlzIGEgcmF2ZW4gbGlrZSBhIHdyaXRpbmcgZGVzaz8="}
+            -d '{"Name":"Alice","Password":"Lewis","Data":"eyJWZXJzaW9uIj...NSSllzPSJ9"}'
+    {"Status":"ok","Response":"eyJEYXRhI...FuMiJdfQ=="}
 
 If there aren't enough keys delegated you'll see:
 
-    {"Status":"Need more delegated keys"}
+    {"Status":"need more delegated keys"}
+
+### Owners
+
+Owners allows users to determine which delegations are needed to decrypt
+a piece of data.
+
+Example query:
+
+    $ curl --cacert cert/server.crt https://localhost:8080/owners  \
+            -d '{"Data":"eyJWZXJzaW9uIj...NSSllzPSJ9"}'
+    {"Status":"ok","Owners":["Alice","Bill","Cat","Dodo"]}
 
 ### Password
 
@@ -203,6 +237,96 @@ Example input JSON format:
            -d '{"Name":"Alice","Password":"Lewis","ToModify":"Bill","Command":"admin"}'
     {"Status":"ok"}
 
+### Purge
+
+Purge deletes all delegates for an encryption key.
+
+Example input JSON format:
+
+    $ curl --cacert cert/server.crt https://localhost:8080/purge \
+           -d '{"Name":"Alice","Password":"Lewis"}'
+    {"Status":"ok"}
+
+
+### Order
+
+Order creates a new order and lets other users know delegations are needed.
+
+Example input JSON format:
+
+    $ curl --cacert server/server.crt https://localhost:8080/order \
+           -d '{"Name":"Alice","Password":"Lewis","Labels": ["Blue","Red"],\
+           "Duration":"1h","Uses":5,"EncryptedData":"ABCDE=="}'
+    {
+       "Admins": [
+            "Bob",
+            "Eve"
+        ],
+        "AdminsDelegated": null,
+        "Delegated": 0,
+        "DurationRequested": 3.6e+12,
+        "Labels": [
+            "blue",
+            "red"
+        ],
+        "Name": "Alice",
+        "Num": "77da1cfd8962fb9685c15c84",
+        "TimeRequested": "2016-01-25T15:58:41.961906679-08:00",
+    }
+
+### Orders Outstanding
+
+Orders Outstanding will return a list of current order numbers
+
+Example input JSON format:
+
+    $ curl --cacert server/server.crt https://localhost:8080/orderout
+           -d '{"Name":"Alice","Password":"Lewis"}'
+    {
+        "77da1cfd8962fb9685c15c84":{
+            "Name":"Alice",
+            "Num":"77da1cfd8962fb9685c15c84",
+            "TimeRequested":"2016-01-25T15:58:41.961906679-08:00",
+            "DurationRequested":3600000000000,
+            "Delegated":0,"
+            AdminsDelegated":null,
+            "Admins":["Bob, Eve"],
+            "Labels":["Blue","Red"]
+        }
+    }
+
+### Order Information
+
+Example input JSON format:
+
+    $ curl --cacert server/server.crt https://localhost:8080/orderinfo
+           -d '{"Name":"Alice","Password":"Lewis", \
+           "OrderNum":"77da1cfd8962fb9685c15c84"}'
+    {
+        "Admins": [
+            "Bob",
+            "Eve"
+        ],
+        "AdminsDelegated": null,
+        "Delegated": 0,
+        "DurationRequested": 3.6e+12,
+        "Labels": [
+            "blue",
+            "red"
+        ],
+        "Name": "Alice",
+        "Num": "77da1cfd8962fb9685c15c84",
+        "TimeRequested": "2016-01-25T15:58:41.961906679-08:00"
+    }
+
+### Order Cancel
+
+Example input JSON format:
+
+    $ curl --cacert server/server.crt https://localhost:8080/orderinfo
+           -d '{"Name":"Alice","Password":"Lewis", \
+           "OrderNum":"77da1cfd8962fb9685c15c84"}'
+    {"Status":"ok"}
 
 ### Web interface
 
@@ -217,3 +341,4 @@ example uses JavaScript's `btoa` and `atob` functions for string
 conversion. For dealing with files directly, using the
 [HTML5 File API](https://developer.mozilla.org/en-US/docs/Web/API/FileReader.readAsDataURL)
 would be a good option.
+
