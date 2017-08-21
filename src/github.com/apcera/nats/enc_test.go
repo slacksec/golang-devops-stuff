@@ -1,304 +1,257 @@
-// Copyright 2012 Apcera Inc. All rights reserved.
-
-package nats
+package nats_test
 
 import (
-	"bytes"
+	"fmt"
 	"testing"
 	"time"
+
+	. "github.com/nats-io/go-nats"
+	"github.com/nats-io/go-nats/encoders/protobuf"
+	"github.com/nats-io/go-nats/encoders/protobuf/testdata"
 )
 
-func NewEConn(t *testing.T) *EncodedConn {
-	ec, err := NewEncodedConn(newConnection(t), "default")
+// Since we import above nats packages, we need to have a different
+// const name than TEST_PORT that we used on the other packages.
+const ENC_TEST_PORT = 8268
+
+var options = Options{
+	Url:            fmt.Sprintf("nats://localhost:%d", ENC_TEST_PORT),
+	AllowReconnect: true,
+	MaxReconnect:   10,
+	ReconnectWait:  100 * time.Millisecond,
+	Timeout:        DefaultTimeout,
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Encoded connection tests
+////////////////////////////////////////////////////////////////////////////////
+
+func TestPublishErrorAfterSubscribeDecodeError(t *testing.T) {
+	ts := RunServerOnPort(ENC_TEST_PORT)
+	defer ts.Shutdown()
+	opts := options
+	nc, _ := opts.Connect()
+	defer nc.Close()
+	c, _ := NewEncodedConn(nc, JSON_ENCODER)
+
+	//Test message type
+	type Message struct {
+		Message string
+	}
+	const testSubj = "test"
+
+	c.Subscribe(testSubj, func(msg *Message) {})
+
+	//Publish invalid json to catch decode error in subscription callback
+	c.Publish(testSubj, `foo`)
+	c.Flush()
+
+	//Next publish should be successful
+	if err := c.Publish(testSubj, Message{"2"}); err != nil {
+		t.Error("Fail to send correct json message after decode error in subscription")
+	}
+}
+
+func TestPublishErrorAfterInvalidPublishMessage(t *testing.T) {
+	ts := RunServerOnPort(ENC_TEST_PORT)
+	defer ts.Shutdown()
+	opts := options
+	nc, _ := opts.Connect()
+	defer nc.Close()
+	c, _ := NewEncodedConn(nc, protobuf.PROTOBUF_ENCODER)
+	const testSubj = "test"
+
+	c.Publish(testSubj, &testdata.Person{Name: "Anatolii"})
+
+	//Publish invalid protobuff message to catch decode error
+	c.Publish(testSubj, "foo")
+
+	//Next publish with valid protobuf message should be successful
+	if err := c.Publish(testSubj, &testdata.Person{Name: "Anatolii"}); err != nil {
+		t.Error("Fail to send correct protobuf message after invalid message publishing", err)
+	}
+}
+
+func TestVariousFailureConditions(t *testing.T) {
+	ts := RunServerOnPort(ENC_TEST_PORT)
+	defer ts.Shutdown()
+
+	dch := make(chan bool)
+
+	opts := options
+	opts.AsyncErrorCB = func(_ *Conn, _ *Subscription, e error) {
+		dch <- true
+	}
+	nc, _ := opts.Connect()
+	nc.Close()
+
+	if _, err := NewEncodedConn(nil, protobuf.PROTOBUF_ENCODER); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	if _, err := NewEncodedConn(nc, protobuf.PROTOBUF_ENCODER); err == nil || err != ErrConnectionClosed {
+		t.Fatalf("Wrong error: %v instead of %v", err, ErrConnectionClosed)
+	}
+
+	nc, _ = opts.Connect()
+	defer nc.Close()
+
+	if _, err := NewEncodedConn(nc, "foo"); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	c, err := NewEncodedConn(nc, protobuf.PROTOBUF_ENCODER)
 	if err != nil {
-		t.Fatalf("Failed to create an encoded connection: %v\n", err)
+		t.Fatalf("Unable to create encoded connection: %v", err)
 	}
-	return ec
+	defer c.Close()
+
+	if _, err := c.Subscribe("bar", func(subj, obj string) {}); err != nil {
+		t.Fatalf("Unable to create subscription: %v", err)
+	}
+
+	if err := c.Publish("bar", &testdata.Person{Name: "Ivan"}); err != nil {
+		t.Fatalf("Unable to publish: %v", err)
+	}
+
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get the async error callback")
+	}
+
+	if err := c.PublishRequest("foo", "bar", "foo"); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	if err := c.Request("foo", "foo", nil, 2*time.Second); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	nc.Close()
+
+	if err := c.PublishRequest("foo", "bar", &testdata.Person{Name: "Ivan"}); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	resp := &testdata.Person{}
+	if err := c.Request("foo", &testdata.Person{Name: "Ivan"}, resp, 2*time.Second); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	if _, err := c.Subscribe("foo", nil); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	if _, err := c.Subscribe("foo", func() {}); err == nil {
+		t.Fatal("Expected an error")
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("Expected an error")
+			}
+		}()
+		if _, err := c.Subscribe("foo", "bar"); err == nil {
+			t.Fatal("Expected an error")
+		}
+	}()
 }
 
-func TestMarshalString(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
+func TestRequest(t *testing.T) {
+	ts := RunServerOnPort(ENC_TEST_PORT)
+	defer ts.Shutdown()
 
-	testString := "Hello World!"
+	dch := make(chan bool)
 
-	ec.Subscribe("enc_string", func(s string) {
-		if s != testString {
-			t.Fatalf("Received test string of '%s', wanted '%s'\n", s, testString)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_string", testString)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
+	opts := options
+	nc, _ := opts.Connect()
+	defer nc.Close()
 
-func TestMarshalBytes(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	testBytes := []byte("Hello World!")
-
-	ec.Subscribe("enc_bytes", func(b []byte) {
-		if !bytes.Equal(b, testBytes) {
-			t.Fatalf("Received test bytes of '%s', wanted '%s'\n", b, testBytes)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_bytes", testBytes)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestMarshalInt(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	testN := 22
-
-	ec.Subscribe("enc_int", func(n int) {
-		if n != testN {
-			t.Fatalf("Received test number of %d, wanted %d\n", n, testN)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_int", testN)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestMarshalInt32(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	testN := 22
-
-	ec.Subscribe("enc_int", func(n int32) {
-		if n != int32(testN) {
-			t.Fatalf("Received test number of %d, wanted %d\n", n, testN)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_int", testN)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestMarshalInt64(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	testN := 22
-
-	ec.Subscribe("enc_int", func(n int64) {
-		if n != int64(testN) {
-			t.Fatalf("Received test number of %d, wanted %d\n", n, testN)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_int", testN)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestMarshalFloat32(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	testN := float32(22)
-
-	ec.Subscribe("enc_float", func(n float32) {
-		if n != testN {
-			t.Fatalf("Received test number of %f, wanted %f\n", n, testN)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_float", testN)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestMarshalFloat64(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	testN := float64(22.22)
-
-	ec.Subscribe("enc_float", func(n float64) {
-		if n != testN {
-			t.Fatalf("Received test number of %f, wanted %f\n", n, testN)
-		}
-		ch <- true
-	})
-	ec.Publish("enc_float", testN)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestMarshalBool(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-	ch := make(chan bool)
-
-	ec.Subscribe("enc_bool", func(b bool) {
-		if b != false {
-			t.Fatal("Boolean values did not match")
-		}
-		ch <- true
-	})
-	ec.Publish("enc_bool", false)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestExtendedSubscribeCB(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-
-	ch := make(chan bool)
-
-	testString := "Hello World!"
-	subject := "cb_args"
-
-	ec.Subscribe(subject, func(subj, s string) {
-		if s != testString {
-			t.Fatalf("Received test string of '%s', wanted '%s'\n", s, testString)
-		}
-		if subj != subject {
-			t.Fatalf("Received subject of '%s', wanted '%s'\n", subj, subject)
-		}
-		ch <- true
-	})
-	ec.Publish(subject, testString)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestExtendedSubscribeCB2(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-
-	ch := make(chan bool)
-
-	testString := "Hello World!"
-	oSubj := "cb_args"
-	oReply := "foobar"
-
-	ec.Subscribe(oSubj, func(subj, reply, s string) {
-		if s != testString {
-			t.Fatalf("Received test string of '%s', wanted '%s'\n", s, testString)
-		}
-		if subj != oSubj {
-			t.Fatalf("Received subject of '%s', wanted '%s'\n", subj, oSubj)
-		}
-		if reply != oReply {
-			t.Fatalf("Received reply of '%s', wanted '%s'\n", reply, oReply)
-		}
-		ch <- true
-	})
-	ec.PublishRequest(oSubj, oReply, testString)
-	if e := wait(ch); e != nil {
-		if ec.LastError() != nil {
-			e = ec.LastError()
-		}
-		t.Fatalf("Did not receive the message: %s", e)
-	}
-}
-
-func TestEncRequest(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-
-	ec.Subscribe("help", func(subj, reply, req string) {
-		ec.Publish(reply, "I can help!")
-	})
-
-	var resp string
-
-	err := ec.Request("help", "help me", &resp, 100*time.Millisecond)
+	c, err := NewEncodedConn(nc, protobuf.PROTOBUF_ENCODER)
 	if err != nil {
-		t.Fatalf("Failed at receiving proper response: %v\n", err)
+		t.Fatalf("Unable to create encoded connection: %v", err)
 	}
-}
+	defer c.Close()
 
-func TestEncRequestReceivesMsg(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
+	sentName := "Ivan"
+	recvName := "Kozlovic"
 
-	ec.Subscribe("help", func(subj, reply, req string) {
-		ec.Publish(reply, "I can help!")
-	})
+	if _, err := c.Subscribe("foo", func(_, reply string, p *testdata.Person) {
+		if p.Name != sentName {
+			t.Fatalf("Got wrong name: %v instead of %v", p.Name, sentName)
+		}
+		c.Publish(reply, &testdata.Person{Name: recvName})
+		dch <- true
+	}); err != nil {
+		t.Fatalf("Unable to create subscription: %v", err)
+	}
+	if _, err := c.Subscribe("foo", func(_ string, p *testdata.Person) {
+		if p.Name != sentName {
+			t.Fatalf("Got wrong name: %v instead of %v", p.Name, sentName)
+		}
+		dch <- true
+	}); err != nil {
+		t.Fatalf("Unable to create subscription: %v", err)
+	}
 
-	var resp Msg
+	if err := c.Publish("foo", &testdata.Person{Name: sentName}); err != nil {
+		t.Fatalf("Unable to publish: %v", err)
+	}
 
-	err := ec.Request("help", "help me", &resp, 100*time.Millisecond)
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get message")
+	}
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get message")
+	}
+
+	response := &testdata.Person{}
+	if err := c.Request("foo", &testdata.Person{Name: sentName}, response, 2*time.Second); err != nil {
+		t.Fatalf("Unable to publish: %v", err)
+	}
+	if response == nil {
+		t.Fatal("No response received")
+	} else if response.Name != recvName {
+		t.Fatalf("Wrong response: %v instead of %v", response.Name, recvName)
+	}
+
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get message")
+	}
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get message")
+	}
+
+	c2, err := NewEncodedConn(nc, GOB_ENCODER)
 	if err != nil {
-		t.Fatalf("Failed at receiving proper response: %v\n", err)
+		t.Fatalf("Unable to create encoded connection: %v", err)
 	}
-}
+	defer c2.Close()
 
-func TestAsyncMarshalErr(t *testing.T) {
-	ec := NewEConn(t)
-	defer ec.Close()
-
-	ch := make(chan bool)
-
-	testString := "Hello World!"
-	subject := "err_marshall"
-
-	ec.Subscribe(subject, func(subj, num int) {
-		// This will never get called.
-	})
-
-	ec.Conn.Opts.AsyncErrorCB = func(c *Conn, s *Subscription, err error) {
-		ch <- true
+	if _, err := c2.QueueSubscribe("bar", "baz", func(m *Msg) {
+		response := &Msg{Subject: m.Reply, Data: []byte(recvName)}
+		c2.Conn.PublishMsg(response)
+		dch <- true
+	}); err != nil {
+		t.Fatalf("Unable to create subscription: %v", err)
 	}
 
-	ec.Publish(subject, testString)
-	if e := wait(ch); e != nil {
-		t.Fatalf("Did not receive the message: %s", e)
+	mReply := Msg{}
+	if err := c2.Request("bar", &Msg{Data: []byte(sentName)}, &mReply, 2*time.Second); err != nil {
+		t.Fatalf("Unable to send request: %v", err)
+	}
+	if string(mReply.Data) != recvName {
+		t.Fatalf("Wrong reply: %v instead of %v", string(mReply.Data), recvName)
+	}
+
+	if err := Wait(dch); err != nil {
+		t.Fatal("Did not get message")
+	}
+
+	if c.LastError() != nil {
+		t.Fatalf("Unexpected connection error: %v", c.LastError())
+	}
+	if c2.LastError() != nil {
+		t.Fatalf("Unexpected connection error: %v", c2.LastError())
 	}
 }

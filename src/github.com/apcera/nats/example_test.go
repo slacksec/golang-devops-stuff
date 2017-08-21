@@ -2,15 +2,22 @@ package nats_test
 
 import (
 	"fmt"
-	"github.com/apcera/nats"
 	"time"
+
+	"github.com/nats-io/go-nats"
 )
 
 // Shows different ways to create a Conn
 func ExampleConnect() {
 
-	nats.Connect(nats.DefaultURL)
-	nats.Connect("nats://derek:secretpassword@nats.apcera.com:421")
+	nc, _ := nats.Connect(nats.DefaultURL)
+	nc.Close()
+
+	nc, _ = nats.Connect("nats://derek:secretpassword@demo.nats.io:4222")
+	nc.Close()
+
+	nc, _ = nats.Connect("tls://derek:secretpassword@demo.nats.io:4443")
+	nc.Close()
 
 	opts := nats.Options{
 		AllowReconnect: true,
@@ -19,7 +26,7 @@ func ExampleConnect() {
 		Timeout:        1 * time.Second,
 	}
 
-	nc, _ := opts.Connect()
+	nc, _ = opts.Connect()
 	nc.Close()
 }
 
@@ -130,7 +137,7 @@ func ExampleConn_QueueSubscribe() {
 	received := 0
 
 	nc.QueueSubscribe("foo", "worker_group", func(_ *nats.Msg) {
-		received += 1
+		received++
 	})
 }
 
@@ -141,7 +148,7 @@ func ExampleSubscription_AutoUnsubscribe() {
 	received, wanted, total := 0, 10, 100
 
 	sub, _ := nc.Subscribe("foo", func(_ *nats.Msg) {
-		received += 1
+		received++
 	})
 	sub.AutoUnsubscribe(wanted)
 
@@ -213,7 +220,7 @@ func ExampleEncodedConn_Subscribe() {
 
 // BindSendChan() allows binding of a Go channel to a nats
 // subject for publish operations. The Encoder attached to the
-// EncodedConn will be used for marshalling.
+// EncodedConn will be used for marshaling.
 func ExampleEncodedConn_BindSendChan() {
 	nc, _ := nats.Connect(nats.DefaultURL)
 	c, _ := nats.NewEncodedConn(nc, "json")
@@ -234,7 +241,7 @@ func ExampleEncodedConn_BindSendChan() {
 
 // BindRecvChan() allows binding of a Go channel to a nats
 // subject for subscribe operations. The Encoder attached to the
-// EncodedConn will be used for un-marshalling.
+// EncodedConn will be used for un-marshaling.
 func ExampleEncodedConn_BindRecvChan() {
 	nc, _ := nats.Connect(nats.DefaultURL)
 	c, _ := nats.NewEncodedConn(nc, "json")
