@@ -2,9 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"sort"
+
 	"github.com/smira/aptly/deb"
 	"github.com/smira/commander"
-	"sort"
 )
 
 func aptlySnapshotVerify(cmd *commander.Command, args []string) error {
@@ -31,25 +32,25 @@ func aptlySnapshotVerify(cmd *commander.Command, args []string) error {
 
 	packageList, err := deb.NewPackageListFromRefList(snapshots[0].RefList(), context.CollectionFactory().PackageCollection(), context.Progress())
 	if err != nil {
-		fmt.Errorf("unable to load packages: %s", err)
+		return fmt.Errorf("unable to load packages: %s", err)
 	}
 
 	sourcePackageList := deb.NewPackageList()
 	err = sourcePackageList.Append(packageList)
 	if err != nil {
-		fmt.Errorf("unable to merge sources: %s", err)
+		return fmt.Errorf("unable to merge sources: %s", err)
 	}
 
 	var pL *deb.PackageList
 	for i := 1; i < len(snapshots); i++ {
 		pL, err = deb.NewPackageListFromRefList(snapshots[i].RefList(), context.CollectionFactory().PackageCollection(), context.Progress())
 		if err != nil {
-			fmt.Errorf("unable to load packages: %s", err)
+			return fmt.Errorf("unable to load packages: %s", err)
 		}
 
 		err = sourcePackageList.Append(pL)
 		if err != nil {
-			fmt.Errorf("unable to merge sources: %s", err)
+			return fmt.Errorf("unable to merge sources: %s", err)
 		}
 	}
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/smira/commander"
 	"github.com/smira/flag"
 )
@@ -34,7 +35,7 @@ func aptlyRepoDrop(cmd *commander.Command, args []string) error {
 		return fmt.Errorf("unable to drop: local repo is published")
 	}
 
-	force := context.flags.Lookup("force").Value.Get().(bool)
+	force := context.Flags().Lookup("force").Value.Get().(bool)
 	if !force {
 		snapshots := context.CollectionFactory().SnapshotCollection().ByLocalRepoSource(repo)
 

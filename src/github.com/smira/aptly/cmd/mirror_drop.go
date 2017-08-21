@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/smira/commander"
 	"github.com/smira/flag"
 )
@@ -20,7 +21,12 @@ func aptlyMirrorDrop(cmd *commander.Command, args []string) error {
 		return fmt.Errorf("unable to drop: %s", err)
 	}
 
-	force := context.flags.Lookup("force").Value.Get().(bool)
+	err = repo.CheckLock()
+	if err != nil {
+		return fmt.Errorf("unable to drop: %s", err)
+	}
+
+	force := context.Flags().Lookup("force").Value.Get().(bool)
 	if !force {
 		snapshots := context.CollectionFactory().SnapshotCollection().ByRemoteRepoSource(repo)
 

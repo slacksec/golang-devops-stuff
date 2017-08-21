@@ -2,15 +2,19 @@ package cmd
 
 import (
 	"bytes"
-	"code.google.com/p/gographviz"
 	"fmt"
-	"github.com/smira/aptly/deb"
-	"github.com/smira/commander"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
+
+	"github.com/smira/aptly/deb"
+	"github.com/smira/aptly/utils"
+	"github.com/smira/commander"
 )
 
 func aptlyGraph(cmd *commander.Command, args []string) error {
@@ -21,121 +25,14 @@ func aptlyGraph(cmd *commander.Command, args []string) error {
 		return commander.ErrCommandError
 	}
 
-	graph := gographviz.NewEscape()
-	graph.SetDir(true)
-	graph.SetName("aptly")
-
-	existingNodes := map[string]bool{}
-
-	fmt.Printf("Loading mirrors...\n")
-
-	err = context.CollectionFactory().RemoteRepoCollection().ForEach(func(repo *deb.RemoteRepo) error {
-		err := context.CollectionFactory().RemoteRepoCollection().LoadComplete(repo)
-		if err != nil {
-			return err
-		}
-
-		graph.AddNode("aptly", repo.UUID, map[string]string{
-			"shape":     "Mrecord",
-			"style":     "filled",
-			"fillcolor": "darkgoldenrod1",
-			"label": fmt.Sprintf("{Mirror %s|url: %s|dist: %s|comp: %s|arch: %s|pkgs: %d}",
-				repo.Name, repo.ArchiveRoot, repo.Distribution, strings.Join(repo.Components, ", "),
-				strings.Join(repo.Architectures, ", "), repo.NumPackages()),
-		})
-		existingNodes[repo.UUID] = true
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Loading local repos...\n")
-
-	err = context.CollectionFactory().LocalRepoCollection().ForEach(func(repo *deb.LocalRepo) error {
-		err := context.CollectionFactory().LocalRepoCollection().LoadComplete(repo)
-		if err != nil {
-			return err
-		}
-
-		graph.AddNode("aptly", repo.UUID, map[string]string{
-			"shape":     "Mrecord",
-			"style":     "filled",
-			"fillcolor": "mediumseagreen",
-			"label": fmt.Sprintf("{Repo %s|comment: %s|pkgs: %d}",
-				repo.Name, repo.Comment, repo.NumPackages()),
-		})
-		existingNodes[repo.UUID] = true
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Loading snapshots...\n")
-
-	context.CollectionFactory().SnapshotCollection().ForEach(func(snapshot *deb.Snapshot) error {
-		existingNodes[snapshot.UUID] = true
-		return nil
-	})
-
-	err = context.CollectionFactory().SnapshotCollection().ForEach(func(snapshot *deb.Snapshot) error {
-		err := context.CollectionFactory().SnapshotCollection().LoadComplete(snapshot)
-		if err != nil {
-			return err
-		}
-
-		description := snapshot.Description
-		if snapshot.SourceKind == "repo" {
-			description = "Snapshot from repo"
-		}
-
-		graph.AddNode("aptly", snapshot.UUID, map[string]string{
-			"shape":     "Mrecord",
-			"style":     "filled",
-			"fillcolor": "cadetblue1",
-			"label":     fmt.Sprintf("{Snapshot %s|%s|pkgs: %d}", snapshot.Name, description, snapshot.NumPackages()),
-		})
-
-		if snapshot.SourceKind == "repo" || snapshot.SourceKind == "local" || snapshot.SourceKind == "snapshot" {
-			for _, uuid := range snapshot.SourceIDs {
-				_, exists := existingNodes[uuid]
-				if exists {
-					graph.AddEdge(uuid, snapshot.UUID, true, nil)
-				}
-			}
-		}
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Loading published repos...\n")
-
-	context.CollectionFactory().PublishedRepoCollection().ForEach(func(repo *deb.PublishedRepo) error {
-		graph.AddNode("aptly", repo.UUID, map[string]string{
-			"shape":     "Mrecord",
-			"style":     "filled",
-			"fillcolor": "darkolivegreen1",
-			"label": fmt.Sprintf("{Published %s/%s|comp: %s|arch: %s}", repo.Prefix, repo.Distribution,
-				strings.Join(repo.Components(), " "), strings.Join(repo.Architectures, ", ")),
-		})
-
-		for _, uuid := range repo.Sources {
-			_, exists := existingNodes[uuid]
-			if exists {
-				graph.AddEdge(uuid, repo.UUID, true, nil)
-			}
-		}
-
-		return nil
-	})
+	layout := context.Flags().Lookup("layout").Value.String()
 
 	fmt.Printf("Generating graph...\n")
+	graph, err := deb.BuildGraph(context.CollectionFactory(), layout)
+
+	if err != nil {
+		return err
+	}
 
 	buf := bytes.NewBufferString(graph.String())
 
@@ -146,9 +43,16 @@ func aptlyGraph(cmd *commander.Command, args []string) error {
 	tempfile.Close()
 	os.Remove(tempfile.Name())
 
-	tempfilename := tempfile.Name() + ".png"
+	format := context.Flags().Lookup("format").Value.String()
+	output := context.Flags().Lookup("output").Value.String()
 
-	command := exec.Command("dot", "-Tpng", "-o"+tempfilename)
+	if filepath.Ext(output) != "" {
+		format = filepath.Ext(output)[1:]
+	}
+
+	tempfilename := tempfile.Name() + "." + format
+
+	command := exec.Command("dot", "-T"+format, "-o"+tempfilename)
 	command.Stderr = os.Stderr
 
 	stdin, err := command.StdinPipe()
@@ -176,13 +80,49 @@ func aptlyGraph(cmd *commander.Command, args []string) error {
 		return err
 	}
 
-	err = exec.Command("open", tempfilename).Run()
-	if err != nil {
-		fmt.Printf("Rendered to PNG file: %s\n", tempfilename)
-		err = nil
+	defer func() {
+		_ = os.Remove(tempfilename)
+	}()
+
+	if output != "" {
+		err = utils.CopyFile(tempfilename, output)
+		if err != nil {
+			return fmt.Errorf("unable to copy %s -> %s: %s", tempfilename, output, err)
+		}
+
+		fmt.Printf("Output saved to %s\n", output)
+	} else {
+		command := getOpenCommand()
+		fmt.Printf("Rendered to %s file: %s, trying to open it with: %s %s...\n", format, tempfilename, command, tempfilename)
+
+		args := strings.Split(command, " ")
+
+		viewer := exec.Command(args[0], append(args[1:], tempfilename)...)
+		viewer.Stderr = os.Stderr
+		if err = viewer.Start(); err == nil {
+			// Wait for a second so that the visualizer has a chance to
+			// open the input file. This needs to be done even if we're
+			// waiting for the visualizer as it can be just a wrapper that
+			// spawns a browser tab and returns right away.
+			defer func(t <-chan time.Time) {
+				<-t
+			}(time.After(time.Second))
+		}
 	}
 
 	return err
+}
+
+// getOpenCommand tries to guess command to open image for OS
+func getOpenCommand() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/usr/bin/open"
+	case "windows":
+		return "cmd /c start"
+	default:
+		return "xdg-open"
+	}
 }
 
 func makeCmdGraph() *commander.Command {
@@ -200,6 +140,10 @@ Example:
   $ aptly graph
 `,
 	}
+
+	cmd.Flag.String("format", "png", "render graph to specified format (png, svg, pdf, etc.)")
+	cmd.Flag.String("output", "", "specify output filename, default is to open result in viewer")
+	cmd.Flag.String("layout", "horizontal", "create a more 'vertical' or a more 'horizontal' graph layout")
 
 	return cmd
 }

@@ -90,9 +90,11 @@ class CreateMirror9Test(BaseTest):
     """
     create mirror: repo with InRelease verification
     """
-    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror9 http://mirror.yandex.ru/debian-backports/ squeeze-backports"
+    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror9 http://mirror.yandex.ru/debian/ wheezy-backports"
     fixtureGpg = True
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using|Warning: using insecure memory!\n', '', s)
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using|Warning: using insecure memory!\n', '', s)
 
     def check(self):
         def removeDates(s):
@@ -109,17 +111,21 @@ class CreateMirror10Test(BaseTest):
     runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror10 http://mirror.yandex.ru/debian-backports/ squeeze-backports"
     fixtureGpg = False
     gold_processor = BaseTest.expand_environ
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using|gpgv: keyblock resource .*$|gpgv: Can\'t check signature: .*$', '', s, flags=re.MULTILINE)
     expectedCode = 1
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using|gpgv: keyblock resource .*$|gpgv: Can\'t check signature: .*$', '', s, flags=re.MULTILINE)
 
 
 class CreateMirror11Test(BaseTest):
     """
     create mirror: repo with Release + Release.gpg verification
     """
-    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror11 http://mirror.yandex.ru/debian/ squeeze"
+    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror11 http://mirror.yandex.ru/debian/ wheezy"
     fixtureGpg = True
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using', '', s)
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
 
     def check(self):
         self.check_output()
@@ -130,11 +136,13 @@ class CreateMirror12Test(BaseTest):
     """
     create mirror: repo with Release+Release.gpg verification, failure
     """
-    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror12 http://mirror.yandex.ru/debian/ squeeze"
+    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror12 http://mirror.yandex.ru/debian/ wheezy"
     fixtureGpg = False
     gold_processor = BaseTest.expand_environ
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using|gpgv: keyblock resource .*$|gpgv: Can\'t check signature: .*$', '', s, flags=re.MULTILINE)
     expectedCode = 1
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using|gpgv: keyblock resource .*$|gpgv: Can\'t check signature: .*$', '', s, flags=re.MULTILINE)
 
 
 class CreateMirror13Test(BaseTest):
@@ -153,20 +161,25 @@ class CreateMirror14Test(BaseTest):
     """
     create mirror: flat repository
     """
-    runCmd = "aptly mirror create -keyring=aptlytest.gpg mirror14 http://download.opensuse.org/repositories/home:/DeepDiver1975/xUbuntu_10.04/ ./"
+    runCmd = "aptly mirror create -keyring=aptlytest.gpg mirror14  https://cloud.r-project.org/bin/linux/debian jessie-cran3/"
     fixtureGpg = True
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using', '', s)
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
 
     def check(self):
+        def removeDates(s):
+            return re.sub(r"(Date|Valid-Until): [,0-9:+A-Za-z -]+\n", "", s)
+
         self.check_output()
-        self.check_cmd_output("aptly mirror show mirror14", "mirror_show")
+        self.check_cmd_output("aptly mirror show mirror14", "mirror_show", match_prepare=removeDates)
 
 
 class CreateMirror15Test(BaseTest):
     """
     create mirror: flat repository + components
     """
-    runCmd = "aptly mirror create -keyring=aptlytest.gpg mirror14 http://download.opensuse.org/repositories/home:/DeepDiver1975/xUbuntu_10.04/ ./ main"
+    runCmd = "aptly mirror create -keyring=aptlytest.gpg mirror14  https://cloud.r-project.org/bin/linux/debian jessie-cran3/ main"
     expectedCode = 1
 
 
@@ -195,14 +208,15 @@ class CreateMirror18Test(BaseTest):
     create mirror: mirror with ppa URL
     """
     fixtureGpg = True
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using', '', s)
-
     configOverride = {
         "ppaDistributorID": "ubuntu",
         "ppaCodename": "maverick",
     }
 
     runCmd = "aptly mirror create -keyring=aptlytest.gpg mirror18 ppa:gladky-anton/gnuplot"
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
 
     def check(self):
         self.check_output()
@@ -214,9 +228,11 @@ class CreateMirror19Test(BaseTest):
     create mirror: mirror with / in distribution
     """
     fixtureGpg = True
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using', '', s)
 
     runCmd = "aptly -architectures='i386' mirror create -keyring=aptlytest.gpg -with-sources mirror19 http://security.debian.org/ wheezy/updates main"
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
 
     def check(self):
         def removeDates(s):
@@ -236,6 +252,9 @@ class CreateMirror20Test(BaseTest):
     environmentOverride = {"HTTP_PROXY": "127.0.0.1:3137"}
     expectedCode = 1
 
+    def outputMatchPrepare(_, s):
+        return s.replace('getsockopt: ', '').replace('proxyconnect tcp', 'http: error connecting to proxy http://127.0.0.1:3137')
+
 
 class CreateMirror21Test(BaseTest):
     """
@@ -243,14 +262,19 @@ class CreateMirror21Test(BaseTest):
     """
     runCmd = "aptly mirror create -keyring=aptlytest.gpg mirror21 http://pkg.jenkins-ci.org/debian-stable binary/"
     fixtureGpg = True
-    outputMatchPrepare = lambda _, s: re.sub(r'Signature made .* using', '', s)
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
 
     def check(self):
         def removeSHA512(s):
             return re.sub(r"SHA512: .+\n", "", s)
 
+        def removeDates(s):
+            return re.sub(r"(Date|Valid-Until): [,0-9:+A-Za-z -]+\n", "", s)
+
         self.check_output()
-        self.check_cmd_output("aptly mirror show mirror21", "mirror_show", match_prepare=removeSHA512)
+        self.check_cmd_output("aptly mirror show mirror21", "mirror_show", match_prepare=lambda s: removeSHA512(removeDates(s)))
 
 
 class CreateMirror22Test(BaseTest):
@@ -273,3 +297,101 @@ class CreateMirror23Test(BaseTest):
     """
     runCmd = "aptly mirror create -ignore-signatures -filter='nginx | ' mirror23 http://security.debian.org/ wheezy/updates main"
     expectedCode = 1
+
+
+class CreateMirror24Test(BaseTest):
+    """
+    create mirror: disable config value with option
+    """
+    runCmd = "aptly mirror create -ignore-signatures=false -keyring=aptlytest.gpg mirror24 http://security.debian.org/ wheezy/updates main"
+    fixtureGpg = True
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
+
+    configOverride = {
+        "gpgDisableVerify": True
+    }
+
+
+class CreateMirror25Test(BaseTest):
+    """
+    create mirror: mirror with udebs enabled
+    """
+    runCmd = "aptly -architectures=i386 mirror create -ignore-signatures -with-udebs mirror25 http://mirror.yandex.ru/debian/ wheezy"
+
+    def check(self):
+        self.check_output()
+        self.check_cmd_output("aptly mirror show mirror25", "mirror_show")
+
+
+class CreateMirror26Test(BaseTest):
+    """
+    create mirror: flat mirror with udebs
+    """
+    runCmd = "aptly mirror create -keyring=aptlytest.gpg -with-udebs mirror26 http://pkg.jenkins-ci.org/debian-stable binary/"
+    fixtureGpg = True
+    expectedCode = 1
+
+
+class CreateMirror27Test(BaseTest):
+    """
+    create mirror: component with slashes, no stripping
+    """
+    runCmd = "aptly mirror create --ignore-signatures mirror27 http://linux.dell.com/repo/community/ubuntu wheezy openmanage/740"
+
+    def check(self):
+        self.check_output()
+        self.check_cmd_output("aptly mirror show mirror27", "mirror_show")
+
+
+class CreateMirror28Test(BaseTest):
+    """
+    create mirror: -force-components
+    """
+    runCmd = "aptly mirror create -ignore-signatures -force-components mirror28 http://downloads-distro.mongodb.org/repo/ubuntu-upstart dist 10gen"
+
+    def check(self):
+        def removeDates(s):
+            return re.sub(r"(Date|Valid-Until): [,0-9:+A-Za-z -]+\n", "", s)
+
+        self.check_output()
+        self.check_cmd_output("aptly mirror show mirror28", "mirror_show", match_prepare=removeDates)
+
+
+class CreateMirror29Test(BaseTest):
+    """
+    create mirror: repo with InRelease verification (internal GPG implementation)
+    """
+    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror9 http://mirror.yandex.ru/debian/ wheezy-backports"
+    configOverride = {"gpgProvider": "internal"}
+    fixtureGpg = True
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
+
+
+class CreateMirror30Test(BaseTest):
+    """
+    create mirror: repo with InRelease verification, failure  (internal GPG implementation)
+    """
+    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror10 http://mirror.yandex.ru/debian-backports/ squeeze-backports"
+    configOverride = {"gpgProvider": "internal"}
+    gold_processor = BaseTest.expand_environ
+    fixtureGpg = False
+    expectedCode = 1
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)
+
+
+class CreateMirror31Test(BaseTest):
+    """
+    create mirror: repo with Release + Release.gpg verification (internal GPG implementation)
+    """
+    runCmd = "aptly mirror create --keyring=aptlytest.gpg mirror11 http://mirror.yandex.ru/debian/ wheezy"
+    configOverride = {"gpgProvider": "internal"}
+    fixtureGpg = True
+
+    def outputMatchPrepare(_, s):
+        return re.sub(r'Signature made .* using', '', s)

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/smira/aptly/query"
 	"github.com/smira/commander"
 	"github.com/smira/flag"
@@ -19,17 +20,39 @@ func aptlyMirrorEdit(cmd *commander.Command, args []string) error {
 		return fmt.Errorf("unable to edit: %s", err)
 	}
 
-	context.flags.Visit(func(flag *flag.Flag) {
+	err = repo.CheckLock()
+	if err != nil {
+		return fmt.Errorf("unable to edit: %s", err)
+	}
+
+	context.Flags().Visit(func(flag *flag.Flag) {
 		switch flag.Name {
 		case "filter":
 			repo.Filter = flag.Value.String()
 		case "filter-with-deps":
 			repo.FilterWithDeps = flag.Value.Get().(bool)
+		case "with-sources":
+			repo.DownloadSources = flag.Value.Get().(bool)
+		case "with-udebs":
+			repo.DownloadUdebs = flag.Value.Get().(bool)
 		}
 	})
 
+	if repo.IsFlat() && repo.DownloadUdebs {
+		return fmt.Errorf("unable to edit: flat mirrors don't support udebs")
+	}
+
 	if repo.Filter != "" {
 		_, err = query.Parse(repo.Filter)
+		if err != nil {
+			return fmt.Errorf("unable to edit: %s", err)
+		}
+	}
+
+	if context.GlobalFlags().Lookup("architectures").Value.String() != "" {
+		repo.Architectures = context.ArchitecturesList()
+
+		err = repo.Fetch(context.Downloader(), nil)
 		if err != nil {
 			return fmt.Errorf("unable to edit: %s", err)
 		}
@@ -48,10 +71,10 @@ func makeCmdMirrorEdit() *commander.Command {
 	cmd := &commander.Command{
 		Run:       aptlyMirrorEdit,
 		UsageLine: "edit <name>",
-		Short:     "edit properties of mirorr",
+		Short:     "edit mirror settings",
 		Long: `
-Command edit allows to change settings of mirror:
-filters.
+Command edit allows one to change settings of mirror:
+filters, list of architectures.
 
 Example:
 
@@ -62,6 +85,8 @@ Example:
 
 	cmd.Flag.String("filter", "", "filter packages in mirror")
 	cmd.Flag.Bool("filter-with-deps", false, "when filtering, include dependencies of matching packages as well")
+	cmd.Flag.Bool("with-sources", false, "download source packages in addition to binary packages")
+	cmd.Flag.Bool("with-udebs", false, "download .udeb packages (Debian installer support)")
 
 	return cmd
 }

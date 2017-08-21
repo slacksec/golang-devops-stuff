@@ -1,9 +1,10 @@
 package utils
 
 import (
-	. "launchpad.net/gocheck"
 	"os"
 	"path/filepath"
+
+	. "gopkg.in/check.v1"
 )
 
 type ConfigSuite struct {
@@ -29,9 +30,17 @@ func (s *ConfigSuite) TestSaveConfig(c *C) {
 
 	s.config.RootDir = "/tmp/aptly"
 	s.config.DownloadConcurrency = 5
-	s.config.S3PublishRoots = map[string]S3PublishRoot{"test": S3PublishRoot{
+	s.config.GpgProvider = "gpg"
+
+	s.config.FileSystemPublishRoots = map[string]FileSystemPublishRoot{"test": {
+		RootDir: "/opt/aptly-publish"}}
+
+	s.config.S3PublishRoots = map[string]S3PublishRoot{"test": {
 		Region: "us-east-1",
 		Bucket: "repo"}}
+
+	s.config.SwiftPublishRoots = map[string]SwiftPublishRoot{"test": {
+		Container: "repo"}}
 
 	err := SaveConfig(configname, &s.config)
 	c.Assert(err, IsNil)
@@ -53,19 +62,53 @@ func (s *ConfigSuite) TestSaveConfig(c *C) {
 		"  \"dependencyFollowRecommends\": false,\n"+
 		"  \"dependencyFollowAllVariants\": false,\n"+
 		"  \"dependencyFollowSource\": false,\n"+
+		"  \"dependencyVerboseResolve\": false,\n"+
 		"  \"gpgDisableSign\": false,\n"+
 		"  \"gpgDisableVerify\": false,\n"+
+		"  \"gpgProvider\": \"gpg\",\n"+
 		"  \"downloadSourcePackages\": false,\n"+
+		"  \"skipLegacyPool\": false,\n"+
 		"  \"ppaDistributorID\": \"\",\n"+
 		"  \"ppaCodename\": \"\",\n"+
+		"  \"skipContentsPublishing\": false,\n"+
+		"  \"FileSystemPublishEndpoints\": {\n"+
+		"    \"test\": {\n"+
+		"      \"rootDir\": \"/opt/aptly-publish\",\n"+
+		"      \"linkMethod\": \"\",\n"+
+		"      \"verifyMethod\": \"\"\n"+
+		"    }\n"+
+		"  },\n"+
 		"  \"S3PublishEndpoints\": {\n"+
 		"    \"test\": {\n"+
 		"      \"region\": \"us-east-1\",\n"+
 		"      \"bucket\": \"repo\",\n"+
+		"      \"endpoint\": \"\",\n"+
 		"      \"awsAccessKeyID\": \"\",\n"+
 		"      \"awsSecretAccessKey\": \"\",\n"+
+		"      \"awsSessionToken\": \"\",\n"+
 		"      \"prefix\": \"\",\n"+
-		"      \"acl\": \"\"\n"+
+		"      \"acl\": \"\",\n"+
+		"      \"storageClass\": \"\",\n"+
+		"      \"encryptionMethod\": \"\",\n"+
+		"      \"plusWorkaround\": false,\n"+
+		"      \"disableMultiDel\": false,\n"+
+		"      \"forceSigV2\": false,\n"+
+		"      \"debug\": false\n"+
+		"    }\n"+
+		"  },\n"+
+		"  \"SwiftPublishEndpoints\": {\n"+
+		"    \"test\": {\n"+
+		"      \"osname\": \"\",\n"+
+		"      \"password\": \"\",\n"+
+		"      \"authurl\": \"\",\n"+
+		"      \"tenant\": \"\",\n"+
+		"      \"tenantid\": \"\",\n"+
+		"      \"domain\": \"\",\n"+
+		"      \"domainid\": \"\",\n"+
+		"      \"tenantdomain\": \"\",\n"+
+		"      \"tenantdomainid\": \"\",\n"+
+		"      \"prefix\": \"\",\n"+
+		"      \"container\": \"repo\"\n"+
 		"    }\n"+
 		"  }\n"+
 		"}")

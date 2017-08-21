@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
+
+	"github.com/smira/aptly/deb"
 	"github.com/smira/aptly/utils"
 	"github.com/smira/commander"
 	"github.com/smira/flag"
-	"strings"
 )
 
 func aptlyMirrorShow(cmd *commander.Command, args []string) error {
@@ -28,20 +30,28 @@ func aptlyMirrorShow(cmd *commander.Command, args []string) error {
 	}
 
 	fmt.Printf("Name: %s\n", repo.Name)
+	if repo.Status == deb.MirrorUpdating {
+		fmt.Printf("Status: In Update (PID %d)\n", repo.WorkerPID)
+	}
 	fmt.Printf("Archive Root URL: %s\n", repo.ArchiveRoot)
 	fmt.Printf("Distribution: %s\n", repo.Distribution)
 	fmt.Printf("Components: %s\n", strings.Join(repo.Components, ", "))
 	fmt.Printf("Architectures: %s\n", strings.Join(repo.Architectures, ", "))
-	downloadSources := "no"
+	downloadSources := No
 	if repo.DownloadSources {
-		downloadSources = "yes"
+		downloadSources = Yes
 	}
 	fmt.Printf("Download Sources: %s\n", downloadSources)
+	downloadUdebs := No
+	if repo.DownloadUdebs {
+		downloadUdebs = Yes
+	}
+	fmt.Printf("Download .udebs: %s\n", downloadUdebs)
 	if repo.Filter != "" {
 		fmt.Printf("Filter: %s\n", repo.Filter)
-		filterWithDeps := "no"
+		filterWithDeps := No
 		if repo.FilterWithDeps {
-			filterWithDeps = "yes"
+			filterWithDeps = Yes
 		}
 		fmt.Printf("Filter With Deps: %s\n", filterWithDeps)
 	}
@@ -57,7 +67,7 @@ func aptlyMirrorShow(cmd *commander.Command, args []string) error {
 		fmt.Printf("%s: %s\n", k, repo.Meta[k])
 	}
 
-	withPackages := context.flags.Lookup("with-packages").Value.Get().(bool)
+	withPackages := context.Flags().Lookup("with-packages").Value.Get().(bool)
 	if withPackages {
 		if repo.LastDownloadDate.IsZero() {
 			fmt.Printf("Unable to show package list, mirror hasn't been downloaded yet.\n")

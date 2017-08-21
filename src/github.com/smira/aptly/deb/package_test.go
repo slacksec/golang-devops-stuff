@@ -2,12 +2,13 @@ package deb
 
 import (
 	"bytes"
-	"github.com/smira/aptly/files"
-	"github.com/smira/aptly/utils"
-	. "launchpad.net/gocheck"
-	"os"
+	"io/ioutil"
 	"path/filepath"
 	"regexp"
+
+	"github.com/smira/aptly/files"
+
+	. "gopkg.in/check.v1"
 )
 
 type PackageSuite struct {
@@ -21,13 +22,14 @@ func (s *PackageSuite) SetUpTest(c *C) {
 	s.stanza = packageStanza.Copy()
 
 	buf := bytes.NewBufferString(sourcePackageMeta)
-	s.sourceStanza, _ = NewControlFileReader(buf).ReadStanza()
+	s.sourceStanza, _ = NewControlFileReader(buf).ReadStanza(false)
 }
 
 func (s *PackageSuite) TestNewFromPara(c *C) {
 	p := NewPackageFromControlFile(s.stanza)
 
 	c.Check(p.IsSource, Equals, false)
+	c.Check(p.IsUdeb, Equals, false)
 	c.Check(p.Name, Equals, "alien-arena-common")
 	c.Check(p.Version, Equals, "7.40-2")
 	c.Check(p.Architecture, Equals, "i386")
@@ -40,11 +42,27 @@ func (s *PackageSuite) TestNewFromPara(c *C) {
 	c.Check(p.deps.Depends, DeepEquals, []string{"libc6 (>= 2.7)", "alien-arena-data (>= 7.40)"})
 }
 
+func (s *PackageSuite) TestNewUdebFromPara(c *C) {
+	stanza, _ := NewControlFileReader(bytes.NewBufferString(udebPackageMeta)).ReadStanza(false)
+	p := NewUdebPackageFromControlFile(stanza)
+
+	c.Check(p.IsSource, Equals, false)
+	c.Check(p.IsUdeb, Equals, true)
+	c.Check(p.Name, Equals, "dmidecode-udeb")
+	c.Check(p.Version, Equals, "2.11-9")
+	c.Check(p.Architecture, Equals, "amd64")
+	c.Check(p.Provides, DeepEquals, []string(nil))
+	c.Check(p.Files(), HasLen, 1)
+	c.Check(p.Files()[0].Filename, Equals, "dmidecode-udeb_2.11-9_amd64.udeb")
+	c.Check(p.deps.Depends, DeepEquals, []string{"libc6-udeb (>= 2.13)"})
+}
+
 func (s *PackageSuite) TestNewSourceFromPara(c *C) {
 	p, err := NewSourcePackageFromControlFile(s.sourceStanza)
 
 	c.Check(err, IsNil)
 	c.Check(p.IsSource, Equals, true)
+	c.Check(p.IsUdeb, Equals, false)
 	c.Check(p.Name, Equals, "access-modifier-checker")
 	c.Check(p.Version, Equals, "1.0-4")
 	c.Check(p.Architecture, Equals, "source")
@@ -107,6 +125,10 @@ func (s *PackageSuite) TestStanza(c *C) {
 	p := NewPackageFromControlFile(s.stanza.Copy())
 	stanza := p.Stanza()
 
+	for k := range s.stanza {
+		c.Check(stanza[k], Equals, s.stanza[k])
+	}
+
 	c.Assert(stanza, DeepEquals, s.stanza)
 
 	p, _ = NewSourcePackageFromControlFile(s.sourceStanza.Copy())
@@ -134,21 +156,28 @@ func (s *PackageSuite) TestGetField(c *C) {
 
 	p4, _ := NewSourcePackageFromControlFile(s.sourceStanza.Copy())
 
+	stanza5, _ := NewControlFileReader(bytes.NewBufferString(udebPackageMeta)).ReadStanza(false)
+	p5 := NewUdebPackageFromControlFile(stanza5)
+
 	c.Check(p.GetField("$Source"), Equals, "alien-arena")
 	c.Check(p2.GetField("$Source"), Equals, "alien-arena-common")
 	c.Check(p3.GetField("$Source"), Equals, "alien-arena")
 	c.Check(p4.GetField("$Source"), Equals, "")
+	c.Check(p5.GetField("$Source"), Equals, "dmidecode")
 
 	c.Check(p.GetField("$SourceVersion"), Equals, "7.40-2")
 	c.Check(p2.GetField("$SourceVersion"), Equals, "7.40-2")
 	c.Check(p3.GetField("$SourceVersion"), Equals, "3.5")
 	c.Check(p4.GetField("$SourceVersion"), Equals, "")
+	c.Check(p5.GetField("$SourceVersion"), Equals, "2.11-9")
 
 	c.Check(p.GetField("$Architecture"), Equals, "i386")
 	c.Check(p4.GetField("$Architecture"), Equals, "source")
+	c.Check(p5.GetField("$Architecture"), Equals, "amd64")
 
 	c.Check(p.GetField("$PackageType"), Equals, "deb")
 	c.Check(p4.GetField("$PackageType"), Equals, "source")
+	c.Check(p5.GetField("$PackageType"), Equals, "udeb")
 
 	c.Check(p.GetField("Name"), Equals, "alien-arena-common")
 	c.Check(p4.GetField("Name"), Equals, "access-modifier-checker")
@@ -270,7 +299,7 @@ func (s *PackageSuite) TestMatchesDependency(c *C) {
 	// ~
 	c.Check(
 		p.MatchesDependency(Dependency{Pkg: "alien-arena-common", Architecture: "i386", Relation: VersionRegexp, Version: "7\\.40-.*",
-			Regexp: regexp.MustCompile("7\\.40-.*")}), Equals, true)
+			Regexp: regexp.MustCompile(`7\.40-.*`)}), Equals, true)
 	c.Check(
 		p.MatchesDependency(Dependency{Pkg: "alien-arena-common", Architecture: "i386", Relation: VersionRegexp, Version: "7\\.40-.*",
 			Regexp: regexp.MustCompile("40")}), Equals, true)
@@ -333,19 +362,17 @@ func (s *PackageSuite) TestPoolDirectory(c *C) {
 }
 
 func (s *PackageSuite) TestLinkFromPool(c *C) {
-	packagePool := files.NewPackagePool(c.MkDir())
-	publishedStorage := files.NewPublishedStorage(c.MkDir())
+	packagePool := files.NewPackagePool(c.MkDir(), false)
+	cs := files.NewMockChecksumStorage()
+	publishedStorage := files.NewPublishedStorage(c.MkDir(), "", "")
 	p := NewPackageFromControlFile(s.stanza)
 
-	poolPath, _ := packagePool.Path(p.Files()[0].Filename, p.Files()[0].Checksums.MD5)
-	err := os.MkdirAll(filepath.Dir(poolPath), 0755)
-	c.Assert(err, IsNil)
+	tmpFilepath := filepath.Join(c.MkDir(), "file")
+	c.Assert(ioutil.WriteFile(tmpFilepath, nil, 0777), IsNil)
 
-	file, err := os.Create(poolPath)
-	c.Assert(err, IsNil)
-	file.Close()
+	p.Files()[0].PoolPath, _ = packagePool.Import(tmpFilepath, p.Files()[0].Filename, &p.Files()[0].Checksums, false, cs)
 
-	err = p.LinkFromPool(publishedStorage, packagePool, "", "non-free", false)
+	err := p.LinkFromPool(publishedStorage, packagePool, "", "non-free", false)
 	c.Check(err, IsNil)
 	c.Check(p.Files()[0].Filename, Equals, "alien-arena-common_7.40-2_i386.deb")
 	c.Check(p.Files()[0].downloadPath, Equals, "pool/non-free/a/alien-arena")
@@ -357,7 +384,7 @@ func (s *PackageSuite) TestLinkFromPool(c *C) {
 }
 
 func (s *PackageSuite) TestFilepathList(c *C) {
-	packagePool := files.NewPackagePool(c.MkDir())
+	packagePool := files.NewPackagePool(c.MkDir(), true)
 	p := NewPackageFromControlFile(s.stanza)
 
 	list, err := p.FilepathList(packagePool)
@@ -366,31 +393,24 @@ func (s *PackageSuite) TestFilepathList(c *C) {
 }
 
 func (s *PackageSuite) TestDownloadList(c *C) {
-	packagePool := files.NewPackagePool(c.MkDir())
+	packagePool := files.NewPackagePool(c.MkDir(), false)
+	cs := files.NewMockChecksumStorage()
 	p := NewPackageFromControlFile(s.stanza)
 	p.Files()[0].Checksums.Size = 5
-	poolPath, _ := packagePool.Path(p.Files()[0].Filename, p.Files()[0].Checksums.MD5)
 
-	list, err := p.DownloadList(packagePool)
+	list, err := p.DownloadList(packagePool, cs)
 	c.Check(err, IsNil)
 	c.Check(list, DeepEquals, []PackageDownloadTask{
-		PackageDownloadTask{
-			RepoURI:         "pool/contrib/a/alien-arena/alien-arena-common_7.40-2_i386.deb",
-			DestinationPath: poolPath,
-			Checksums: utils.ChecksumInfo{Size: 5,
-				MD5:    "1e8cba92c41420aa7baa8a5718d67122",
-				SHA1:   "46955e48cad27410a83740a21d766ce362364024",
-				SHA256: "eb4afb9885cba6dc70cccd05b910b2dbccc02c5900578be5e99f0d3dbf9d76a5"}}})
+		{
+			File: &p.Files()[0],
+		},
+	})
 
-	err = os.MkdirAll(filepath.Dir(poolPath), 0755)
-	c.Assert(err, IsNil)
+	tmpFilepath := filepath.Join(c.MkDir(), "file")
+	c.Assert(ioutil.WriteFile(tmpFilepath, []byte("abcde"), 0777), IsNil)
+	p.Files()[0].PoolPath, _ = packagePool.Import(tmpFilepath, p.Files()[0].Filename, &p.Files()[0].Checksums, false, cs)
 
-	file, err := os.Create(poolPath)
-	c.Assert(err, IsNil)
-	file.WriteString("abcde")
-	file.Close()
-
-	list, err = p.DownloadList(packagePool)
+	list, err = p.DownloadList(packagePool, cs)
 	c.Check(err, IsNil)
 	c.Check(list, DeepEquals, []PackageDownloadTask{})
 }
@@ -398,29 +418,27 @@ func (s *PackageSuite) TestDownloadList(c *C) {
 func (s *PackageSuite) TestVerifyFiles(c *C) {
 	p := NewPackageFromControlFile(s.stanza)
 
-	packagePool := files.NewPackagePool(c.MkDir())
-	poolPath, _ := packagePool.Path(p.Files()[0].Filename, p.Files()[0].Checksums.MD5)
+	packagePool := files.NewPackagePool(c.MkDir(), false)
+	cs := files.NewMockChecksumStorage()
 
-	err := os.MkdirAll(filepath.Dir(poolPath), 0755)
-	c.Assert(err, IsNil)
+	tmpFilepath := filepath.Join(c.MkDir(), "file")
+	c.Assert(ioutil.WriteFile(tmpFilepath, []byte("abcde"), 0777), IsNil)
 
-	file, err := os.Create(poolPath)
-	c.Assert(err, IsNil)
-	file.WriteString("abcde")
-	file.Close()
+	p.Files()[0].PoolPath, _ = packagePool.Import(tmpFilepath, p.Files()[0].Filename, &p.Files()[0].Checksums, false, cs)
 
-	result, err := p.VerifyFiles(packagePool)
+	p.Files()[0].Checksums.Size = 100
+	result, err := p.VerifyFiles(packagePool, cs)
 	c.Check(err, IsNil)
 	c.Check(result, Equals, false)
 
 	p.Files()[0].Checksums.Size = 5
 
-	result, err = p.VerifyFiles(packagePool)
+	result, err = p.VerifyFiles(packagePool, cs)
 	c.Check(err, IsNil)
 	c.Check(result, Equals, true)
 }
 
-var packageStanza = Stanza{"Source": "alien-arena", "Pre-Depends": "dpkg (>= 1.6)", "Suggests": "alien-arena-mars", "Recommends": "aliean-arena-luna", "Depends": "libc6 (>= 2.7), alien-arena-data (>= 7.40)", "Filename": "pool/contrib/a/alien-arena/alien-arena-common_7.40-2_i386.deb", "SHA1": " 46955e48cad27410a83740a21d766ce362364024", "SHA256": " eb4afb9885cba6dc70cccd05b910b2dbccc02c5900578be5e99f0d3dbf9d76a5", "Priority": "extra", "Maintainer": "Debian Games Team <pkg-games-devel@lists.alioth.debian.org>", "Description": "Common files for Alien Arena client and server ALIEN ARENA is a standalone 3D first person online deathmatch shooter\n crafted from the original source code of Quake II and Quake III, released\n by id Software under the GPL license. With features including 32 bit\n graphics, new particle engine and effects, light blooms, reflective water,\n hi resolution textures and skins, hi poly models, stain maps, ALIEN ARENA\n pushes the envelope of graphical beauty rivaling today's top games.\n .\n This package installs the common files for Alien Arena.\n", "Homepage": "http://red.planetarena.org", "Tag": "role::app-data, role::shared-lib, special::auto-inst-parts", "Installed-Size": "456", "Version": "7.40-2", "Replaces": "alien-arena (<< 7.33-1)", "Size": "187518", "MD5sum": "1e8cba92c41420aa7baa8a5718d67122", "Package": "alien-arena-common", "Section": "contrib/games", "Architecture": "i386"}
+var packageStanza = Stanza{"Source": "alien-arena", "Pre-Depends": "dpkg (>= 1.6)", "Suggests": "alien-arena-mars", "Recommends": "aliean-arena-luna", "Depends": "libc6 (>= 2.7), alien-arena-data (>= 7.40)", "Filename": "pool/contrib/a/alien-arena/alien-arena-common_7.40-2_i386.deb", "SHA1": "46955e48cad27410a83740a21d766ce362364024", "SHA256": "eb4afb9885cba6dc70cccd05b910b2dbccc02c5900578be5e99f0d3dbf9d76a5", "Priority": "extra", "Maintainer": "Debian Games Team <pkg-games-devel@lists.alioth.debian.org>", "Description": "Common files for Alien Arena client and server ALIEN ARENA is a standalone 3D first person online deathmatch shooter\n crafted from the original source code of Quake II and Quake III, released\n by id Software under the GPL license. With features including 32 bit\n graphics, new particle engine and effects, light blooms, reflective water,\n hi resolution textures and skins, hi poly models, stain maps, ALIEN ARENA\n pushes the envelope of graphical beauty rivaling today's top games.\n .\n This package installs the common files for Alien Arena.\n", "Homepage": "http://red.planetarena.org", "Tag": "role::app-data, role::shared-lib, special::auto-inst-parts", "Installed-Size": "456", "Version": "7.40-2", "Replaces": "alien-arena (<< 7.33-1)", "Size": "187518", "MD5sum": "1e8cba92c41420aa7baa8a5718d67122", "Package": "alien-arena-common", "Section": "contrib/games", "Architecture": "i386"}
 
 const sourcePackageMeta = `Package: access-modifier-checker
 Binary: libaccess-modifier-checker-java, libaccess-modifier-checker-java-doc
@@ -455,3 +473,20 @@ Directory: pool/main/a/access-modifier-checker
 Priority: source
 Section: java
 `
+
+const udebPackageMeta = `Package: dmidecode-udeb
+Source: dmidecode
+Version: 2.11-9
+Installed-Size: 115
+Maintainer: Daniel Baumann <daniel.baumann@progress-technologies.net>
+Architecture: amd64
+Depends: libc6-udeb (>= 2.13)
+Description: SMBIOS/DMI table decoder (udeb)
+Description-md5: bdfb786c6a57097be8c8600b800e749f
+Section: debian-installer
+Priority: optional
+Filename: pool/main/d/dmidecode/dmidecode-udeb_2.11-9_amd64.udeb
+Size: 29188
+MD5sum: ae70341c4d96dcded89fa670bcfea31e
+SHA1: 9532ae4226a85805189a671ee0283f719d48a5ba
+SHA256: bbb3a2cb07f741c3995b6d4bb08d772d83582b93a0236d4ea7736bc0370fc320`

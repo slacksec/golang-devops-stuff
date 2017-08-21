@@ -1,7 +1,7 @@
 Usage: aptly mirror create <name> <archive url> <distribution> [<component1> ...]
 
 Creates mirror <name> of remote repository, aptly supports both regular and flat Debian repositories exported
-via HTTP. aptly would try download Release file from remote repository and verify its' signature. Command
+via HTTP and FTP. aptly would try download Release file from remote repository and verify its' signature. Command
 line format resembles apt utlitily sources.list(5).
 
 PPA urls could specified in short format:
@@ -15,13 +15,19 @@ Example:
 Options:
   -architectures="": list of architectures to consider during (comma-separated), default to all available
   -config="": location of configuration file (default locations are /etc/aptly.conf, ~/.aptly.conf)
-  -dep-follow-all-variants=false: when processing dependencies, follow a & b if depdency is 'a|b'
+  -db-open-attempts=10: number of attempts to open DB if it's locked by other instance
+  -dep-follow-all-variants=false: when processing dependencies, follow a & b if dependency is 'a|b'
   -dep-follow-recommends=false: when processing dependencies, follow Recommends
   -dep-follow-source=false: when processing dependencies, follow from binary to Source packages
   -dep-follow-suggests=false: when processing dependencies, follow Suggests
+  -dep-verbose-resolve=false: when processing dependencies, print detailed logs
   -filter="": filter packages in mirror
   -filter-with-deps=false: when filtering, include dependencies of matching packages as well
+  -force-architectures=false: (only with architecture list) skip check that requested architectures are listed in Release file
+  -force-components=false: (only with component list) skip check that requested components are listed in Release file
+  -gpg-provider="": PGP implementation ("gpg" for external gpg or "internal" for Go internal implementation)
   -ignore-signatures=false: disable verification of Release file signatures
   -keyring=: gpg keyring to use when verifying Release file (could be specified multiple times)
   -with-sources=false: download source packages in addition to binary packages
+  -with-udebs=false: download .udeb packages (Debian installer support)
 

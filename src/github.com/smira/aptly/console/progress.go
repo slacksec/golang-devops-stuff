@@ -2,18 +2,23 @@ package console
 
 import (
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/cheggaaa/pb"
 	"github.com/smira/aptly/aptly"
 	"github.com/wsxiaoys/terminal/color"
-	"strings"
 )
 
 const (
 	codePrint = iota
+	codePrintStdErr
 	codeProgress
 	codeHideProgress
 	codeStop
 	codeFlush
+	codeBarEnabled
+	codeBarDisabled
 )
 
 type printTask struct {
@@ -25,7 +30,6 @@ type printTask struct {
 // Progress is a progress displaying subroutine, it allows to show download and other operations progress
 // mixed with progress bar
 type Progress struct {
-	stop     chan bool
 	stopped  chan bool
 	queue    chan printTask
 	bar      *pb.ProgressBar
@@ -81,6 +85,8 @@ func (p *Progress) InitBar(count int64, isBytes bool) {
 			p.bar.SetUnits(pb.U_BYTES)
 			p.bar.ShowSpeed = true
 		}
+
+		p.queue <- printTask{code: codeBarEnabled}
 		p.bar.Start()
 	}
 }
@@ -91,6 +97,7 @@ func (p *Progress) ShutdownBar() {
 		return
 	}
 	p.bar.Finish()
+	p.queue <- printTask{code: codeBarDisabled}
 	p.bar = nil
 	p.queue <- printTask{code: codeHideProgress}
 }
@@ -122,25 +129,41 @@ func (p *Progress) Printf(msg string, a ...interface{}) {
 	p.queue <- printTask{code: codePrint, message: fmt.Sprintf(msg, a...)}
 }
 
+// PrintfStdErr does printf but in safe manner to stderr
+func (p *Progress) PrintfStdErr(msg string, a ...interface{}) {
+	p.queue <- printTask{code: codePrintStdErr, message: fmt.Sprintf(msg, a...)}
+}
+
 // ColoredPrintf does printf in colored way + newline
 func (p *Progress) ColoredPrintf(msg string, a ...interface{}) {
 	if RunningOnTerminal() {
 		p.queue <- printTask{code: codePrint, message: color.Sprintf(msg, a...) + "\n"}
 	} else {
 		// stip color marks
-		var prev rune
+		var inColorMark, inCurly bool
 		msg = strings.Map(func(r rune) rune {
-			if prev == '@' {
-				prev = 0
-				if r == '@' {
-					return r
+			if inColorMark {
+				if inCurly {
+					if r == '}' {
+						inCurly = false
+						inColorMark = false
+						return -1
+					}
+				} else {
+					if r == '{' {
+						inCurly = true
+					} else if r == '@' {
+						return '@'
+					} else {
+						inColorMark = false
+					}
 				}
 				return -1
 			}
-			prev = r
-			if r == '@' {
-				return -1
 
+			if r == '@' {
+				inColorMark = true
+				return -1
 			}
 
 			return r
@@ -151,17 +174,29 @@ func (p *Progress) ColoredPrintf(msg string, a ...interface{}) {
 }
 
 func (p *Progress) worker() {
+	hasBar := false
+
 	for {
 		task := <-p.queue
 		switch task.code {
+		case codeBarEnabled:
+			hasBar = true
+		case codeBarDisabled:
+			hasBar = false
 		case codePrint:
 			if p.barShown {
 				fmt.Print("\r\033[2K")
 				p.barShown = false
 			}
 			fmt.Print(task.message)
+		case codePrintStdErr:
+			if p.barShown {
+				fmt.Print("\r\033[2K")
+				p.barShown = false
+			}
+			fmt.Fprint(os.Stderr, task.message)
 		case codeProgress:
-			if p.bar != nil {
+			if hasBar {
 				fmt.Print("\r" + task.message)
 				p.barShown = true
 			}

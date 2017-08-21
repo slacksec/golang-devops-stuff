@@ -3,17 +3,23 @@ package deb
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
+
+	"github.com/smira/aptly/aptly"
 	"github.com/smira/aptly/database"
 	"github.com/ugorji/go/codec"
-	"path/filepath"
 )
 
 // PackageCollection does management of packages in DB
 type PackageCollection struct {
-	db           database.Storage
-	encodeBuffer bytes.Buffer
-	codecHandle  *codec.MsgpackHandle
+	db          database.Storage
+	codecHandle *codec.MsgpackHandle
 }
+
+// Verify interface
+var (
+	_ PackageCatalog = &PackageCollection{}
+)
 
 // NewPackageCollection creates new PackageCollection and binds it to database
 func NewPackageCollection(db database.Storage) *PackageCollection {
@@ -156,45 +162,86 @@ func (collection *PackageCollection) loadFiles(p *Package) *PackageFiles {
 	return files
 }
 
+// loadContents loads or calculates and saves package contents
+func (collection *PackageCollection) loadContents(p *Package, packagePool aptly.PackagePool, progress aptly.Progress) []string {
+	encoded, err := collection.db.Get(p.Key("xC"))
+	if err == nil {
+		contents := []string{}
+
+		decoder := codec.NewDecoderBytes(encoded, collection.codecHandle)
+		err = decoder.Decode(&contents)
+		if err != nil {
+			panic("unable to decode contents")
+		}
+
+		return contents
+	}
+
+	if err != database.ErrNotFound {
+		panic("unable to load contents")
+	}
+
+	contents, err := p.CalculateContents(packagePool, progress)
+	if err != nil {
+		// failed to acquire contents, don't persist it
+		return contents
+	}
+
+	var buf bytes.Buffer
+	err = codec.NewEncoder(&buf, collection.codecHandle).Encode(contents)
+	if err != nil {
+		panic("unable to encode contents")
+	}
+
+	err = collection.db.Put(p.Key("xC"), buf.Bytes())
+	if err != nil {
+		panic("unable to save contents")
+	}
+
+	return contents
+}
+
 // Update adds or updates information about package in DB checking for conficts first
 func (collection *PackageCollection) Update(p *Package) error {
-	encoder := codec.NewEncoder(&collection.encodeBuffer, collection.codecHandle)
+	var encodeBuffer bytes.Buffer
 
-	collection.encodeBuffer.Reset()
-	collection.encodeBuffer.WriteByte(0xc1)
-	collection.encodeBuffer.WriteByte(0x1)
+	encoder := codec.NewEncoder(&encodeBuffer, collection.codecHandle)
+
+	encodeBuffer.Reset()
+	encodeBuffer.WriteByte(0xc1)
+	encodeBuffer.WriteByte(0x1)
 	err := encoder.Encode(p)
 	if err != nil {
 		return err
 	}
 
-	err = collection.db.Put(p.Key(""), collection.encodeBuffer.Bytes())
+	err = collection.db.Put(p.Key(""), encodeBuffer.Bytes())
 	if err != nil {
 		return err
 	}
 
 	// Encode offloaded fields one by one
 	if p.files != nil {
-		collection.encodeBuffer.Reset()
+		encodeBuffer.Reset()
 		err = encoder.Encode(*p.files)
 		if err != nil {
 			return err
 		}
 
-		err = collection.db.Put(p.Key("xF"), collection.encodeBuffer.Bytes())
+		err = collection.db.Put(p.Key("xF"), encodeBuffer.Bytes())
 		if err != nil {
 			return err
 		}
 	}
 
 	if p.deps != nil {
-		collection.encodeBuffer.Reset()
+		encodeBuffer.Reset()
 		err = encoder.Encode(*p.deps)
 		if err != nil {
 			return err
 		}
 
-		err = collection.db.Put(p.Key("xD"), collection.encodeBuffer.Bytes())
+		err = collection.db.Put(p.Key("xD"), encodeBuffer.Bytes())
 		if err != nil {
 			return err
 		}
@@ -203,13 +250,13 @@ func (collection *PackageCollection) Update(p *Package) error {
 	}
 
 	if p.extra != nil {
-		collection.encodeBuffer.Reset()
+		encodeBuffer.Reset()
 		err = encoder.Encode(*p.extra)
 		if err != nil {
 			return err
 		}
 
-		err = collection.db.Put(p.Key("xE"), collection.encodeBuffer.Bytes())
+		err = collection.db.Put(p.Key("xE"), encodeBuffer.Bytes())
 		if err != nil {
 			return err
 		}
@@ -236,4 +283,50 @@ func (collection *PackageCollection) DeleteByKey(key []byte) error {
 		}
 	}
 	return nil
+}
+
+// Scan does full scan on all the packages
+func (collection *PackageCollection) Scan(q PackageQuery) (result *PackageList) {
+	result = NewPackageListWithDuplicates(true, 0)
+
+	for _, key := range collection.db.KeysByPrefix([]byte("P")) {
+		pkg, err := collection.ByKey(key)
+		if err != nil {
+			panic(fmt.Sprintf("unable to load package: %s", err))
+		}
+
+		if q.Matches(pkg) {
+			result.Add(pkg)
+		}
+	}
+
+	return
+}
+
+// Search is not implemented
+func (collection *PackageCollection) Search(dep Dependency, allMatches bool) (searchResults []*Package) {
+	panic("Not implemented")
+}
+
+// SearchSupported returns false
+func (collection *PackageCollection) SearchSupported() bool {
+	return false
+}
+
+// SearchByKey finds package by exact key
+func (collection *PackageCollection) SearchByKey(arch, name, version string) (result *PackageList) {
+	result = NewPackageListWithDuplicates(true, 0)
+
+	for _, key := range collection.db.KeysByPrefix([]byte(fmt.Sprintf("P%s %s %s", arch, name, version))) {
+		pkg, err := collection.ByKey(key)
+		if err != nil {
+			panic(fmt.Sprintf("unable to load package: %s", err))
+		}
+
+		if pkg.Architecture == arch && pkg.Name == name && pkg.Version == version {
+			result.Add(pkg)
+		}
+	}
+
+	return
 }

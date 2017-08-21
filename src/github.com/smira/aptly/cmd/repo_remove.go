@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/smira/aptly/deb"
 	"github.com/smira/aptly/query"
 	"github.com/smira/commander"
@@ -54,7 +55,7 @@ func aptlyRepoRemove(cmd *commander.Command, args []string) error {
 		return nil
 	})
 
-	if context.flags.Lookup("dry-run").Value.Get().(bool) {
+	if context.Flags().Lookup("dry-run").Value.Get().(bool) {
 		context.Progress().Printf("\nChanges not saved, as dry run has been requested.\n")
 	} else {
 		repo.UpdateRefList(deb.NewPackageRefListFromPackageList(list))

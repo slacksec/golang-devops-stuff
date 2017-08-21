@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/smira/aptly/deb"
 	"github.com/smira/commander"
 	"github.com/smira/flag"
@@ -20,7 +21,7 @@ func aptlyPublishUpdate(cmd *commander.Command, args []string) error {
 	if len(args) == 2 {
 		param = args[1]
 	}
-	storage, prefix := parsePrefix(param)
+	storage, prefix := deb.ParsePrefix(param)
 
 	var published *deb.PublishedRepo
 
@@ -29,7 +30,7 @@ func aptlyPublishUpdate(cmd *commander.Command, args []string) error {
 		return fmt.Errorf("unable to update: %s", err)
 	}
 
-	if published.SourceKind != "local" {
+	if published.SourceKind != deb.SourceLocalRepo {
 		return fmt.Errorf("unable to update: not a local repository publish")
 	}
 
@@ -43,15 +44,19 @@ func aptlyPublishUpdate(cmd *commander.Command, args []string) error {
 		published.UpdateLocalRepo(component)
 	}
 
-	signer, err := getSigner(context.flags)
+	signer, err := getSigner(context.Flags())
 	if err != nil {
 		return fmt.Errorf("unable to initialize GPG signer: %s", err)
 	}
 
-	forceOverwrite := context.flags.Lookup("force-overwrite").Value.Get().(bool)
+	forceOverwrite := context.Flags().Lookup("force-overwrite").Value.Get().(bool)
 	if forceOverwrite {
 		context.Progress().ColoredPrintf("@rWARNING@|: force overwrite mode enabled, aptly might corrupt other published repositories sharing " +
 			"the same package pool.\n")
+	}
+
+	if context.Flags().IsSet("skip-contents") {
+		published.SkipContents = context.Flags().Lookup("skip-contents").Value.Get().(bool)
 	}
 
 	err = published.Publish(context.PackagePool(), context, context.CollectionFactory(), signer, context.Progress(), forceOverwrite)
@@ -98,7 +103,11 @@ Example:
 	cmd.Flag.String("gpg-key", "", "GPG key ID to use when signing the release")
 	cmd.Flag.Var(&keyRingsFlag{}, "keyring", "GPG keyring to use (instead of default)")
 	cmd.Flag.String("secret-keyring", "", "GPG secret keyring to use (instead of default)")
+	cmd.Flag.String("passphrase", "", "GPG passhprase for the key (warning: could be insecure)")
+	cmd.Flag.String("passphrase-file", "", "GPG passhprase-file for the key (warning: could be insecure)")
+	cmd.Flag.Bool("batch", false, "run GPG with detached tty")
 	cmd.Flag.Bool("skip-signing", false, "don't sign Release files with GPG")
+	cmd.Flag.Bool("skip-contents", false, "don't generate Contents indexes")
 	cmd.Flag.Bool("force-overwrite", false, "overwrite files in package pool in case of mismatch")
 
 	return cmd

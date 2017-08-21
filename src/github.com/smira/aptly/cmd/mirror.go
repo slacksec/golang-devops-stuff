@@ -1,20 +1,21 @@
 package cmd
 
 import (
-	"github.com/smira/aptly/utils"
+	"strings"
+
+	"github.com/smira/aptly/pgp"
 	"github.com/smira/commander"
 	"github.com/smira/flag"
-	"strings"
 )
 
-func getVerifier(flags *flag.FlagSet) (utils.Verifier, error) {
-	if context.Config().GpgDisableVerify || flags.Lookup("ignore-signatures").Value.Get().(bool) {
+func getVerifier(flags *flag.FlagSet) (pgp.Verifier, error) {
+	if LookupOption(context.Config().GpgDisableVerify, flags, "ignore-signatures") {
 		return nil, nil
 	}
 
 	keyRings := flags.Lookup("keyring").Value.Get().([]string)
 
-	verifier := &utils.GpgVerifier{}
+	verifier := context.GetVerifier()
 	for _, keyRing := range keyRings {
 		verifier.AddKeyring(keyRing)
 	}
@@ -56,6 +57,7 @@ func makeCmdMirror() *commander.Command {
 			makeCmdMirrorUpdate(),
 			makeCmdMirrorRename(),
 			makeCmdMirrorEdit(),
+			makeCmdMirrorSearch(),
 		},
 	}
 }

@@ -2,9 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"sort"
+
 	"github.com/smira/aptly/deb"
 	"github.com/smira/commander"
-	"sort"
 )
 
 func aptlyMirrorList(cmd *commander.Command, args []string) error {
@@ -27,6 +28,8 @@ func aptlyMirrorList(cmd *commander.Command, args []string) error {
 		i++
 		return nil
 	})
+
+	context.CloseDatabase()
 
 	sort.Strings(repos)
 

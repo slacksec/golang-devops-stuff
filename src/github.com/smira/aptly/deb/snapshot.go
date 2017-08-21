@@ -2,31 +2,38 @@ package deb
 
 import (
 	"bytes"
-	"code.google.com/p/go-uuid/uuid"
 	"errors"
 	"fmt"
+	"log"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/smira/aptly/database"
 	"github.com/smira/aptly/utils"
+	"github.com/smira/go-uuid/uuid"
 	"github.com/ugorji/go/codec"
-	"log"
-	"strings"
-	"time"
 )
 
 // Snapshot is immutable state of repository: list of packages
 type Snapshot struct {
 	// Persisten internal ID
-	UUID string
+	UUID string `json:"-"`
 	// Human-readable name
 	Name string
 	// Date of creation
 	CreatedAt time.Time
 
 	// Source: kind + ID
-	SourceKind string
-	SourceIDs  []string
+	SourceKind string   `json:"-"`
+	SourceIDs  []string `json:"-"`
 	// Description of how snapshot was created
 	Description string
+
+	Origin               string
+	NotAutomatic         string
+	ButAutomaticUpgrades string
 
 	packageRefs *PackageRefList
 }
@@ -38,31 +45,36 @@ func NewSnapshotFromRepository(name string, repo *RemoteRepo) (*Snapshot, error)
 	}
 
 	return &Snapshot{
-		UUID:        uuid.New(),
-		Name:        name,
-		CreatedAt:   time.Now(),
-		SourceKind:  "repo",
-		SourceIDs:   []string{repo.UUID},
-		Description: fmt.Sprintf("Snapshot from mirror %s", repo),
-		packageRefs: repo.packageRefs,
+		UUID:                 uuid.New(),
+		Name:                 name,
+		CreatedAt:            time.Now(),
+		SourceKind:           SourceRemoteRepo,
+		SourceIDs:            []string{repo.UUID},
+		Description:          fmt.Sprintf("Snapshot from mirror %s", repo),
+		Origin:               repo.Meta["Origin"],
+		NotAutomatic:         repo.Meta["NotAutomatic"],
+		ButAutomaticUpgrades: repo.Meta["ButAutomaticUpgrades"],
+		packageRefs:          repo.packageRefs,
 	}, nil
 }
 
 // NewSnapshotFromLocalRepo creates snapshot from current state of local repository
 func NewSnapshotFromLocalRepo(name string, repo *LocalRepo) (*Snapshot, error) {
-	if repo.packageRefs == nil {
-		return nil, errors.New("local repo doesn't have packages")
-	}
-
-	return &Snapshot{
+	snap := &Snapshot{
 		UUID:        uuid.New(),
 		Name:        name,
 		CreatedAt:   time.Now(),
-		SourceKind:  "local",
+		SourceKind:  SourceLocalRepo,
 		SourceIDs:   []string{repo.UUID},
 		Description: fmt.Sprintf("Snapshot from local repo %s", repo),
 		packageRefs: repo.packageRefs,
-	}, nil
+	}
+
+	if snap.packageRefs == nil {
+		snap.packageRefs = NewPackageRefList()
+	}
+
+	return snap, nil
 }
 
 // NewSnapshotFromPackageList creates snapshot from PackageList
@@ -131,12 +143,12 @@ func (s *Snapshot) Decode(input []byte) error {
 		if strings.HasPrefix(err.Error(), "codec.decoder: readContainerLen: Unrecognized descriptor byte: hex: 80") {
 			// probably it is broken DB from go < 1.2, try decoding w/o time.Time
 			var snapshot11 struct {
-				UUID string
-				Name string
+				UUID      string
+				Name      string
 				CreatedAt []byte
 
-				SourceKind string
-				SourceIDs  []string
+				SourceKind  string
+				SourceIDs   []string
 				Description string
 			}
 
@@ -160,6 +172,7 @@ func (s *Snapshot) Decode(input []byte) error {
 
 // SnapshotCollection does listing, updating/adding/deleting of Snapshots
 type SnapshotCollection struct {
+	*sync.RWMutex
 	db   database.Storage
 	list []*Snapshot
 }
@@ -167,7 +180,8 @@ type SnapshotCollection struct {
 // NewSnapshotCollection loads Snapshots from DB and makes up collection
 func NewSnapshotCollection(db database.Storage) *SnapshotCollection {
 	result := &SnapshotCollection{
-		db: db,
+		RWMutex: &sync.RWMutex{},
+		db:      db,
 	}
 
 	blobs := db.FetchByPrefix([]byte("S"))
@@ -247,10 +261,10 @@ func (collection *SnapshotCollection) ByUUID(uuid string) (*Snapshot, error) {
 
 // ByRemoteRepoSource looks up snapshots that have specified RemoteRepo as a source
 func (collection *SnapshotCollection) ByRemoteRepoSource(repo *RemoteRepo) []*Snapshot {
-	result := make([]*Snapshot, 0)
+	var result []*Snapshot
 
 	for _, s := range collection.list {
-		if s.SourceKind == "repo" && utils.StrSliceHasItem(s.SourceIDs, repo.UUID) {
+		if s.SourceKind == SourceRemoteRepo && utils.StrSliceHasItem(s.SourceIDs, repo.UUID) {
 			result = append(result, s)
 		}
 	}
@@ -259,10 +273,10 @@ func (collection *SnapshotCollection) ByRemoteRepoSource(repo *RemoteRepo) []*Sn
 
 // ByLocalRepoSource looks up snapshots that have specified LocalRepo as a source
 func (collection *SnapshotCollection) ByLocalRepoSource(repo *LocalRepo) []*Snapshot {
-	result := make([]*Snapshot, 0)
+	var result []*Snapshot
 
 	for _, s := range collection.list {
-		if s.SourceKind == "local" && utils.StrSliceHasItem(s.SourceIDs, repo.UUID) {
+		if s.SourceKind == SourceLocalRepo && utils.StrSliceHasItem(s.SourceIDs, repo.UUID) {
 			result = append(result, s)
 		}
 	}
@@ -271,7 +285,7 @@ func (collection *SnapshotCollection) ByLocalRepoSource(repo *LocalRepo) []*Snap
 
 // BySnapshotSource looks up snapshots that have specified snapshot as a source
 func (collection *SnapshotCollection) BySnapshotSource(snapshot *Snapshot) []*Snapshot {
-	result := make([]*Snapshot, 0)
+	var result []*Snapshot
 
 	for _, s := range collection.list {
 		if s.SourceKind == "snapshot" && utils.StrSliceHasItem(s.SourceIDs, snapshot.UUID) {
@@ -291,6 +305,23 @@ func (collection *SnapshotCollection) ForEach(handler func(*Snapshot) error) err
 		}
 	}
 	return err
+}
+
+// ForEachSorted runs method for each snapshot following some sort order
+func (collection *SnapshotCollection) ForEachSorted(sortMethod string, handler func(*Snapshot) error) error {
+	sorter, err := newSnapshotSorter(sortMethod, collection)
+	if err != nil {
+		return err
+	}
+
+	for _, i := range sorter.list {
+		err = handler(collection.list[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Len returns number of snapshots in collection
@@ -323,4 +354,56 @@ func (collection *SnapshotCollection) Drop(snapshot *Snapshot) error {
 	}
 
 	return collection.db.Delete(snapshot.RefKey())
+}
+
+// Snapshot sorting methods
+const (
+	SortName = iota
+	SortTime
+)
+
+type snapshotSorter struct {
+	list       []int
+	collection *SnapshotCollection
+	sortMethod int
+}
+
+func newSnapshotSorter(sortMethod string, collection *SnapshotCollection) (*snapshotSorter, error) {
+	s := &snapshotSorter{collection: collection}
+
+	switch sortMethod {
+	case "time", "Time":
+		s.sortMethod = SortTime
+	case "name", "Name":
+		s.sortMethod = SortName
+	default:
+		return nil, fmt.Errorf("sorting method \"%s\" unknown", sortMethod)
+	}
+
+	s.list = make([]int, len(collection.list))
+	for i := range s.list {
+		s.list[i] = i
+	}
+
+	sort.Sort(s)
+
+	return s, nil
+}
+
+func (s *snapshotSorter) Swap(i, j int) {
+	s.list[i], s.list[j] = s.list[j], s.list[i]
+}
+
+func (s *snapshotSorter) Less(i, j int) bool {
+	switch s.sortMethod {
+	case SortName:
+		return s.collection.list[s.list[i]].Name < s.collection.list[s.list[j]].Name
+	case SortTime:
+		return s.collection.list[s.list[i]].CreatedAt.Before(s.collection.list[s.list[j]].CreatedAt)
+	}
+	panic("unknown sort method")
+}
+
+func (s *snapshotSorter) Len() int {
+	return len(s.list)
 }

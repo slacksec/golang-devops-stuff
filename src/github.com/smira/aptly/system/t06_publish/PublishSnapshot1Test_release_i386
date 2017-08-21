@@ -1,5 +1,5 @@
-Origin: . maverick
+Origin: LP-PPA-gladky-anton-gnuplot
 Label: . maverick
-Architecture: i386
 Archive: maverick
+Architecture: i386
 Component: main

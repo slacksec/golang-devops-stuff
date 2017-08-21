@@ -2,9 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"sort"
+
 	"github.com/smira/aptly/deb"
 	"github.com/smira/commander"
-	"sort"
 )
 
 func aptlyPublishList(cmd *commander.Command, args []string) error {
@@ -19,13 +20,13 @@ func aptlyPublishList(cmd *commander.Command, args []string) error {
 	published := make([]string, 0, context.CollectionFactory().PublishedRepoCollection().Len())
 
 	err = context.CollectionFactory().PublishedRepoCollection().ForEach(func(repo *deb.PublishedRepo) error {
-		err := context.CollectionFactory().PublishedRepoCollection().LoadComplete(repo, context.CollectionFactory())
-		if err != nil {
-			return err
+		e := context.CollectionFactory().PublishedRepoCollection().LoadComplete(repo, context.CollectionFactory())
+		if e != nil {
+			return e
 		}
 
 		if raw {
-			published = append(published, fmt.Sprintf("%s %s", repo.Prefix, repo.Distribution))
+			published = append(published, fmt.Sprintf("%s %s", repo.StoragePrefix(), repo.Distribution))
 		} else {
 			published = append(published, repo.String())
 		}
@@ -35,6 +36,8 @@ func aptlyPublishList(cmd *commander.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("unable to load list of repos: %s", err)
 	}
+
+	context.CloseDatabase()
 
 	sort.Strings(published)
 

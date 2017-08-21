@@ -4,14 +4,16 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+
 	"github.com/smira/aptly/aptly"
 	"github.com/smira/aptly/database"
 	"github.com/smira/aptly/files"
 	"github.com/ugorji/go/codec"
-	"io/ioutil"
-	. "launchpad.net/gocheck"
-	"os"
-	"path/filepath"
+
+	. "gopkg.in/check.v1"
 )
 
 type pathExistsChecker struct {
@@ -36,7 +38,13 @@ func (n *NullSigner) Init() error {
 func (n *NullSigner) SetKey(keyRef string) {
 }
 
+func (n *NullSigner) SetBatch(batch bool) {
+}
+
 func (n *NullSigner) SetKeyRing(keyring, secretKeyring string) {
+}
+
+func (n *NullSigner) SetPassphrase(passphrase, passphraseFile string) {
 }
 
 func (n *NullSigner) DetachedSign(source string, destination string) error {
@@ -66,6 +74,7 @@ type PublishedRepoSuite struct {
 	provider                            *FakeStorageProvider
 	publishedStorage, publishedStorage2 *files.PublishedStorage
 	packagePool                         aptly.PackagePool
+	cs                                  aptly.ChecksumStorage
 	localRepo                           *LocalRepo
 	snapshot, snapshot2                 *Snapshot
 	db                                  database.Storage
@@ -78,19 +87,33 @@ var _ = Suite(&PublishedRepoSuite{})
 func (s *PublishedRepoSuite) SetUpTest(c *C) {
 	s.SetUpPackages()
 
-	s.db, _ = database.OpenDB(c.MkDir())
+	s.db, _ = database.NewOpenDB(c.MkDir())
 	s.factory = NewCollectionFactory(s.db)
 
 	s.root = c.MkDir()
-	s.publishedStorage = files.NewPublishedStorage(s.root)
+	s.publishedStorage = files.NewPublishedStorage(s.root, "", "")
 	s.root2 = c.MkDir()
-	s.publishedStorage2 = files.NewPublishedStorage(s.root2)
+	s.publishedStorage2 = files.NewPublishedStorage(s.root2, "", "")
 	s.provider = &FakeStorageProvider{map[string]aptly.PublishedStorage{
 		"":            s.publishedStorage,
 		"files:other": s.publishedStorage2}}
-	s.packagePool = files.NewPackagePool(s.root)
+	s.packagePool = files.NewPackagePool(s.root, false)
+	s.cs = files.NewMockChecksumStorage()
 
-	repo, _ := NewRemoteRepo("yandex", "http://mirror.yandex.ru/debian/", "squeeze", []string{"main"}, []string{}, false)
+	tmpFilepath := filepath.Join(c.MkDir(), "file")
+	c.Assert(ioutil.WriteFile(tmpFilepath, nil, 0777), IsNil)
+
+	var err error
+	s.p1.Files()[0].PoolPath, err = s.packagePool.Import(tmpFilepath, s.p1.Files()[0].Filename, &s.p1.Files()[0].Checksums, false, s.cs)
+	c.Assert(err, IsNil)
+
+	s.p1.UpdateFiles(s.p1.Files())
+	s.p2.UpdateFiles(s.p1.Files())
+	s.p3.UpdateFiles(s.p1.Files())
+
+	s.reflist = NewPackageRefListFromPackageList(s.list)
+
+	repo, _ := NewRemoteRepo("yandex", "http://mirror.yandex.ru/debian/", "squeeze", []string{"main"}, []string{}, false, false)
 	repo.packageRefs = s.reflist
 	s.factory.RemoteRepoCollection().Add(repo)
 
@@ -110,20 +133,19 @@ func (s *PublishedRepoSuite) SetUpTest(c *C) {
 	s.packageCollection.Update(s.p3)
 
 	s.repo, _ = NewPublishedRepo("", "ppa", "squeeze", nil, []string{"main"}, []interface{}{s.snapshot}, s.factory)
+	s.repo.SkipContents = true
 
 	s.repo2, _ = NewPublishedRepo("", "ppa", "maverick", nil, []string{"main"}, []interface{}{s.localRepo}, s.factory)
+	s.repo2.SkipContents = true
 
 	s.repo3, _ = NewPublishedRepo("", "linux", "natty", nil, []string{"main", "contrib"}, []interface{}{s.snapshot, s.snapshot2}, s.factory)
+	s.repo3.SkipContents = true
 
 	s.repo4, _ = NewPublishedRepo("", "ppa", "maverick", []string{"source"}, []string{"main"}, []interface{}{s.localRepo}, s.factory)
+	s.repo4.SkipContents = true
 
 	s.repo5, _ = NewPublishedRepo("files:other", "ppa", "maverick", []string{"source"}, []string{"main"}, []interface{}{s.localRepo}, s.factory)
-
-	poolPath, _ := s.packagePool.Path(s.p1.Files()[0].Filename, s.p1.Files()[0].Checksums.MD5)
-	err := os.MkdirAll(filepath.Dir(poolPath), 0755)
-	f, err := os.Create(poolPath)
-	c.Assert(err, IsNil)
-	f.Close()
+	s.repo5.SkipContents = true
 }
 
 func (s *PublishedRepoSuite) TearDownTest(c *C) {
@@ -164,6 +186,9 @@ func (s *PublishedRepoSuite) TestNewPublishedRepo(c *C) {
 
 	_, err := NewPublishedRepo("", ".", "a", nil, []string{"main", "main"}, []interface{}{s.snapshot, s.snapshot2}, s.factory)
 	c.Check(err, ErrorMatches, "duplicate component name: main")
+
+	_, err = NewPublishedRepo("", ".", "wheezy/updates", nil, []string{"main"}, []interface{}{s.snapshot}, s.factory)
+	c.Check(err, ErrorMatches, "invalid distribution wheezy/updates, '/' is not allowed")
 }
 
 func (s *PublishedRepoSuite) TestPrefixNormalization(c *C) {
@@ -252,7 +277,7 @@ func (s *PublishedRepoSuite) TestDistributionComponentGuessing(c *C) {
 	c.Check(repo.Distribution, Equals, "squeeze")
 	c.Check(repo.Components(), DeepEquals, []string{"main"})
 
-	repo, err = NewPublishedRepo("", "ppa", "", nil, []string{"main"}, []interface{}{s.localRepo}, s.factory)
+	_, err = NewPublishedRepo("", "ppa", "", nil, []string{"main"}, []interface{}{s.localRepo}, s.factory)
 	c.Check(err, ErrorMatches, "unable to guess distribution name, please specify explicitly")
 
 	s.localRepo.DefaultDistribution = "precise"
@@ -264,12 +289,19 @@ func (s *PublishedRepoSuite) TestDistributionComponentGuessing(c *C) {
 	c.Check(repo.Distribution, Equals, "precise")
 	c.Check(repo.Components(), DeepEquals, []string{"contrib"})
 
+	s.localRepo.DefaultDistribution = "precise/updates"
+
+	repo, err = NewPublishedRepo("", "ppa", "", nil, []string{""}, []interface{}{s.localRepo}, s.factory)
+	c.Check(err, IsNil)
+	c.Check(repo.Distribution, Equals, "precise-updates")
+	c.Check(repo.Components(), DeepEquals, []string{"contrib"})
+
 	repo, err = NewPublishedRepo("", "ppa", "", nil, []string{"", "contrib"}, []interface{}{s.snapshot, s.snapshot2}, s.factory)
 	c.Check(err, IsNil)
 	c.Check(repo.Distribution, Equals, "squeeze")
 	c.Check(repo.Components(), DeepEquals, []string{"contrib", "main"})
 
-	repo, err = NewPublishedRepo("", "ppa", "", nil, []string{"", ""}, []interface{}{s.snapshot, s.snapshot2}, s.factory)
+	_, err = NewPublishedRepo("", "ppa", "", nil, []string{"", ""}, []interface{}{s.snapshot, s.snapshot2}, s.factory)
 	c.Check(err, ErrorMatches, "duplicate component name: main")
 }
 
@@ -283,7 +315,7 @@ func (s *PublishedRepoSuite) TestPublish(c *C) {
 	c.Assert(err, IsNil)
 
 	cfr := NewControlFileReader(rf)
-	st, err := cfr.ReadStanza()
+	st, err := cfr.ReadStanza(true)
 	c.Assert(err, IsNil)
 
 	c.Check(st["Origin"], Equals, "ppa squeeze")
@@ -296,13 +328,13 @@ func (s *PublishedRepoSuite) TestPublish(c *C) {
 	cfr = NewControlFileReader(pf)
 
 	for i := 0; i < 3; i++ {
-		st, err = cfr.ReadStanza()
+		st, err = cfr.ReadStanza(false)
 		c.Assert(err, IsNil)
 
 		c.Check(st["Filename"], Equals, "pool/main/a/alien-arena/alien-arena-common_7.40-2_i386.deb")
 	}
 
-	st, err = cfr.ReadStanza()
+	st, err = cfr.ReadStanza(false)
 	c.Assert(err, IsNil)
 	c.Assert(st, IsNil)
 
@@ -310,7 +342,7 @@ func (s *PublishedRepoSuite) TestPublish(c *C) {
 	c.Assert(err, IsNil)
 
 	cfr = NewControlFileReader(drf)
-	st, err = cfr.ReadStanza()
+	st, err = cfr.ReadStanza(true)
 	c.Assert(err, IsNil)
 
 	c.Check(st["Archive"], Equals, "squeeze")
@@ -417,7 +449,7 @@ type PublishedRepoCollectionSuite struct {
 var _ = Suite(&PublishedRepoCollectionSuite{})
 
 func (s *PublishedRepoCollectionSuite) SetUpTest(c *C) {
-	s.db, _ = database.OpenDB(c.MkDir())
+	s.db, _ = database.NewOpenDB(c.MkDir())
 	s.factory = NewCollectionFactory(s.db)
 
 	s.snapshotCollection = s.factory.SnapshotCollection()
@@ -445,7 +477,7 @@ func (s *PublishedRepoCollectionSuite) TearDownTest(c *C) {
 }
 
 func (s *PublishedRepoCollectionSuite) TestAddByStoragePrefixDistribution(c *C) {
-	r, err := s.collection.ByStoragePrefixDistribution("", "ppa", "anaconda")
+	_, err := s.collection.ByStoragePrefixDistribution("", "ppa", "anaconda")
 	c.Assert(err, ErrorMatches, "*.not found")
 
 	c.Assert(s.collection.Add(s.repo1), IsNil)
@@ -457,7 +489,7 @@ func (s *PublishedRepoCollectionSuite) TestAddByStoragePrefixDistribution(c *C) 
 	c.Assert(s.collection.Add(s.repo4), IsNil)
 	c.Assert(s.collection.Add(s.repo5), IsNil)
 
-	r, err = s.collection.ByStoragePrefixDistribution("", "ppa", "anaconda")
+	r, err := s.collection.ByStoragePrefixDistribution("", "ppa", "anaconda")
 	c.Assert(err, IsNil)
 
 	err = s.collection.LoadComplete(r, s.factory)
@@ -473,16 +505,17 @@ func (s *PublishedRepoCollectionSuite) TestAddByStoragePrefixDistribution(c *C) 
 	c.Assert(r.String(), Equals, s.repo1.String())
 
 	r, err = s.collection.ByStoragePrefixDistribution("files:other", "ppa", "precise")
+	c.Assert(err, IsNil)
 	c.Check(r.String(), Equals, s.repo5.String())
 }
 
 func (s *PublishedRepoCollectionSuite) TestByUUID(c *C) {
-	r, err := s.collection.ByUUID(s.repo1.UUID)
+	_, err := s.collection.ByUUID(s.repo1.UUID)
 	c.Assert(err, ErrorMatches, "*.not found")
 
 	c.Assert(s.collection.Add(s.repo1), IsNil)
 
-	r, err = s.collection.ByUUID(s.repo1.UUID)
+	r, err := s.collection.ByUUID(s.repo1.UUID)
 	c.Assert(err, IsNil)
 
 	err = s.collection.LoadComplete(r, s.factory)
@@ -529,7 +562,7 @@ func (s *PublishedRepoCollectionSuite) TestLoadPre0_6(c *C) {
 		Prefix:        "ppa",
 		Distribution:  "anaconda",
 		Architectures: []string{"i386"},
-		SourceKind:    "local",
+		SourceKind:    SourceLocalRepo,
 		Component:     "contrib",
 		SourceUUID:    s.localRepo.UUID,
 	}
@@ -607,7 +640,7 @@ type PublishedRepoRemoveSuite struct {
 var _ = Suite(&PublishedRepoRemoveSuite{})
 
 func (s *PublishedRepoRemoveSuite) SetUpTest(c *C) {
-	s.db, _ = database.OpenDB(c.MkDir())
+	s.db, _ = database.NewOpenDB(c.MkDir())
 	s.factory = NewCollectionFactory(s.db)
 
 	s.snapshotCollection = s.factory.SnapshotCollection()
@@ -630,7 +663,7 @@ func (s *PublishedRepoRemoveSuite) SetUpTest(c *C) {
 	s.collection.Add(s.repo5)
 
 	s.root = c.MkDir()
-	s.publishedStorage = files.NewPublishedStorage(s.root)
+	s.publishedStorage = files.NewPublishedStorage(s.root, "", "")
 	s.publishedStorage.MkDir("ppa/dists/anaconda")
 	s.publishedStorage.MkDir("ppa/dists/meduza")
 	s.publishedStorage.MkDir("ppa/dists/osminog")
@@ -640,7 +673,7 @@ func (s *PublishedRepoRemoveSuite) SetUpTest(c *C) {
 	s.publishedStorage.MkDir("pool/main")
 
 	s.root2 = c.MkDir()
-	s.publishedStorage2 = files.NewPublishedStorage(s.root2)
+	s.publishedStorage2 = files.NewPublishedStorage(s.root2, "", "")
 	s.publishedStorage2.MkDir("ppa/dists/osminog")
 	s.publishedStorage2.MkDir("ppa/pool/contrib")
 
@@ -723,7 +756,7 @@ func (s *PublishedRepoRemoveSuite) TestRemoveFilesWithPrefixRoot(c *C) {
 }
 
 func (s *PublishedRepoRemoveSuite) TestRemoveRepo1and2(c *C) {
-	err := s.collection.Remove(s.provider, "", "ppa", "anaconda", s.factory, nil)
+	err := s.collection.Remove(s.provider, "", "ppa", "anaconda", s.factory, nil, false)
 	c.Check(err, IsNil)
 
 	_, err = s.collection.ByStoragePrefixDistribution("", "ppa", "anaconda")
@@ -743,10 +776,10 @@ func (s *PublishedRepoRemoveSuite) TestRemoveRepo1and2(c *C) {
 	c.Check(filepath.Join(s.publishedStorage2.PublicPath(), "ppa/dists/osminog"), PathExists)
 	c.Check(filepath.Join(s.publishedStorage2.PublicPath(), "ppa/pool/contrib"), PathExists)
 
-	err = s.collection.Remove(s.provider, "", "ppa", "anaconda", s.factory, nil)
+	err = s.collection.Remove(s.provider, "", "ppa", "anaconda", s.factory, nil, false)
 	c.Check(err, ErrorMatches, ".*not found")
 
-	err = s.collection.Remove(s.provider, "", "ppa", "meduza", s.factory, nil)
+	err = s.collection.Remove(s.provider, "", "ppa", "meduza", s.factory, nil, false)
 	c.Check(err, IsNil)
 
 	c.Check(filepath.Join(s.publishedStorage.PublicPath(), "ppa/dists/anaconda"), Not(PathExists))
@@ -761,7 +794,7 @@ func (s *PublishedRepoRemoveSuite) TestRemoveRepo1and2(c *C) {
 }
 
 func (s *PublishedRepoRemoveSuite) TestRemoveRepo3(c *C) {
-	err := s.collection.Remove(s.provider, "", ".", "anaconda", s.factory, nil)
+	err := s.collection.Remove(s.provider, "", ".", "anaconda", s.factory, nil, false)
 	c.Check(err, IsNil)
 
 	_, err = s.collection.ByStoragePrefixDistribution("", ".", "anaconda")
@@ -783,7 +816,7 @@ func (s *PublishedRepoRemoveSuite) TestRemoveRepo3(c *C) {
 }
 
 func (s *PublishedRepoRemoveSuite) TestRemoveRepo5(c *C) {
-	err := s.collection.Remove(s.provider, "files:other", "ppa", "osminog", s.factory, nil)
+	err := s.collection.Remove(s.provider, "files:other", "ppa", "osminog", s.factory, nil, false)
 	c.Check(err, IsNil)
 
 	_, err = s.collection.ByStoragePrefixDistribution("files:other", "ppa", "osminog")

@@ -45,7 +45,8 @@ class ConfigInFileTest(BaseTest):
               "-config=%s" % (os.path.join(os.path.dirname(inspect.getsourcefile(BadConfigTest)), "aptly.conf"), )]
     prepare = BaseTest.prepare_remove_all
 
-    outputMatchPrepare = lambda _, s: re.sub(r'  -(cpuprofile|memprofile|memstats|meminterval)=.*\n', '', s, flags=re.MULTILINE)
+    def outputMatchPrepare(_, s):
+        return re.sub(r'  -(cpuprofile|memprofile|memstats|meminterval)=.*\n', '', s, flags=re.MULTILINE)
 
 
 class ConfigInMissingFileTest(BaseTest):
@@ -55,3 +56,11 @@ class ConfigInMissingFileTest(BaseTest):
     runCmd = ["aptly", "mirror", "list", "-config=nosuchfile.conf"]
     expectedCode = 1
     prepare = BaseTest.prepare_remove_all
+
+
+class ConfigShowTest(BaseTest):
+    """
+    config showing
+    """
+    runCmd = ["aptly", "config", "show"]
+    gold_processor = BaseTest.expand_environ
