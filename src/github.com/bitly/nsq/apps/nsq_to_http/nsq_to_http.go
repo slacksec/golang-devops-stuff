@@ -5,9 +5,10 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/url"
@@ -19,9 +20,10 @@ import (
 	"time"
 
 	"github.com/bitly/go-hostpool"
-	"github.com/bitly/go-nsq"
-	"github.com/bitly/nsq/util"
-	"github.com/bitly/nsq/util/timermetrics"
+	"github.com/bitly/timer_metrics"
+	"github.com/nsqio/go-nsq"
+	"github.com/nsqio/nsq/internal/app"
+	"github.com/nsqio/nsq/internal/version"
 )
 
 const (
@@ -37,28 +39,21 @@ var (
 	channel     = flag.String("channel", "nsq_to_http", "nsq channel")
 	maxInFlight = flag.Int("max-in-flight", 200, "max number of messages to allow in flight")
 
-	numPublishers = flag.Int("n", 100, "number of concurrent publishers")
-	mode          = flag.String("mode", "round-robin", "the upstream request mode options: multicast, round-robin, hostpool")
-	sample        = flag.Float64("sample", 1.0, "% of messages to publish (float b/w 0 -> 1)")
-	httpTimeout   = flag.Duration("http-timeout", 20*time.Second, "timeout for HTTP connect/read/write (each)")
-	statusEvery   = flag.Int("status-every", 250, "the # of requests between logging status (per handler), 0 disables")
-	contentType   = flag.String("content-type", "application/octet-stream", "the Content-Type used for POST requests")
+	numPublishers      = flag.Int("n", 100, "number of concurrent publishers")
+	mode               = flag.String("mode", "hostpool", "the upstream request mode options: round-robin, hostpool (default), epsilon-greedy")
+	sample             = flag.Float64("sample", 1.0, "% of messages to publish (float b/w 0 -> 1)")
+	httpConnectTimeout = flag.Duration("http-client-connect-timeout", 2*time.Second, "timeout for HTTP connect")
+	httpRequestTimeout = flag.Duration("http-client-request-timeout", 20*time.Second, "timeout for HTTP request")
+	statusEvery        = flag.Int("status-every", 250, "the # of requests between logging status (per handler), 0 disables")
+	contentType        = flag.String("content-type", "application/octet-stream", "the Content-Type used for POST requests")
 
-	readerOpts       = util.StringArray{}
-	getAddrs         = util.StringArray{}
-	postAddrs        = util.StringArray{}
-	nsqdTCPAddrs     = util.StringArray{}
-	lookupdHTTPAddrs = util.StringArray{}
-
-	// TODO: remove, deprecated
-	roundRobin         = flag.Bool("round-robin", false, "(deprecated) use --mode=round-robin, enable round robin mode")
-	maxBackoffDuration = flag.Duration("max-backoff-duration", 120*time.Second, "(deprecated) use --reader-opt=max_backoff_duration=X, the maximum backoff duration")
-	throttleFraction   = flag.Float64("throttle-fraction", 1.0, "(deprecated) use --sample=X, publish only a fraction of messages")
-	httpTimeoutMs      = flag.Int("http-timeout-ms", 20000, "(deprecated) use --http-timeout=X, timeout for HTTP connect/read/write (each)")
+	getAddrs         = app.StringArray{}
+	postAddrs        = app.StringArray{}
+	nsqdTCPAddrs     = app.StringArray{}
+	lookupdHTTPAddrs = app.StringArray{}
 )
 
 func init() {
-	flag.Var(&readerOpts, "reader-opt", "option to passthrough to nsq.Consumer (may be given multiple times)")
 	flag.Var(&postAddrs, "post", "HTTP address to make a POST request to.  data will be in the body (may be given multiple times)")
 	flag.Var(&getAddrs, "get", "HTTP address to make a GET request to. '%s' will be printf replaced with data (may be given multiple times)")
 	flag.Var(&nsqdTCPAddrs, "nsqd-tcp-address", "nsqd TCP address (may be given multiple times)")
@@ -70,14 +65,16 @@ type Publisher interface {
 }
 
 type PublishHandler struct {
+	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	counter uint64
+
 	Publisher
-	addresses util.StringArray
-	counter   uint64
+	addresses app.StringArray
 	mode      int
 	hostPool  hostpool.HostPool
 
-	perAddressStatus map[string]*timermetrics.TimerMetrics
-	timermetrics     *timermetrics.TimerMetrics
+	perAddressStatus map[string]*timer_metrics.TimerMetrics
+	timermetrics     *timer_metrics.TimerMetrics
 }
 
 func (ph *PublishHandler) HandleMessage(m *nsq.Message) error {
@@ -124,13 +121,15 @@ type PostPublisher struct{}
 
 func (p *PostPublisher) Publish(addr string, msg []byte) error {
 	buf := bytes.NewBuffer(msg)
-	resp, err := HttpPost(addr, buf)
+	resp, err := HTTPPost(addr, buf)
 	if err != nil {
 		return err
 	}
+	io.Copy(ioutil.Discard, resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("got status code %d", resp.StatusCode))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("got status code %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -139,63 +138,69 @@ type GetPublisher struct{}
 
 func (p *GetPublisher) Publish(addr string, msg []byte) error {
 	endpoint := fmt.Sprintf(addr, url.QueryEscape(string(msg)))
-	resp, err := HttpGet(endpoint)
+	resp, err := HTTPGet(endpoint)
 	if err != nil {
 		return err
 	}
+	io.Copy(ioutil.Discard, resp.Body)
 	resp.Body.Close()
+
 	if resp.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("got status code %d", resp.StatusCode))
+		return fmt.Errorf("got status code %d", resp.StatusCode)
 	}
 	return nil
 }
 
 func hasArg(s string) bool {
-	for _, arg := range os.Args {
-		if strings.Contains(arg, s) {
-			return true
+	argExist := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == s {
+			argExist = true
 		}
-	}
-	return false
+	})
+	return argExist
 }
 
 func main() {
 	var publisher Publisher
-	var addresses util.StringArray
+	var addresses app.StringArray
 	var selectedMode int
 
+	cfg := nsq.NewConfig()
+
+	flag.Var(&nsq.ConfigFlag{cfg}, "consumer-opt", "option to passthrough to nsq.Consumer (may be given multiple times, http://godoc.org/github.com/nsqio/go-nsq#Config)")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("nsq_to_http v%s\n", util.BINARY_VERSION)
+		fmt.Printf("nsq_to_http v%s\n", version.Binary)
 		return
 	}
 
 	if *topic == "" || *channel == "" {
-		log.Fatalf("--topic and --channel are required")
+		log.Fatal("--topic and --channel are required")
 	}
 
 	if *contentType != flag.Lookup("content-type").DefValue {
 		if len(postAddrs) == 0 {
-			log.Fatalf("--content-type only used with --post")
+			log.Fatal("--content-type only used with --post")
 		}
 		if len(*contentType) == 0 {
-			log.Fatalf("--content-type requires a value when used")
+			log.Fatal("--content-type requires a value when used")
 		}
 	}
 
 	if len(nsqdTCPAddrs) == 0 && len(lookupdHTTPAddrs) == 0 {
-		log.Fatalf("--nsqd-tcp-address or --lookupd-http-address required")
+		log.Fatal("--nsqd-tcp-address or --lookupd-http-address required")
 	}
 	if len(nsqdTCPAddrs) > 0 && len(lookupdHTTPAddrs) > 0 {
-		log.Fatalf("use --nsqd-tcp-address or --lookupd-http-address not both")
+		log.Fatal("use --nsqd-tcp-address or --lookupd-http-address not both")
 	}
 
 	if len(getAddrs) == 0 && len(postAddrs) == 0 {
-		log.Fatalf("--get or --post required")
+		log.Fatal("--get or --post required")
 	}
 	if len(getAddrs) > 0 && len(postAddrs) > 0 {
-		log.Fatalf("use --get or --post not both")
+		log.Fatal("use --get or --post not both")
 	}
 	if len(getAddrs) > 0 {
 		for _, get := range getAddrs {
@@ -206,39 +211,18 @@ func main() {
 	}
 
 	switch *mode {
-	case "multicast":
-		log.Printf("WARNING: multicast mode is deprecated in favor of using separate nsq_to_http on different channels (and will be dropped in a future release)")
-		selectedMode = ModeAll
 	case "round-robin":
 		selectedMode = ModeRoundRobin
-	case "hostpool":
+	case "hostpool", "epsilon-greedy":
 		selectedMode = ModeHostPool
 	}
 
-	// TODO: remove, deprecated
-	if hasArg("--round-robin") {
-		log.Printf("WARNING: --round-robin is deprecated in favor of --mode=round-robin")
-		selectedMode = ModeRoundRobin
-	}
-
-	// TODO: remove, deprecated
-	if hasArg("throttle-fraction") {
-		log.Printf("WARNING: --throttle-fraction is deprecatedin favor of --sample=X")
-		*sample = *throttleFraction
-	}
-
 	if *sample > 1.0 || *sample < 0.0 {
-		log.Fatalf("ERROR: --sample must be between 0.0 and 1.0")
-	}
-
-	// TODO: remove, deprecated
-	if hasArg("http-timeout-ms") {
-		log.Printf("WARNING: --http-timeout-ms is deprecated in favor of --http-timeout=X")
-		*httpTimeout = time.Duration(*httpTimeoutMs) * time.Millisecond
+		log.Fatal("ERROR: --sample must be between 0.0 and 1.0")
 	}
 
 	termChan := make(chan os.Signal, 1)
-	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
 
 	if len(postAddrs) > 0 {
 		publisher = &PostPublisher{}
@@ -248,68 +232,56 @@ func main() {
 		addresses = getAddrs
 	}
 
-	cfg := nsq.NewConfig()
-	cfg.UserAgent = fmt.Sprintf("nsq_to_http/%s go-nsq/%s", util.BINARY_VERSION, nsq.VERSION)
-
-	err := util.ParseReaderOpts(cfg, readerOpts)
-	if err != nil {
-		log.Fatalf(err.Error())
-	}
+	cfg.UserAgent = fmt.Sprintf("nsq_to_http/%s go-nsq/%s", version.Binary, nsq.VERSION)
 	cfg.MaxInFlight = *maxInFlight
 
-	// TODO: remove, deprecated
-	if hasArg("max-backoff-duration") {
-		log.Printf("WARNING: --max-backoff-duration is deprecated in favor of --reader-opt=max_backoff_duration=X")
-		cfg.MaxBackoffDuration = *maxBackoffDuration
-	}
-
-	r, err := nsq.NewConsumer(*topic, *channel, cfg)
+	consumer, err := nsq.NewConsumer(*topic, *channel, cfg)
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err)
 	}
 
-	perAddressStatus := make(map[string]*timermetrics.TimerMetrics)
+	perAddressStatus := make(map[string]*timer_metrics.TimerMetrics)
 	if len(addresses) == 1 {
 		// disable since there is only one address
-		perAddressStatus[addresses[0]] = timermetrics.NewTimerMetrics(0, "")
+		perAddressStatus[addresses[0]] = timer_metrics.NewTimerMetrics(0, "")
 	} else {
 		for _, a := range addresses {
-			perAddressStatus[a] = timermetrics.NewTimerMetrics(*statusEvery,
+			perAddressStatus[a] = timer_metrics.NewTimerMetrics(*statusEvery,
 				fmt.Sprintf("[%s]:", a))
 		}
+	}
+
+	hostPool := hostpool.New(addresses)
+	if *mode == "epsilon-greedy" {
+		hostPool = hostpool.NewEpsilonGreedy(addresses, 0, &hostpool.LinearEpsilonValueCalculator{})
 	}
 
 	handler := &PublishHandler{
 		Publisher:        publisher,
 		addresses:        addresses,
 		mode:             selectedMode,
-		hostPool:         hostpool.New(addresses),
+		hostPool:         hostPool,
 		perAddressStatus: perAddressStatus,
-		timermetrics:     timermetrics.NewTimerMetrics(*statusEvery, "[aggregate]:"),
+		timermetrics:     timer_metrics.NewTimerMetrics(*statusEvery, "[aggregate]:"),
 	}
-	r.AddConcurrentHandlers(handler, *numPublishers)
+	consumer.AddConcurrentHandlers(handler, *numPublishers)
 
-	for _, addrString := range nsqdTCPAddrs {
-		err := r.ConnectToNSQD(addrString)
-		if err != nil {
-			log.Fatalf("%s", err)
-		}
+	err = consumer.ConnectToNSQDs(nsqdTCPAddrs)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	for _, addrString := range lookupdHTTPAddrs {
-		log.Printf("lookupd addr %s", addrString)
-		err := r.ConnectToNSQLookupd(addrString)
-		if err != nil {
-			log.Fatalf("%s", err)
-		}
+	err = consumer.ConnectToNSQLookupds(lookupdHTTPAddrs)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	for {
 		select {
-		case <-r.StopChan:
+		case <-consumer.StopChan:
 			return
 		case <-termChan:
-			r.Stop()
+			consumer.Stop()
 		}
 	}
 }

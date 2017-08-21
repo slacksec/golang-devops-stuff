@@ -1,8 +1,8 @@
-## enable verbose logging
-verbose = false
+## log verbosity level: debug, info, warn, error, or fatal
+log-level = "info"
 
 ## unique identifier (int) for this worker (will default to a hash of hostname)
-# worker_id = 5150
+# id = 5150
 
 ## <addr>:<port> to listen on for TCP clients
 tcp_address = "0.0.0.0:4150"
@@ -21,6 +21,11 @@ nsqlookupd_tcp_addresses = [
     "127.0.0.1:4160"
 ]
 
+## duration to wait before HTTP client connection timeout
+http_client_connect_timeout = "2s"
+
+## duration to wait before HTTP client request timeout
+http_client_request_timeout = "5s"
 
 ## path to store disk-backed messages
 # data_path = "/var/lib/nsq"
@@ -106,6 +111,9 @@ tls_key = ""
 
 ## require client TLS upgrades
 tls_required = false
+
+## minimum TLS version ("ssl3.0", "tls1.0," "tls1.1", "tls1.2")
+tls_min_version = ""
 
 ## enable deflate feature negotiation (client compression)
 deflate = true

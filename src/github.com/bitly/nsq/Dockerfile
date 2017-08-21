@@ -1,10 +1,10 @@
-FROM google/golang:latest
+FROM alpine:3.6
 
-RUN go get -u github.com/tools/godep
-RUN go get -u github.com/bmizerany/assert
+EXPOSE 4150 4151 4160 4161 4170 4171
 
-ADD . $GOPATH/src/github.com/bitly/nsq
-RUN godep get github.com/bitly/nsq/...
-RUN cd $GOPATH/src/github.com/bitly/nsq && godep restore
+VOLUME /data
+VOLUME /etc/ssl/certs
 
-RUN cd $GOPATH/src/github.com/bitly/nsq && ./test.sh
+COPY dist/docker/bin/ /usr/local/bin/
+RUN ln -s /usr/local/bin/*nsq* / \
+    && ln -s /usr/local/bin/*nsq* /bin/
