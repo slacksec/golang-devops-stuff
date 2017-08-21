@@ -2,9 +2,10 @@
 // Use of this source code is governed by The MIT License (MIT) that can be
 // found in the LICENSE file.
 
-package main
+package server
 
 import (
+	"crypto/sha1"
 	"encoding/base32"
 	"strings"
 
@@ -58,6 +59,7 @@ func (s *server) newNSEC3NameError(qname string) *dns.NSEC3 {
 	n.Hdr.Rrtype = dns.TypeNSEC3
 	n.Hdr.Ttl = s.config.MinTtl
 	n.Hash = dns.SHA1
+	n.HashLength = sha1.Size
 	n.Flags = 0
 	n.Salt = ""
 	n.TypeBitMap = []uint16{}
@@ -66,7 +68,7 @@ func (s *server) newNSEC3NameError(qname string) *dns.NSEC3 {
 
 	buf := packBase32(covername)
 	byteArith(buf, false) // one before
-	n.Hdr.Name = strings.ToLower(unpackBase32(buf)) + "." + s.config.Domain
+	n.Hdr.Name = appendDomain(strings.ToLower(unpackBase32(buf)), s.config.Domain)
 	byteArith(buf, true) // one next
 	byteArith(buf, true) // and another one
 	n.NextDomain = unpackBase32(buf)
@@ -80,6 +82,7 @@ func (s *server) newNSEC3NoData(qname string) *dns.NSEC3 {
 	n.Hdr.Rrtype = dns.TypeNSEC3
 	n.Hdr.Ttl = s.config.MinTtl
 	n.Hash = dns.SHA1
+	n.HashLength = sha1.Size
 	n.Flags = 0
 	n.Salt = ""
 	n.TypeBitMap = []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeSRV, dns.TypeRRSIG}
@@ -89,7 +92,7 @@ func (s *server) newNSEC3NoData(qname string) *dns.NSEC3 {
 	byteArith(buf, true) // one next
 	n.NextDomain = unpackBase32(buf)
 
-	n.Hdr.Name += "." + s.config.Domain
+	n.Hdr.Name += appendDomain("", s.config.Domain)
 	return n
 }
 
@@ -101,6 +104,7 @@ func newNSEC3CEandWildcard(apex, ce string, ttl uint32) (*dns.NSEC3, *dns.NSEC3)
 	n1.Hdr.Rrtype = dns.TypeNSEC3
 	n1.Hdr.Ttl = ttl
 	n1.Hash = dns.SHA1
+	n1.HashLength = sha1.Size
 	n1.Flags = 0
 	n1.Iterations = 0
 	n1.Salt = ""
@@ -117,6 +121,7 @@ func newNSEC3CEandWildcard(apex, ce string, ttl uint32) (*dns.NSEC3, *dns.NSEC3)
 	n2.Hdr.Rrtype = dns.TypeNSEC3
 	n2.Hdr.Ttl = ttl
 	n2.Hash = dns.SHA1
+	n2.HashLength = sha1.Size
 	n2.Flags = 0
 	n2.Iterations = 0
 	n2.Salt = ""
@@ -124,7 +129,7 @@ func newNSEC3CEandWildcard(apex, ce string, ttl uint32) (*dns.NSEC3, *dns.NSEC3)
 	prev = dns.HashName("*."+ce, dns.SHA1, n2.Iterations, n2.Salt)
 	buf = packBase32(prev)
 	byteArith(buf, false) // one before
-	n2.Hdr.Name = strings.ToLower(unpackBase32(buf)) + "." + apex
+	n2.Hdr.Name = appendDomain(strings.ToLower(unpackBase32(buf)), apex)
 	byteArith(buf, true) // one next
 	byteArith(buf, true) // and another one
 	n2.NextDomain = unpackBase32(buf)
