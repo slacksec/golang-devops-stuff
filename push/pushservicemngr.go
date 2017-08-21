@@ -30,24 +30,20 @@ type serviceType struct {
 
 type PushServiceManager struct {
 	serviceTypes map[string]*serviceType
-	errChan      chan<- error
+	errChan      chan<- PushError
 }
 
 var (
 	pushServiceManager *PushServiceManager
+	once               sync.Once
 )
 
 /* This is a singleton */
-func newPushServiceManager() *PushServiceManager {
-	ret := new(PushServiceManager)
-	ret.serviceTypes = make(map[string]*serviceType, 5)
-	return ret
-}
-
 func GetPushServiceManager() *PushServiceManager {
-	if pushServiceManager == nil {
-		pushServiceManager = newPushServiceManager()
-	}
+	once.Do(func() {
+		pushServiceManager = new(PushServiceManager)
+		pushServiceManager.serviceTypes = make(map[string]*serviceType, 5)
+	})
 	return pushServiceManager
 }
 
@@ -192,14 +188,22 @@ func (m *PushServiceManager) Push(psp *PushServiceProvider, dpQueue <-chan *Deli
 		r.Destination = nil
 		r.MsgId = ""
 		r.Content = notif
-		r.Err = fmt.Errorf("InvalidPushServiceProvider")
+		r.Err = NewError("InvalidPushServiceProvider")
 		resQueue <- r
 	}
 
 	wg.Wait()
 }
 
-func (m *PushServiceManager) SetErrorReportChan(errChan chan<- error) {
+func (m *PushServiceManager) Preview(ptname string, notif *Notification) ([]byte, PushError) {
+	if pst, ok := m.serviceTypes[ptname]; ok && pst != nil {
+		return pst.pst.Preview(notif)
+	} else {
+		return nil, NewErrorf("No push service type %q", ptname)
+	}
+}
+
+func (m *PushServiceManager) SetErrorReportChan(errChan chan<- PushError) {
 	m.errChan = errChan
 	for _, t := range m.serviceTypes {
 		t.pst.SetErrorReportChan(errChan)

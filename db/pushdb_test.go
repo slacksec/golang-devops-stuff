@@ -19,10 +19,10 @@ package db
 
 import (
 	"fmt"
-	redis "github.com/monnand/goredis"
-	. "github.com/uniqush/uniqush-push/push"
 	"strconv"
 	"testing"
+
+	redis5 "gopkg.in/redis.v5"
 )
 
 var dbconf *DatabaseConfig
@@ -41,7 +41,6 @@ func connectDatabase() (db PushDatabase, err error) {
 }
 
 func clearData() {
-	var client redis.Client
 	c := dbconf
 	if c.Host == "" {
 		c.Host = "localhost"
@@ -52,14 +51,17 @@ func clearData() {
 	if c.Name == "" {
 		c.Name = "0"
 	}
-	client.Addr = fmt.Sprintf("%s:%d", c.Host, c.Port)
-	client.Password = c.Password
-	var err error
-	client.Db, err = strconv.Atoi(c.Name)
+	db, err := strconv.ParseInt(c.Name, 10, 64)
 	if err != nil {
-		client.Db = 0
+		db = 0
 	}
-	client.Flush(true)
+	client := redis5.NewClient(&redis5.Options{
+		Addr:     fmt.Sprintf("%s:%d", c.Host, c.Port),
+		Password: c.Password,
+		DB:       int(db),
+	})
+
+	client.FlushDb() // Flush the database which pushredisdb.go used.
 }
 
 func TestConnectAndDelete(t *testing.T) {

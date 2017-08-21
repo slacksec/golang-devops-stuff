@@ -22,15 +22,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 )
 
+// PushPeer implements common functionality for pushes. Other structs in this module include this struct.
 type PushPeer struct {
+	m               sync.Mutex // Enforces that there are no data races on Name() in multi push.
 	name            string
 	pushServiceType PushServiceType
-	VolatileData    map[string]string
-	FixedData       map[string]string
+	// VolatileData contains data about a push peer that may be changed by clients.
+	VolatileData map[string]string
+	// FixedData contains unchanging data about a push peer. FixedData is used to generate the identifier for this PushPeer.
+	FixedData map[string]string
 }
 
+// PushServiceName is the name push service type this object uses (apns, gcm, etc.)
 func (p *PushPeer) PushServiceName() string {
 	return p.pushServiceType.Name()
 }
@@ -72,6 +79,8 @@ func (p *PushPeer) copyPushPeer(dst *PushPeer) {
 }
 
 func (p *PushPeer) Name() string {
+	p.m.Lock()
+	defer p.m.Unlock()
 	if p.name != "" {
 		return p.name
 	}
@@ -89,10 +98,12 @@ func (p *PushPeer) Name() string {
 }
 
 func (p *PushPeer) clear() {
-	for k, _ := range p.FixedData {
+	p.m.Lock()
+	defer p.m.Unlock()
+	for k := range p.FixedData {
 		delete(p.FixedData, k)
 	}
-	for k, _ := range p.VolatileData {
+	for k := range p.VolatileData {
 		delete(p.VolatileData, k)
 	}
 	p.name = ""
@@ -134,6 +145,7 @@ func (p *PushPeer) Unmarshal(value []byte) error {
 	return nil
 }
 
+// DeliveryPoint contains information about a user+app+device. It contains the information about that combination needed to send pushes.
 type DeliveryPoint struct {
 	PushPeer
 }
@@ -152,4 +164,47 @@ func NewEmptyPushServiceProvider() *PushServiceProvider {
 	psp := new(PushServiceProvider)
 	psp.InitPushPeer()
 	return psp
+}
+
+// IsSamePSP returns whether or not the name, FixedData, and VolatileData of two PSPs are identical.
+func IsSamePSP(a *PushServiceProvider, b *PushServiceProvider) bool {
+	if a.Name() != b.Name() {
+		return false
+	}
+	if len(a.VolatileData) != len(b.VolatileData) {
+		return false
+	}
+	for k, v := range a.VolatileData {
+		if b.VolatileData[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// UnserializeSubscription unserializes the data (of the form "<pushservicetype>:{...}") about a user's subscription, to be returned to uniqush's clients.
+func UnserializeSubscription(data []byte) (map[string]string, error) {
+	parts := strings.SplitN(string(data), ":", 2)
+
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("UnserializeSubscription() Bad data, no ':' to split on.")
+	}
+
+	var f []map[string]string
+	err := json.Unmarshal([]byte(parts[1]), &f)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(f) > 0 {
+		sub := f[0]
+		sub["pushservicetype"] = parts[0]
+		delete(sub, "subscriber")
+		// TODO: Return any data useful to uniqush users from VolatileData (in a separate PR). It will be in f[1] if it exists.
+		// (E.g. if version of the app, device id for a device token (e.g. for checking if two device tokens in different pushservicetypes belong to the same device))
+
+		return sub, nil
+	}
+
+	return nil, fmt.Errorf("UnserializeSubscription() Invalid data")
 }
