@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"log"
 	"os"
 	"os/user"
@@ -59,8 +60,9 @@ func (self *ProcessGroup) StartProcess() (process *os.Process, err error) {
 		}
 	}
 
-	log.Println("Starting", self.commandPath)
-	process, err = os.StartProcess(self.commandPath, []string{}, procAttr)
+	args := append([]string{self.commandPath}, flag.Args()...)
+	log.Println("Starting", self.commandPath, args)
+	process, err = os.StartProcess(self.commandPath, args, procAttr)
 	if err != nil {
 		return
 	}
@@ -127,6 +129,12 @@ func (self *processSet) Remove(process *os.Process) {
 	self.Lock()
 	defer self.Unlock()
 	delete(self.set, process)
+}
+
+func (self *processSet) Len() int {
+	self.Lock()
+	defer self.Unlock()
+	return len(self.set)
 }
 
 func logOutput(input *os.File, pid int, wg sync.WaitGroup) {
