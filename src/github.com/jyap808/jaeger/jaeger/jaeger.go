@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"code.google.com/p/go.crypto/openpgp"
+	"golang.org/x/crypto/openpgp"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -79,7 +79,6 @@ func main() {
 		if basefilename == "" {
 			flag.Usage()
 			log.Fatalf("\n\nERROR: No JSON GPG DB file specified or input file does not have a %v extension", jaegerTemplateExtension)
-			return
 		}
 		// Set from the basefilename
 		*jsonGPGDB = fmt.Sprintf("%v%v", basefilename, jaegerDBExtension)
@@ -89,7 +88,6 @@ func main() {
 		if basefilename == "" {
 			flag.Usage()
 			log.Fatalf("\n\nERROR: No Output file specified or input file does not have a %v extension", jaegerTemplateExtension)
-			return
 		}
 		// Set from the basefilename
 		*outputFile = basefilename
