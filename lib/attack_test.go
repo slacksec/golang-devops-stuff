@@ -1,148 +1,186 @@
 package vegeta
 
 import (
-	"bytes"
+	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestAttackRate(t *testing.T) {
 	t.Parallel()
-
-	hitCount := uint64(0)
 	server := httptest.NewServer(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddUint64(&hitCount, 1)
-		}),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
 	)
-
-	tgt := Target{Method: "GET", URL: server.URL}
-	rate := uint64(1000)
-	Attack(Targets{tgt}, rate, 1*time.Second)
-	if hits := atomic.LoadUint64(&hitCount); hits != rate {
-		t.Fatalf("Wrong number of hits: want %d, got %d\n", rate, hits)
+	defer server.Close()
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	rate := uint64(100)
+	atk := NewAttacker()
+	var hits uint64
+	for range atk.Attack(tr, rate, 1*time.Second) {
+		hits++
+	}
+	if got, want := hits, rate; got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
 	}
 }
 
-func TestAttackBody(t *testing.T) {
+func TestAttackDuration(t *testing.T) {
 	t.Parallel()
-
-	want := []byte("VEGETA!")
 	server := httptest.NewServer(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			got, err := ioutil.ReadAll(r.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(want, got) {
-				t.Fatalf("Wrong body. Want: %s, Got: %s", want, got)
-			}
-		}),
-	)
-
-	Attack(Targets{{Method: "GET", URL: server.URL, Body: want}}, 100, 1*time.Second)
-}
-
-func TestDefaultAttackerCertConfig(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewTLSServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
 	)
-	request, _ := http.NewRequest("GET", server.URL, nil)
-	_, err := DefaultAttacker.client.Do(request)
-	if err != nil && strings.Contains(err.Error(), "x509: certificate signed by unknown authority") {
-		t.Errorf("Invalid certificates should be ignored: Got `%s`", err)
+	defer server.Close()
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	atk := NewAttacker()
+	time.AfterFunc(2*time.Second, func() { t.Fatal("Timed out") })
+
+	rate, hits := uint64(100), uint64(0)
+	for range atk.Attack(tr, rate, 0) {
+		if hits++; hits == 100 {
+			atk.Stop()
+			break
+		}
+	}
+
+	if got, want := hits, rate; got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
+	}
+}
+
+func TestTLSConfig(t *testing.T) {
+	t.Parallel()
+	atk := NewAttacker()
+	got := atk.client.Transport.(*http.Transport).TLSClientConfig
+	if want := (&tls.Config{InsecureSkipVerify: true}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got: %+v, want: %+v", got, want)
 	}
 }
 
 func TestRedirects(t *testing.T) {
 	t.Parallel()
-
-	var servers [2]*httptest.Server
-	var hits uint64
-
-	for i := range servers {
-		servers[i] = httptest.NewServer(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				atomic.AddUint64(&hits, 1)
-				http.Redirect(w, r, servers[(i+1)%2].URL, 302)
-			}),
-		)
+	server := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/redirect", 302)
+		}),
+	)
+	defer server.Close()
+	redirects := 2
+	atk := NewAttacker(Redirects(redirects))
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	res := atk.hit(tr, time.Now())
+	want := fmt.Sprintf("stopped after %d redirects", redirects)
+	if got := res.Error; !strings.HasSuffix(got, want) {
+		t.Fatalf("want: '%v' in '%v'", want, got)
 	}
+}
 
-	atk := NewAttacker(2, DefaultTimeout, DefaultLocalAddr)
-	tgt := Target{Method: "GET", URL: servers[0].URL}
-	var rate uint64 = 10
-	results := atk.Attack(Targets{tgt}, rate, 1*time.Second)
-
-	want := fmt.Sprintf("stopped after %d redirects", 2)
-	for _, result := range results {
-		if !strings.Contains(result.Error, want) {
-			t.Fatalf("Expected error to be: %s, Got: %s", want, result.Error)
-		}
+func TestNoFollow(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/redirect-here", 302)
+		}),
+	)
+	defer server.Close()
+	atk := NewAttacker(Redirects(NoFollow))
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	res := atk.hit(tr, time.Now())
+	if res.Error != "" {
+		t.Fatalf("got err: %v", res.Error)
 	}
-
-	if want, got := rate*(2+1), hits; want != got {
-		t.Fatalf("Expected hits to be: %d, Got: %d", want, got)
+	if res.Code != 302 {
+		t.Fatalf("res.Code => %d, want %d", res.Code, 302)
 	}
 }
 
 func TestTimeout(t *testing.T) {
 	t.Parallel()
-
 	server := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			<-time.After(20 * time.Millisecond)
 		}),
 	)
-
-	atk := NewAttacker(DefaultRedirects, 10*time.Millisecond, DefaultLocalAddr)
-	tgt := Target{Method: "GET", URL: server.URL}
-	results := atk.Attack(Targets{tgt}, 1, 1*time.Second)
-
+	defer server.Close()
+	atk := NewAttacker(Timeout(10 * time.Millisecond))
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	res := atk.hit(tr, time.Now())
 	want := "net/http: timeout awaiting response headers"
-	for _, result := range results {
-		if !strings.Contains(result.Error, want) {
-			t.Fatalf("Expected error to be: %s, Got: %s", want, result.Error)
-		}
+	if got := res.Error; !strings.HasSuffix(got, want) {
+		t.Fatalf("want: '%v' in '%v'", want, got)
 	}
 }
 
 func TestLocalAddr(t *testing.T) {
 	t.Parallel()
-
 	addr, err := net.ResolveIPAddr("ip", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	server := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
+			if got, _, err := net.SplitHostPort(r.RemoteAddr); err != nil {
 				t.Fatal(err)
-			}
-
-			if host != addr.String() {
-				t.Fatalf("Wrong source address. Want %s, Got %s", addr, host)
+			} else if want := addr.String(); got != want {
+				t.Fatalf("wrong source address. got %v, want: %v", got, want)
 			}
 		}),
 	)
+	defer server.Close()
+	atk := NewAttacker(LocalAddr(*addr))
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	atk.hit(tr, time.Now())
+}
 
-	atk := NewAttacker(DefaultRedirects, DefaultTimeout, *addr)
-	tgt := Target{Method: "GET", URL: server.URL}
+func TestKeepAlive(t *testing.T) {
+	t.Parallel()
+	atk := NewAttacker(KeepAlive(false))
+	if got, want := atk.dialer.KeepAlive, time.Duration(0); got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
+	}
+	got := atk.client.Transport.(*http.Transport).DisableKeepAlives
+	if want := true; got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
+	}
+}
 
-	for _, result := range atk.Attack(Targets{tgt}, 1, 1*time.Second) {
-		if result.Error != "" {
-			t.Fatal(result.Error)
-		}
+func TestConnections(t *testing.T) {
+	t.Parallel()
+	atk := NewAttacker(Connections(23))
+	got := atk.client.Transport.(*http.Transport).MaxIdleConnsPerHost
+	if want := 23; got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
+	}
+}
+
+func TestStatusCodeErrors(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+		}),
+	)
+	defer server.Close()
+	atk := NewAttacker()
+	tr := NewStaticTargeter(Target{Method: "GET", URL: server.URL})
+	res := atk.hit(tr, time.Now())
+	if got, want := res.Error, "400 Bad Request"; got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
+	}
+}
+
+func TestBadTargeterError(t *testing.T) {
+	t.Parallel()
+	atk := NewAttacker()
+	tr := func(*Target) error { return io.EOF }
+	res := atk.hit(tr, time.Now())
+	if got, want := res.Error, io.EOF.Error(); got != want {
+		t.Fatalf("got: %v, want: %v", got, want)
 	}
 }
