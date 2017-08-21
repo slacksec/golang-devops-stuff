@@ -62,9 +62,10 @@ const (
 	tokenTypeSqlFront                                 // front
 	tokenTypeSqlReturning                             // returning
 	tokenTypeSqlTopic                                 // topic
-	tokenTypeSqlMysql                                 // mysql
-	tokenTypeSqlConnect                               // connect
-	tokenTypeSqlDisconnect                            // disconnect
+	tokenTypeCmdMysql                                 // mysql
+	tokenTypeCmdConnect                               // connect
+	tokenTypeCmdDisconnect                            // disconnect
+	tokenTypeCmdTables                                // tables
 )
 
 // String converts tokenType value to a string.
@@ -140,12 +141,14 @@ func (typ tokenType) String() string {
 		return "tokenTypeSqlFront"
 	case tokenTypeSqlTopic:
 		return "tokenTypeSqlTopic"
-	case tokenTypeSqlMysql:
-		return "tokenTypeSqlMysql"
-	case tokenTypeSqlConnect:
-		return "tokenTypeSqlConnect"
-	case tokenTypeSqlDisconnect:
-		return "tokenTypeSqlDisconnect"
+	case tokenTypeCmdMysql:
+		return "tokenTypeCmdMysql"
+	case tokenTypeCmdConnect:
+		return "tokenTypeCmdConnect"
+	case tokenTypeCmdDisconnect:
+		return "tokenTypeCmdDisconnect"
+	case tokenTypeCmdTables:
+		return "tokenTypeCmdTables"
 	}
 	return "not implemented"
 }
@@ -756,30 +759,7 @@ func lexSqlUnsubscribeFrom(this *lexer) stateFn {
 	return lexSqlFrom(this)
 }
 
-// CONNECT
-
-func lexSqlConnectValue(this *lexer) stateFn {
-	this.skipWhiteSpaces()
-	return this.lexSqlValue(nil)
-}
-
 // END SQL
-
-// Helper function to process subscribe unsubscribe connect disconnect commands.
-func lexCommandMysql(this *lexer) stateFn {
-	this.skipWhiteSpaces()
-	switch this.next() {
-	case 's':
-		return this.lexMatch(tokenTypeSqlSubscribe, "subscribe", 1, lexSqlSubscribe)
-	case 'u':
-		return this.lexMatch(tokenTypeSqlUnsubscribe, "unsubscribe", 1, lexSqlUnsubscribeFrom)
-	case 'c':
-		return this.lexMatch(tokenTypeSqlConnect, "connect", 1, lexSqlConnectValue)
-	case 'd':
-		return this.lexMatch(tokenTypeSqlDisconnect, "disconnect", 1, nil)
-	}
-	return this.errorToken("Invalid command:" + this.current())
-}
 
 // Helper function to process status stop start commands.
 func lexCommandST(this *lexer) stateFn {
@@ -844,7 +824,7 @@ func lexCommand(this *lexer) stateFn {
 	case 'p': // pop, push, peek
 		return lexCommandP(this)
 	case 'm': // mysql
-		return this.lexMatch(tokenTypeSqlMysql, "mysql", 1, lexCommandMysql)
+		return this.lexMatch(tokenTypeCmdMysql, "mysql", 1, lexCmdMysql)
 	}
 	return this.errorToken("Invalid command:" + this.current())
 }

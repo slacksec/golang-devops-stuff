@@ -82,26 +82,26 @@ func (this *cli) runOnce(command string) {
 		return
 	}
 	this.requestId++
-	rw := newnetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
+	rw := newNetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
 	bytes := []byte(command)
 	err := rw.writeHeaderAndMessage(this.requestId, bytes)
 	if err != nil {
-		logerror(err)
+		logError(err)
 		return
 	}
 	_, bytes, err = rw.readMessage()
 	if err != nil && command != "stop" {
-		logerror(err)
+		logError(err)
 	}
 }
 
-// run is an event loop function that recieves a command line input and forwards it to the server.
+// run is an event loop function that receives a command line input and forwards it to the server.
 func (this *cli) run() {
-	this.initConsolePrefix()
 	// by default connect to local host
 	if config.IP == "" {
 		config.IP = "localhost"
 	}
+	this.initConsolePrefix()
 	//
 	if !this.connect() {
 		return
@@ -145,7 +145,9 @@ LOOP:
 
 // connect establishes tcp connection to the serer.
 func (this *cli) connect() bool {
-	conn, err := net.Dial("tcp", config.netAddress())
+	addr := config.netAddress()
+	logInfo("Net address:", addr)
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		this.outputError(err)
 		return false
@@ -183,7 +185,7 @@ func (this *cli) readInput() {
 func (this *cli) readMessages() {
 	this.quit.Join()
 	defer this.quit.Leave()
-	reader := newnetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
+	reader := newNetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
 LOOP:
 	for {
 		_, bytes, err := reader.readMessage()
@@ -205,7 +207,7 @@ LOOP:
 func (this *cli) writeMessages() {
 	this.quit.Join()
 	defer this.quit.Leave()
-	writer := newnetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
+	writer := newNetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
 LOOP:
 	for {
 		select {

@@ -56,7 +56,7 @@ type network struct {
 	context     *networkContext
 }
 
-func (this *network) addConnection(netconn *networkConnection) {
+func (this *network) addConnection(netConn *networkConnection) {
 	if this.context.quit.Done() {
 		return
 	}
@@ -65,15 +65,15 @@ func (this *network) addConnection(netconn *networkConnection) {
 	if this.connections == nil {
 		this.connections = make(map[uint64]*networkConnection)
 	}
-	this.connections[netconn.getConnectionId()] = netconn
-	loginfo("new client connection id:", strconv.FormatUint(netconn.getConnectionId(), 10))
+	this.connections[netConn.getConnectionId()] = netConn
+	logInfo("new client connection id:", strconv.FormatUint(netConn.getConnectionId(), 10))
 }
 
-func (this *network) removeConnection(netconn *networkConnection) {
+func (this *network) removeConnection(netConn *networkConnection) {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 	if this.connections != nil {
-		delete(this.connections, netconn.getConnectionId())
+		delete(this.connections, netConn.getConnectionId())
 	}
 }
 
@@ -103,11 +103,11 @@ func newNetwork(context *networkContext) *network {
 func (this *network) start(address string) bool {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		logerror("Failed to listen for incoming connections ", err.Error())
+		logError("Failed to listen for incoming connections ", err.Error())
 		return false
 	}
-	//host, port := net.SplitHostPort(address)
-	loginfo("listening for incoming connections on ", address)
+	// host, port := net.SplitHostPort(address)
+	logInfo("listening for incoming connections on ", address)
 	this.listener = listener
 	var connectionId uint64 = 0
 	// accept connections
@@ -123,11 +123,11 @@ func (this *network) start(address string) bool {
 			}
 			if err == nil {
 				connectionId++
-				netconn := newNetworkConnection(conn, this.context, connectionId, this)
-				this.addConnection(netconn)
-				go netconn.run()
+				netConn := newNetworkConnection(conn, this.context, connectionId, this)
+				this.addConnection(netConn)
+				go netConn.run()
 			} else {
-				logerror("failed to accept client connection", err.Error())
+				logError("failed to accept client connection", err.Error())
 			}
 		}
 	}
@@ -140,146 +140,4 @@ func (this *network) stop() {
 		this.listener.Close()
 	}
 	this.closeConnections()
-}
-
-//
-
-type networkConnection struct {
-	parent networkConnectionContainer
-	conn   net.Conn
-	quit   *Quitter
-	router *requestRouter
-	sender *responseSender
-}
-
-func newNetworkConnection(conn net.Conn, context *networkContext, connectionId uint64, parent networkConnectionContainer) *networkConnection {
-	return &networkConnection{
-		parent: parent,
-		conn:   conn,
-		quit:   context.quit,
-		router: context.router,
-		sender: newResponseSenderStub(connectionId),
-	}
-}
-
-func (this *networkConnection) remove() {
-	this.parent.removeConnection(this)
-}
-
-func (this *networkConnection) getConnectionId() uint64 {
-	return this.sender.connectionId
-}
-
-func (this *networkConnection) watchForQuit() {
-	select {
-	case <-this.sender.quit.GetChan():
-	case <-this.quit.GetChan():
-	}
-	this.conn.Close()
-	this.parent.removeConnection(this)
-}
-
-func (this *networkConnection) close() {
-	this.sender.quit.Quit(0)
-}
-
-func (this *networkConnection) run() {
-	go this.watchForQuit()
-	go this.read()
-	this.write()
-}
-
-func (this *networkConnection) Done() bool {
-	// connection can be stopped becuase of global shutdown sequence
-	// or response sender is full
-	// or socket error
-	return this.sender.quit.Done() || this.quit.Done()
-}
-
-func (c *networkConnection) route(header *netHeader, req request) {
-	item := &requestItem{
-		header: header,
-		req:    req,
-		sender: c.sender,
-	}
-	c.router.route(item)
-}
-
-func (this *networkConnection) read() {
-	this.quit.Join()
-	defer this.quit.Leave()
-	reader := newnetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
-	//
-	var err error
-	var message []byte
-	var header *netHeader
-	tokens := newTokens()
-	for {
-		err = nil
-		if this.Done() {
-			break
-		}
-		header, message, err = reader.readMessage()
-		if err != nil {
-			break
-		}
-		tokens.reuse()
-		// parse and route the message
-		lex(string(message), tokens)
-		req := parse(tokens)
-		this.route(header, req)
-	}
-	if err != nil && !this.Done() {
-		logwarn("failed to read from client connection:", this.sender.connectionId, err.Error())
-		// notify writer and sender that we are done
-		this.sender.quit.Quit(0)
-	}
-}
-
-func (this *networkConnection) write() {
-	this.quit.Join()
-	defer this.quit.Leave()
-	writer := newnetHelper(this.conn, config.NET_READWRITE_BUFFER_SIZE)
-	var err error
-	for {
-		select {
-		case res := <-this.sender.sender:
-			debug("response is ready to be send over tcp")
-			// merge responses if applicable
-			nextRes := this.sender.tryRecv()
-			for nextRes != nil && res.merge(nextRes) {
-				nextRes = this.sender.tryRecv()
-			}
-			// write messages in batches if applicable
-			var msg []byte
-			more := true
-			for err == nil && more {
-				if this.Done() {
-					return
-				}
-				msg, more = res.toNetworkReadyJSON()
-				err = writer.writeMessage(msg)
-				if err != nil {
-					break
-				}
-				if !more && nextRes != nil {
-					res = nextRes
-					nextRes = nil
-					more = true
-				}
-			}
-			if err != nil && !this.Done() {
-				logwarn("failed to write to client connection:", this.sender.connectionId, err.Error())
-				// notify reader and sender that we are done
-				this.sender.quit.Quit(0)
-				return
-			}
-		case <-this.quit.GetChan():
-			debug("on write stop")
-			return
-		case <-this.sender.quit.GetChan():
-			debug("on write connection stop")
-			return
-		}
-	}
 }

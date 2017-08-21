@@ -21,6 +21,7 @@ type requestItem struct {
 	header *netHeader
 	req    request
 	sender *responseSender
+	dbConn *mysqlConnection
 }
 
 func (this *requestItem) getRequestId() uint32 {
@@ -41,7 +42,7 @@ type dataService struct {
 // newDataService returns new dataService.
 func newDataService(quit *Quitter) *dataService {
 	return &dataService{
-		requests: make(chan *requestItem, config.CHAN_DATASERVICE_REQUESTS_BUFFER_SIZE),
+		requests: make(chan *requestItem, config.CHAN_DATA_SERVICE_REQUESTS_BUFFER_SIZE),
 		quit:     quit,
 		tables:   make(map[string]*table),
 	}
@@ -84,8 +85,16 @@ func (this *dataService) onSqlRequest(item *requestItem) {
 		this.tables[tableName] = tbl
 		tbl.quit = this.quit
 		tbl.requests = make(chan *requestItem, config.CHAN_TABLE_REQUESTS_BUFFER_SIZE)
-		loginfo("table", tableName, " was created; connection:", item.sender.connectionId)
+		logInfo("table", tableName, "was created; connection:", item.sender.connectionId)
 		go tbl.run()
+	}
+	switch item.req.(type) {
+	case *mysqlSubscribeRequest:
+		info("database operation onMysqlSubscribe:", item.req.getTableName())
+		//request := item.req.(*mysqlSubscribeRequest)
+	case *mysqlUnsubscribeRequest:
+		info("database operation onMysqlUnsubscribe:", item.req.getTableName())
+		//request := item.req.(*mysqlUnsubscribeRequest)
 	}
 	// forward sql request to the table
 	tbl.requests <- item
