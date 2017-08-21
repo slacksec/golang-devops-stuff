@@ -1,20 +1,22 @@
 package daemon
 
 import (
-	"time"
-
-	"github.com/docker/docker/engine"
+	"github.com/docker/docker/container"
+	"golang.org/x/net/context"
 )
 
-func (daemon *Daemon) ContainerWait(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s", job.Name)
+// ContainerWait waits until the given container is in a certain state
+// indicated by the given condition. If the container is not found, a nil
+// channel and non-nil error is returned immediately. If the container is
+// found, a status result will be sent on the returned channel once the wait
+// condition is met or if an error occurs waiting for the container (such as a
+// context timeout or cancellation). On a successful wait, the exit code of the
+// container is returned in the status with a non-nil Err() value.
+func (daemon *Daemon) ContainerWait(ctx context.Context, name string, condition container.WaitCondition) (<-chan container.StateStatus, error) {
+	cntr, err := daemon.GetContainer(name)
+	if err != nil {
+		return nil, err
 	}
-	name := job.Args[0]
-	if container := daemon.Get(name); container != nil {
-		status, _ := container.State.WaitStop(-1 * time.Second)
-		job.Printf("%d\n", status)
-		return engine.StatusOK
-	}
-	return job.Errorf("%s: no such container: %s", job.Name, name)
+
+	return cntr.Wait(ctx, condition), nil
 }

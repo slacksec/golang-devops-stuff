@@ -2,307 +2,222 @@ package image
 
 import (
 	"encoding/json"
-	"fmt"
-	"github.com/docker/docker/archive"
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/runconfig"
-	"github.com/docker/docker/utils"
-	"io/ioutil"
-	"os"
-	"path"
-	"strconv"
+	"errors"
+	"io"
+	"runtime"
+	"strings"
 	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/dockerversion"
+	"github.com/docker/docker/layer"
+	"github.com/opencontainers/go-digest"
 )
 
-type Image struct {
-	ID              string            `json:"id"`
-	Parent          string            `json:"parent,omitempty"`
-	Comment         string            `json:"comment,omitempty"`
-	Created         time.Time         `json:"created"`
-	Container       string            `json:"container,omitempty"`
-	ContainerConfig runconfig.Config  `json:"container_config,omitempty"`
-	DockerVersion   string            `json:"docker_version,omitempty"`
-	Author          string            `json:"author,omitempty"`
-	Config          *runconfig.Config `json:"config,omitempty"`
-	Architecture    string            `json:"architecture,omitempty"`
-	OS              string            `json:"os,omitempty"`
-	Size            int64
+// ID is the content-addressable ID of an image.
+type ID digest.Digest
 
-	graph Graph
+func (id ID) String() string {
+	return id.Digest().String()
 }
 
-func LoadImage(root string) (*Image, error) {
-	// Load the json data
-	jsonData, err := ioutil.ReadFile(jsonPath(root))
+// Digest converts ID into a digest
+func (id ID) Digest() digest.Digest {
+	return digest.Digest(id)
+}
+
+// IDFromDigest creates an ID from a digest
+func IDFromDigest(digest digest.Digest) ID {
+	return ID(digest)
+}
+
+// V1Image stores the V1 image configuration.
+type V1Image struct {
+	// ID is a unique 64 character identifier of the image
+	ID string `json:"id,omitempty"`
+	// Parent is the ID of the parent image
+	Parent string `json:"parent,omitempty"`
+	// Comment is the commit message that was set when committing the image
+	Comment string `json:"comment,omitempty"`
+	// Created is the timestamp at which the image was created
+	Created time.Time `json:"created"`
+	// Container is the id of the container used to commit
+	Container string `json:"container,omitempty"`
+	// ContainerConfig is the configuration of the container that is committed into the image
+	ContainerConfig container.Config `json:"container_config,omitempty"`
+	// DockerVersion specifies the version of Docker that was used to build the image
+	DockerVersion string `json:"docker_version,omitempty"`
+	// Author is the name of the author that was specified when committing the image
+	Author string `json:"author,omitempty"`
+	// Config is the configuration of the container received from the client
+	Config *container.Config `json:"config,omitempty"`
+	// Architecture is the hardware that the image is built and runs on
+	Architecture string `json:"architecture,omitempty"`
+	// OS is the operating system used to build and run the image
+	OS string `json:"os,omitempty"`
+	// Size is the total size of the image including all layers it is composed of
+	Size int64 `json:",omitempty"`
+}
+
+// Image stores the image configuration
+type Image struct {
+	V1Image
+	Parent     ID        `json:"parent,omitempty"`
+	RootFS     *RootFS   `json:"rootfs,omitempty"`
+	History    []History `json:"history,omitempty"`
+	OSVersion  string    `json:"os.version,omitempty"`
+	OSFeatures []string  `json:"os.features,omitempty"`
+
+	// rawJSON caches the immutable JSON associated with this image.
+	rawJSON []byte
+
+	// computedID is the ID computed from the hash of the image config.
+	// Not to be confused with the legacy V1 ID in V1Image.
+	computedID ID
+}
+
+// RawJSON returns the immutable JSON associated with the image.
+func (img *Image) RawJSON() []byte {
+	return img.rawJSON
+}
+
+// ID returns the image's content-addressable ID.
+func (img *Image) ID() ID {
+	return img.computedID
+}
+
+// ImageID stringifies ID.
+func (img *Image) ImageID() string {
+	return img.ID().String()
+}
+
+// RunConfig returns the image's container config.
+func (img *Image) RunConfig() *container.Config {
+	return img.Config
+}
+
+// Platform returns the image's operating system. If not populated, defaults to the host runtime OS.
+func (img *Image) Platform() string {
+	os := img.OS
+	if os == "" {
+		os = runtime.GOOS
+	}
+	return os
+}
+
+// MarshalJSON serializes the image to JSON. It sorts the top-level keys so
+// that JSON that's been manipulated by a push/pull cycle with a legacy
+// registry won't end up with a different key order.
+func (img *Image) MarshalJSON() ([]byte, error) {
+	type MarshalImage Image
+
+	pass1, err := json.Marshal(MarshalImage(*img))
 	if err != nil {
 		return nil, err
 	}
+
+	var c map[string]*json.RawMessage
+	if err := json.Unmarshal(pass1, &c); err != nil {
+		return nil, err
+	}
+	return json.Marshal(c)
+}
+
+// ChildConfig is the configuration to apply to an Image to create a new
+// Child image. Other properties of the image are copied from the parent.
+type ChildConfig struct {
+	ContainerID     string
+	Author          string
+	Comment         string
+	DiffID          layer.DiffID
+	ContainerConfig *container.Config
+	Config          *container.Config
+}
+
+// NewChildImage creates a new Image as a child of this image.
+func NewChildImage(img *Image, child ChildConfig, platform string) *Image {
+	isEmptyLayer := layer.IsEmpty(child.DiffID)
+	var rootFS *RootFS
+	if img.RootFS != nil {
+		rootFS = img.RootFS.Clone()
+	} else {
+		rootFS = NewRootFS()
+	}
+
+	if !isEmptyLayer {
+		rootFS.Append(child.DiffID)
+	}
+	imgHistory := NewHistory(
+		child.Author,
+		child.Comment,
+		strings.Join(child.ContainerConfig.Cmd, " "),
+		isEmptyLayer)
+
+	return &Image{
+		V1Image: V1Image{
+			DockerVersion:   dockerversion.Version,
+			Config:          child.Config,
+			Architecture:    runtime.GOARCH,
+			OS:              platform,
+			Container:       child.ContainerID,
+			ContainerConfig: *child.ContainerConfig,
+			Author:          child.Author,
+			Created:         imgHistory.Created,
+		},
+		RootFS:     rootFS,
+		History:    append(img.History, imgHistory),
+		OSFeatures: img.OSFeatures,
+		OSVersion:  img.OSVersion,
+	}
+}
+
+// History stores build commands that were used to create an image
+type History struct {
+	// Created is the timestamp at which the image was created
+	Created time.Time `json:"created"`
+	// Author is the name of the author that was specified when committing the image
+	Author string `json:"author,omitempty"`
+	// CreatedBy keeps the Dockerfile command used while building the image
+	CreatedBy string `json:"created_by,omitempty"`
+	// Comment is the commit message that was set when committing the image
+	Comment string `json:"comment,omitempty"`
+	// EmptyLayer is set to true if this history item did not generate a
+	// layer. Otherwise, the history item is associated with the next
+	// layer in the RootFS section.
+	EmptyLayer bool `json:"empty_layer,omitempty"`
+}
+
+// NewHistory creates a new history struct from arguments, and sets the created
+// time to the current time in UTC
+func NewHistory(author, comment, createdBy string, isEmptyLayer bool) History {
+	return History{
+		Author:     author,
+		Created:    time.Now().UTC(),
+		CreatedBy:  createdBy,
+		Comment:    comment,
+		EmptyLayer: isEmptyLayer,
+	}
+}
+
+// Exporter provides interface for loading and saving images
+type Exporter interface {
+	Load(io.ReadCloser, io.Writer, bool) error
+	// TODO: Load(net.Context, io.ReadCloser, <- chan StatusMessage) error
+	Save([]string, io.Writer) error
+}
+
+// NewFromJSON creates an Image configuration from json.
+func NewFromJSON(src []byte) (*Image, error) {
 	img := &Image{}
 
-	if err := json.Unmarshal(jsonData, img); err != nil {
+	if err := json.Unmarshal(src, img); err != nil {
 		return nil, err
 	}
-	if err := utils.ValidateID(img.ID); err != nil {
-		return nil, err
+	if img.RootFS == nil {
+		return nil, errors.New("invalid image JSON, no RootFS key")
 	}
 
-	if buf, err := ioutil.ReadFile(path.Join(root, "layersize")); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		// If the layersize file does not exist then set the size to a negative number
-		// because a layer size of 0 (zero) is valid
-		img.Size = -1
-	} else {
-		size, err := strconv.Atoi(string(buf))
-		if err != nil {
-			return nil, err
-		}
-		img.Size = int64(size)
-	}
+	img.rawJSON = src
 
 	return img, nil
-}
-
-func StoreImage(img *Image, jsonData []byte, layerData archive.ArchiveReader, root, layer string) error {
-	// Store the layer
-	var (
-		size   int64
-		err    error
-		driver = img.graph.Driver()
-	)
-	if err := os.MkdirAll(layer, 0755); err != nil {
-		return err
-	}
-
-	// If layerData is not nil, unpack it into the new layer
-	if layerData != nil {
-		if differ, ok := driver.(graphdriver.Differ); ok {
-			if err := differ.ApplyDiff(img.ID, layerData); err != nil {
-				return err
-			}
-
-			if size, err = differ.DiffSize(img.ID); err != nil {
-				return err
-			}
-		} else {
-			start := time.Now().UTC()
-			utils.Debugf("Start untar layer")
-			if err := archive.ApplyLayer(layer, layerData); err != nil {
-				return err
-			}
-			utils.Debugf("Untar time: %vs", time.Now().UTC().Sub(start).Seconds())
-
-			if img.Parent == "" {
-				if size, err = utils.TreeSize(layer); err != nil {
-					return err
-				}
-			} else {
-				parent, err := driver.Get(img.Parent, "")
-				if err != nil {
-					return err
-				}
-				defer driver.Put(img.Parent)
-				changes, err := archive.ChangesDirs(layer, parent)
-				if err != nil {
-					return err
-				}
-				size = archive.ChangesSize(layer, changes)
-			}
-		}
-	}
-
-	img.Size = size
-	if err := img.SaveSize(root); err != nil {
-		return err
-	}
-
-	// If raw json is provided, then use it
-	if jsonData != nil {
-		if err := ioutil.WriteFile(jsonPath(root), jsonData, 0600); err != nil {
-			return err
-		}
-	} else {
-		if jsonData, err = json.Marshal(img); err != nil {
-			return err
-		}
-		if err := ioutil.WriteFile(jsonPath(root), jsonData, 0600); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (img *Image) SetGraph(graph Graph) {
-	img.graph = graph
-}
-
-// SaveSize stores the current `size` value of `img` in the directory `root`.
-func (img *Image) SaveSize(root string) error {
-	if err := ioutil.WriteFile(path.Join(root, "layersize"), []byte(strconv.Itoa(int(img.Size))), 0600); err != nil {
-		return fmt.Errorf("Error storing image size in %s/layersize: %s", root, err)
-	}
-	return nil
-}
-
-func jsonPath(root string) string {
-	return path.Join(root, "json")
-}
-
-func (img *Image) RawJson() ([]byte, error) {
-	root, err := img.root()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to get root for image %s: %s", img.ID, err)
-	}
-	fh, err := os.Open(jsonPath(root))
-	if err != nil {
-		return nil, fmt.Errorf("Failed to open json for image %s: %s", img.ID, err)
-	}
-	buf, err := ioutil.ReadAll(fh)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to read json for image %s: %s", img.ID, err)
-	}
-	return buf, nil
-}
-
-// TarLayer returns a tar archive of the image's filesystem layer.
-func (img *Image) TarLayer() (arch archive.Archive, err error) {
-	if img.graph == nil {
-		return nil, fmt.Errorf("Can't load storage driver for unregistered image %s", img.ID)
-	}
-	driver := img.graph.Driver()
-	if differ, ok := driver.(graphdriver.Differ); ok {
-		return differ.Diff(img.ID)
-	}
-
-	imgFs, err := driver.Get(img.ID, "")
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		if err != nil {
-			driver.Put(img.ID)
-		}
-	}()
-
-	if img.Parent == "" {
-		archive, err := archive.Tar(imgFs, archive.Uncompressed)
-		if err != nil {
-			return nil, err
-		}
-		return utils.NewReadCloserWrapper(archive, func() error {
-			err := archive.Close()
-			driver.Put(img.ID)
-			return err
-		}), nil
-	}
-
-	parentFs, err := driver.Get(img.Parent, "")
-	if err != nil {
-		return nil, err
-	}
-	defer driver.Put(img.Parent)
-	changes, err := archive.ChangesDirs(imgFs, parentFs)
-	if err != nil {
-		return nil, err
-	}
-	archive, err := archive.ExportChanges(imgFs, changes)
-	if err != nil {
-		return nil, err
-	}
-	return utils.NewReadCloserWrapper(archive, func() error {
-		err := archive.Close()
-		driver.Put(img.ID)
-		return err
-	}), nil
-}
-
-// Image includes convenience proxy functions to its graph
-// These functions will return an error if the image is not registered
-// (ie. if image.graph == nil)
-func (img *Image) History() ([]*Image, error) {
-	var parents []*Image
-	if err := img.WalkHistory(
-		func(img *Image) error {
-			parents = append(parents, img)
-			return nil
-		},
-	); err != nil {
-		return nil, err
-	}
-	return parents, nil
-}
-
-func (img *Image) WalkHistory(handler func(*Image) error) (err error) {
-	currentImg := img
-	for currentImg != nil {
-		if handler != nil {
-			if err := handler(currentImg); err != nil {
-				return err
-			}
-		}
-		currentImg, err = currentImg.GetParent()
-		if err != nil {
-			return fmt.Errorf("Error while getting parent image: %v", err)
-		}
-	}
-	return nil
-}
-
-func (img *Image) GetParent() (*Image, error) {
-	if img.Parent == "" {
-		return nil, nil
-	}
-	if img.graph == nil {
-		return nil, fmt.Errorf("Can't lookup parent of unregistered image")
-	}
-	return img.graph.Get(img.Parent)
-}
-
-func (img *Image) root() (string, error) {
-	if img.graph == nil {
-		return "", fmt.Errorf("Can't lookup root of unregistered image")
-	}
-	return img.graph.ImageRoot(img.ID), nil
-}
-
-func (img *Image) GetParentsSize(size int64) int64 {
-	parentImage, err := img.GetParent()
-	if err != nil || parentImage == nil {
-		return size
-	}
-	size += parentImage.Size
-	return parentImage.GetParentsSize(size)
-}
-
-// Depth returns the number of parents for a
-// current image
-func (img *Image) Depth() (int, error) {
-	var (
-		count  = 0
-		parent = img
-		err    error
-	)
-
-	for parent != nil {
-		count++
-		parent, err = parent.GetParent()
-		if err != nil {
-			return -1, err
-		}
-	}
-	return count, nil
-}
-
-// Build an Image object from raw json data
-func NewImgJSON(src []byte) (*Image, error) {
-	ret := &Image{}
-
-	utils.Debugf("Json string: {%s}", src)
-	// FIXME: Is there a cleaner way to "purify" the input json?
-	if err := json.Unmarshal(src, ret); err != nil {
-		return nil, err
-	}
-	return ret, nil
 }

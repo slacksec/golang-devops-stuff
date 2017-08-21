@@ -1,71 +1,116 @@
 package runconfig
 
 import (
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/nat"
+	"encoding/json"
+	"io"
+
+	"github.com/docker/docker/api/types/container"
+	networktypes "github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/pkg/sysinfo"
+	"github.com/docker/docker/volume"
+	"github.com/pkg/errors"
 )
 
-// Note: the Config structure should hold only portable information about the container.
-// Here, "portable" means "independent from the host we are running on".
-// Non-portable information *should* appear in HostConfig.
-type Config struct {
-	Hostname        string
-	Domainname      string
-	User            string
-	Memory          int64  // Memory limit (in bytes)
-	MemorySwap      int64  // Total memory usage (memory + swap); set `-1' to disable swap
-	CpuShares       int64  // CPU shares (relative weight vs. other containers)
-	Cpuset          string // Cpuset 0-2, 0,1
-	AttachStdin     bool
-	AttachStdout    bool
-	AttachStderr    bool
-	PortSpecs       []string // Deprecated - Can be in the format of 8080/tcp
-	ExposedPorts    map[nat.Port]struct{}
-	Tty             bool // Attach standard streams to a tty, including stdin if it is not closed.
-	OpenStdin       bool // Open stdin
-	StdinOnce       bool // If true, close stdin after the 1 attached client disconnects.
-	Env             []string
-	Cmd             []string
-	Image           string // Name of the image as it was passed by the operator (eg. could be symbolic)
-	Volumes         map[string]struct{}
-	WorkingDir      string
-	Entrypoint      []string
-	NetworkDisabled bool
-	OnBuild         []string
+// ContainerDecoder implements httputils.ContainerDecoder
+// calling DecodeContainerConfig.
+type ContainerDecoder struct{}
+
+// DecodeConfig makes ContainerDecoder to implement httputils.ContainerDecoder
+func (r ContainerDecoder) DecodeConfig(src io.Reader) (*container.Config, *container.HostConfig, *networktypes.NetworkingConfig, error) {
+	c, hc, nc, err := decodeContainerConfig(src)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return c, hc, nc, nil
 }
 
-func ContainerConfigFromJob(job *engine.Job) *Config {
-	config := &Config{
-		Hostname:        job.Getenv("Hostname"),
-		Domainname:      job.Getenv("Domainname"),
-		User:            job.Getenv("User"),
-		Memory:          job.GetenvInt64("Memory"),
-		MemorySwap:      job.GetenvInt64("MemorySwap"),
-		CpuShares:       job.GetenvInt64("CpuShares"),
-		Cpuset:          job.Getenv("Cpuset"),
-		AttachStdin:     job.GetenvBool("AttachStdin"),
-		AttachStdout:    job.GetenvBool("AttachStdout"),
-		AttachStderr:    job.GetenvBool("AttachStderr"),
-		Tty:             job.GetenvBool("Tty"),
-		OpenStdin:       job.GetenvBool("OpenStdin"),
-		StdinOnce:       job.GetenvBool("StdinOnce"),
-		Image:           job.Getenv("Image"),
-		WorkingDir:      job.Getenv("WorkingDir"),
-		NetworkDisabled: job.GetenvBool("NetworkDisabled"),
+// DecodeHostConfig makes ContainerDecoder to implement httputils.ContainerDecoder
+func (r ContainerDecoder) DecodeHostConfig(src io.Reader) (*container.HostConfig, error) {
+	hc, err := decodeHostConfig(src)
+	if err != nil {
+		return nil, err
 	}
-	job.GetenvJson("ExposedPorts", &config.ExposedPorts)
-	job.GetenvJson("Volumes", &config.Volumes)
-	if PortSpecs := job.GetenvList("PortSpecs"); PortSpecs != nil {
-		config.PortSpecs = PortSpecs
+	return hc, nil
+}
+
+// decodeContainerConfig decodes a json encoded config into a ContainerConfigWrapper
+// struct and returns both a Config and a HostConfig struct
+// Be aware this function is not checking whether the resulted structs are nil,
+// it's your business to do so
+func decodeContainerConfig(src io.Reader) (*container.Config, *container.HostConfig, *networktypes.NetworkingConfig, error) {
+	var w ContainerConfigWrapper
+
+	decoder := json.NewDecoder(src)
+	if err := decoder.Decode(&w); err != nil {
+		return nil, nil, nil, err
 	}
-	if Env := job.GetenvList("Env"); Env != nil {
-		config.Env = Env
+
+	hc := w.getHostConfig()
+
+	// Perform platform-specific processing of Volumes and Binds.
+	if w.Config != nil && hc != nil {
+
+		// Initialize the volumes map if currently nil
+		if w.Config.Volumes == nil {
+			w.Config.Volumes = make(map[string]struct{})
+		}
+
+		// Now validate all the volumes and binds
+		if err := validateMountSettings(w.Config, hc); err != nil {
+			return nil, nil, nil, err
+		}
 	}
-	if Cmd := job.GetenvList("Cmd"); Cmd != nil {
-		config.Cmd = Cmd
+
+	// Certain parameters need daemon-side validation that cannot be done
+	// on the client, as only the daemon knows what is valid for the platform.
+	if err := validateNetMode(w.Config, hc); err != nil {
+		return nil, nil, nil, err
 	}
-	if Entrypoint := job.GetenvList("Entrypoint"); Entrypoint != nil {
-		config.Entrypoint = Entrypoint
+
+	// Validate isolation
+	if err := validateIsolation(hc); err != nil {
+		return nil, nil, nil, err
 	}
-	return config
+
+	// Validate QoS
+	if err := validateQoS(hc); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Validate Resources
+	if err := validateResources(hc, sysinfo.New(true)); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Validate Privileged
+	if err := validatePrivileged(hc); err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Validate ReadonlyRootfs
+	if err := validateReadonlyRootfs(hc); err != nil {
+		return nil, nil, nil, err
+	}
+
+	return w.Config, hc, w.NetworkingConfig, nil
+}
+
+// validateMountSettings validates each of the volumes and bind settings
+// passed by the caller to ensure they are valid.
+func validateMountSettings(c *container.Config, hc *container.HostConfig) error {
+	// it is ok to have len(hc.Mounts) > 0 && (len(hc.Binds) > 0 || len (c.Volumes) > 0 || len (hc.Tmpfs) > 0 )
+
+	// Ensure all volumes and binds are valid.
+	for spec := range c.Volumes {
+		if _, err := volume.ParseMountRaw(spec, hc.VolumeDriver); err != nil {
+			return errors.Wrapf(err, "invalid volume spec %q", spec)
+		}
+	}
+	for _, spec := range hc.Binds {
+		if _, err := volume.ParseMountRaw(spec, hc.VolumeDriver); err != nil {
+			return errors.Wrapf(err, "invalid bind mount spec %q", spec)
+		}
+	}
+
+	return nil
 }

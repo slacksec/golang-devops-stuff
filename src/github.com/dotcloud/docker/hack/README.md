@@ -1,24 +1,60 @@
-# Hacking on Docker
+## About
 
-The hack/ directory holds information and tools for everyone involved in the process of creating and
-distributing Docker, specifically:
+This directory contains a collection of scripts used to build and manage this
+repository. If there are any issues regarding the intention of a particular
+script (or even part of a certain script), please reach out to us.
+It may help us either refine our current scripts, or add on new ones
+that are appropriate for a given use case.
 
-## Guides
+## DinD (dind.sh)
 
-If you're a *contributor* or aspiring contributor, you should read CONTRIBUTORS.md.
+DinD is a wrapper script which allows Docker to be run inside a Docker
+container. DinD requires the container to
+be run with privileged mode enabled.
 
-If you're a *maintainer* or aspiring maintainer, you should read MAINTAINERS.md.
+## Generate Authors (generate-authors.sh)
 
-If you're a *packager* or aspiring packager, you should read PACKAGERS.md.
+Generates AUTHORS; a file with all the names and corresponding emails of
+individual contributors. AUTHORS can be found in the home directory of
+this repository.
 
-If you're a maintainer in charge of a *release*, you should read RELEASE-CHECKLIST.md.
+## Make
 
-## Roadmap
+There are two make files, each with different extensions. Neither are supposed
+to be called directly; only invoke `make`. Both scripts run inside a Docker
+container.
 
-A high-level roadmap is available at ROADMAP.md.
+### make.ps1
 
+- The Windows native build script that uses PowerShell semantics; it is limited
+unlike `hack\make.sh` since it does not provide support for the full set of
+operations provided by the Linux counterpart, `make.sh`. However, `make.ps1`
+does provide support for local Windows development and Windows to Windows CI.
+More information is found within `make.ps1` by the author, @jhowardmsft
 
-## Build tools
+### make.sh
 
-make.sh is the primary build tool for docker. It is used for compiling the official binary,
-running the test suite, and pushing releases.
+- Referenced via `make test` when running tests on a local machine,
+or directly referenced when running tests inside a Docker development container.  
+- When running on a local machine, `make test` to run all tests found in
+`test`, `test-unit`, `test-integration`, and `test-docker-py` on
+your local machine. The default timeout is set in `make.sh` to 60 minutes
+(`${TIMEOUT:=60m}`), since it currently takes up to an hour to run
+all of the tests.
+- When running inside a Docker development container, `hack/make.sh` does
+not have a single target that runs all the tests. You need to provide a
+single command line with multiple targets that performs the same thing.
+An example referenced from [Run targets inside a development container](https://docs.docker.com/opensource/project/test-and-docs/#run-targets-inside-a-development-container): `root@5f8630b873fe:/go/src/github.com/moby/moby# hack/make.sh dynbinary binary cross test-unit test-integration test-docker-py`
+- For more information related to testing outside the scope of this README,
+refer to
+[Run tests and test documentation](https://docs.docker.com/opensource/project/test-and-docs/)
+
+## Release (release.sh)
+
+Releases any bundles built by `make` on a public AWS S3 bucket.
+For information regarding configuration, please view `release.sh`.
+
+## Vendor (vendor.sh)
+
+A shell script that is a wrapper around Vndr. For information on how to use
+this, please refer to [vndr's README](https://github.com/LK4D4/vndr/blob/master/README.md)

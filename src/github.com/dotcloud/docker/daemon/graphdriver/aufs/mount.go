@@ -1,16 +1,20 @@
+// +build linux
+
 package aufs
 
 import (
-	"github.com/docker/docker/utils"
 	"os/exec"
-	"syscall"
+
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
+// Unmount the target specified.
 func Unmount(target string) error {
 	if err := exec.Command("auplink", target, "flush").Run(); err != nil {
-		utils.Errorf("[warning]: couldn't run auplink before unmount: %s", err)
+		logrus.Warnf("Couldn't run auplink before unmount %s: %s", target, err)
 	}
-	if err := syscall.Unmount(target, 0); err != nil {
+	if err := unix.Unmount(target, 0); err != nil {
 		return err
 	}
 	return nil

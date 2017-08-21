@@ -9,7 +9,7 @@
 # docker run -v `pwd`:/go/src/github.com/docker/docker --privileged -i -t docker bash
 #
 # # Run the test suite:
-# docker run --privileged docker hack/make.sh test
+# docker run -e DOCKER_GITCOMMIT=foo --privileged docker hack/make.sh test-unit test-integration test-docker-py
 #
 # # Publish a release:
 # docker run --privileged \
@@ -19,92 +19,200 @@
 #  -e GPG_PASSPHRASE=gloubiboulga \
 #  docker hack/release.sh
 #
-# Note: Apparmor used to mess with privileged mode, but this is no longer
+# Note: AppArmor used to mess with privileged mode, but this is no longer
 # the case. Therefore, you don't have to disable it anymore.
 #
 
-docker-version	0.6.1
-FROM	ubuntu:14.04
-MAINTAINER	Tianon Gravi <admwiggin@gmail.com> (@tianon)
+FROM debian:jessie
+
+# allow replacing httpredir or deb mirror
+ARG APT_MIRROR=deb.debian.org
+RUN sed -ri "s/(httpredir|deb).debian.org/$APT_MIRROR/g" /etc/apt/sources.list
 
 # Packaged dependencies
-RUN	apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y \
+	apparmor \
+	apt-utils \
 	aufs-tools \
 	automake \
+	bash-completion \
+	binutils-mingw-w64 \
+	bsdmainutils \
 	btrfs-tools \
 	build-essential \
+	cmake \
+	createrepo \
 	curl \
 	dpkg-sig \
+	gcc-mingw-w64 \
 	git \
 	iptables \
+	jq \
+	less \
 	libapparmor-dev \
 	libcap-dev \
-	libsqlite3-dev \
-	lxc=1.0* \
+	libnl-3-dev \
+	libprotobuf-c0-dev \
+	libprotobuf-dev \
+	libsystemd-journal-dev \
+	libtool \
 	mercurial \
-	parallel \
-	reprepro \
-	ruby1.9.1 \
-	ruby1.9.1-dev \
-	s3cmd=1.1.0* \
-	--no-install-recommends
+	net-tools \
+	pkg-config \
+	protobuf-compiler \
+	protobuf-c-compiler \
+	python-dev \
+	python-mock \
+	python-pip \
+	python-websocket \
+	tar \
+	vim \
+	vim-common \
+	xfsprogs \
+	zip \
+	--no-install-recommends \
+	&& pip install awscli==1.10.15
 
-# Get lvm2 source for compiling statically
-RUN	git clone --no-checkout https://git.fedorahosted.org/git/lvm2.git /usr/local/lvm2 && cd /usr/local/lvm2 && git checkout -q v2_02_103
-# see https://git.fedorahosted.org/cgit/lvm2.git/refs/tags for release tags
-# note: we don't use "git clone -b" above because it then spews big nasty warnings about 'detached HEAD' state that we can't silence as easily as we can silence them using "git checkout" directly
+# Get lvm2 sources to build statically linked devmapper library
+ENV LVM2_VERSION 2.02.173
+RUN mkdir -p /usr/local/lvm2 \
+	&& curl -fsSL "https://mirrors.kernel.org/sourceware/lvm2/LVM2.${LVM2_VERSION}.tgz" \
+		| tar -xzC /usr/local/lvm2 --strip-components=1
 
-# Compile and install lvm2
-RUN	cd /usr/local/lvm2 && ./configure --enable-static_link && make device-mapper && make install_device-mapper
-# see https://git.fedorahosted.org/cgit/lvm2.git/tree/INSTALL
+# Compile and install (only the needed library)
+RUN cd /usr/local/lvm2 \
+	&& ./configure \
+		--build="$(gcc -print-multiarch)" \
+		--enable-static_link \
+		--enable-pkgconfig \
+	&& make -C include \
+	&& make -C libdm install_device-mapper
+
+# Install seccomp: the version shipped upstream is too old
+ENV SECCOMP_VERSION 2.3.2
+RUN set -x \
+	&& export SECCOMP_PATH="$(mktemp -d)" \
+	&& curl -fsSL "https://github.com/seccomp/libseccomp/releases/download/v${SECCOMP_VERSION}/libseccomp-${SECCOMP_VERSION}.tar.gz" \
+		| tar -xzC "$SECCOMP_PATH" --strip-components=1 \
+	&& ( \
+		cd "$SECCOMP_PATH" \
+		&& ./configure --prefix=/usr/local \
+		&& make \
+		&& make install \
+		&& ldconfig \
+	) \
+	&& rm -rf "$SECCOMP_PATH"
 
 # Install Go
-RUN	curl -sSL https://golang.org/dl/go1.3.src.tar.gz | tar -v -C /usr/local -xz
-ENV	PATH	/usr/local/go/bin:$PATH
-ENV	GOPATH	/go:/go/src/github.com/docker/docker/vendor
-ENV PATH /go/bin:$PATH
-RUN	cd /usr/local/go/src && ./make.bash --no-clean 2>&1
+# IMPORTANT: If the version of Go is updated, the Windows to Linux CI machines
+#            will need updating, to avoid errors. Ping #docker-maintainers on IRC
+#            with a heads-up.
+# IMPORTANT: When updating this please note that stdlib archive/tar pkg is vendored
+ENV GO_VERSION 1.8.3
+RUN curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+	| tar -xzC /usr/local
 
-# Compile Go for cross compilation
-ENV	DOCKER_CROSSPLATFORMS	\
-	linux/386 linux/arm \
-	darwin/amd64 darwin/386 \
-	freebsd/amd64 freebsd/386 freebsd/arm
-# (set an explicit GOARM of 5 for maximum compatibility)
-ENV	GOARM	5
-RUN	cd /usr/local/go/src && bash -xc 'for platform in $DOCKER_CROSSPLATFORMS; do GOOS=${platform%/*} GOARCH=${platform##*/} ./make.bash --no-clean 2>&1; done'
+ENV PATH /go/bin:/usr/local/go/bin:$PATH
+ENV GOPATH /go
 
-# Grab Go's cover tool for dead-simple code coverage testing
-RUN	go get code.google.com/p/go.tools/cmd/cover
+# Install CRIU for checkpoint/restore support
+ENV CRIU_VERSION 2.12.1
+# Install dependancy packages specific to criu
+RUN apt-get install libnet-dev -y && \
+	mkdir -p /usr/src/criu \
+	&& curl -sSL https://github.com/xemul/criu/archive/v${CRIU_VERSION}.tar.gz | tar -v -C /usr/src/criu/ -xz --strip-components=1 \
+	&& cd /usr/src/criu \
+	&& make \
+	&& make install-criu
 
-# TODO replace FPM with some very minimal debhelper stuff
-RUN	gem install --no-rdoc --no-ri fpm --version 1.0.2
+# Install two versions of the registry. The first is an older version that
+# only supports schema1 manifests. The second is a newer version that supports
+# both. This allows integration-cli tests to cover push/pull with both schema1
+# and schema2 manifests.
+ENV REGISTRY_COMMIT_SCHEMA1 ec87e9b6971d831f0eff752ddb54fb64693e51cd
+ENV REGISTRY_COMMIT 47a064d4195a9b56133891bbb13620c3ac83a827
+RUN set -x \
+	&& export GOPATH="$(mktemp -d)" \
+	&& git clone https://github.com/docker/distribution.git "$GOPATH/src/github.com/docker/distribution" \
+	&& (cd "$GOPATH/src/github.com/docker/distribution" && git checkout -q "$REGISTRY_COMMIT") \
+	&& GOPATH="$GOPATH/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH" \
+		go build -o /usr/local/bin/registry-v2 github.com/docker/distribution/cmd/registry \
+	&& (cd "$GOPATH/src/github.com/docker/distribution" && git checkout -q "$REGISTRY_COMMIT_SCHEMA1") \
+	&& GOPATH="$GOPATH/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH" \
+		go build -o /usr/local/bin/registry-v2-schema1 github.com/docker/distribution/cmd/registry \
+	&& rm -rf "$GOPATH"
 
-# Install man page generator
-RUN mkdir -p /go/src/github.com/cpuguy83 \
-    && git clone -b v1 https://github.com/cpuguy83/go-md2man.git /go/src/github.com/cpuguy83/go-md2man \
-    && cd /go/src/github.com/cpuguy83/go-md2man \
-    && go get -v ./...
+# Install notary and notary-server
+ENV NOTARY_VERSION v0.5.0
+RUN set -x \
+	&& export GOPATH="$(mktemp -d)" \
+	&& git clone https://github.com/docker/notary.git "$GOPATH/src/github.com/docker/notary" \
+	&& (cd "$GOPATH/src/github.com/docker/notary" && git checkout -q "$NOTARY_VERSION") \
+	&& GOPATH="$GOPATH/src/github.com/docker/notary/vendor:$GOPATH" \
+		go build -o /usr/local/bin/notary-server github.com/docker/notary/cmd/notary-server \
+	&& GOPATH="$GOPATH/src/github.com/docker/notary/vendor:$GOPATH" \
+		go build -o /usr/local/bin/notary github.com/docker/notary/cmd/notary \
+	&& rm -rf "$GOPATH"
 
-# Get the "busybox" image source so we can build locally instead of pulling
-RUN	git clone -b buildroot-2014.02 https://github.com/jpetazzo/docker-busybox.git /docker-busybox
+# Get the "docker-py" source so we can run their integration tests
+ENV DOCKER_PY_COMMIT a962578e515185cf06506050b2200c0b81aa84ef
+# To run integration tests docker-pycreds is required.
+# Before running the integration tests conftest.py is
+# loaded which results in loads auth.py that
+# imports the docker-pycreds module.
+RUN git clone https://github.com/docker/docker-py.git /docker-py \
+	&& cd /docker-py \
+	&& git checkout -q $DOCKER_PY_COMMIT \
+	&& pip install docker-pycreds==0.2.1 \
+	&& pip install -r test-requirements.txt
 
-# Setup s3cmd config
-RUN	/bin/echo -e '[default]\naccess_key=$AWS_ACCESS_KEY\nsecret_key=$AWS_SECRET_KEY' > /.s3cfg
+# Install yamllint for validating swagger.yaml
+RUN pip install yamllint==1.5.0
+
+# Install go-swagger for validating swagger.yaml
+ENV GO_SWAGGER_COMMIT c28258affb0b6251755d92489ef685af8d4ff3eb
+RUN git clone https://github.com/go-swagger/go-swagger.git /go/src/github.com/go-swagger/go-swagger \
+	&& (cd /go/src/github.com/go-swagger/go-swagger && git checkout -q $GO_SWAGGER_COMMIT) \
+	&& go install -v github.com/go-swagger/go-swagger/cmd/swagger
 
 # Set user.email so crosbymichael's in-container merge commits go smoothly
-RUN	git config --global user.email 'docker-dummy@example.com'
+RUN git config --global user.email 'docker-dummy@example.com'
 
 # Add an unprivileged user to be used for tests which need it
 RUN groupadd -r docker
 RUN useradd --create-home --gid docker unprivilegeduser
 
-VOLUME	/var/lib/docker
-WORKDIR	/go/src/github.com/docker/docker
-ENV	DOCKER_BUILDTAGS	apparmor selinux
+VOLUME /var/lib/docker
+WORKDIR /go/src/github.com/docker/docker
+ENV DOCKER_BUILDTAGS apparmor seccomp selinux
+
+# Let us use a .bashrc file
+RUN ln -sfv $PWD/.bashrc ~/.bashrc
+# Add integration helps to bashrc
+RUN echo "source $PWD/hack/make/.integration-test-helpers" >> /etc/bash.bashrc
+
+# Get useful and necessary Hub images so we can "docker load" locally instead of pulling
+COPY contrib/download-frozen-image-v2.sh /go/src/github.com/docker/docker/contrib/
+RUN ./contrib/download-frozen-image-v2.sh /docker-frozen-images \
+	buildpack-deps:jessie@sha256:85b379ec16065e4fe4127eb1c5fb1bcc03c559bd36dbb2e22ff496de55925fa6 \
+	busybox:latest@sha256:32f093055929dbc23dec4d03e09dfe971f5973a9ca5cf059cbfb644c206aa83f \
+	debian:jessie@sha256:72f784399fd2719b4cb4e16ef8e369a39dc67f53d978cd3e2e7bf4e502c7b793 \
+	hello-world:latest@sha256:c5515758d4c5e1e838e9cd307f6c6a0d620b5e07e6f927b07d05f6d12a1ac8d7
+# See also ensureFrozenImagesLinux() in "integration-cli/fixtures_linux_daemon_test.go" (which needs to be updated when adding images to this list)
+
+# Install tomlv, vndr, runc, containerd, tini, docker-proxy dockercli
+# Please edit hack/dockerfile/install-binaries.sh to update them.
+COPY hack/dockerfile/binaries-commits /tmp/binaries-commits
+COPY hack/dockerfile/install-binaries.sh /tmp/install-binaries.sh
+RUN /tmp/install-binaries.sh tomlv vndr runc containerd tini proxy dockercli gometalinter
+ENV PATH=/usr/local/cli:$PATH
+
+# Activate bash completion and include Docker's completion if mounted with DOCKER_BASH_COMPLETION_PATH
+RUN echo "source /usr/share/bash-completion/bash_completion" >> /etc/bash.bashrc
+RUN ln -s /usr/local/completion/bash/docker /etc/bash_completion.d/docker
 
 # Wrap all commands in the "docker-in-docker" script to allow nested containers
-ENTRYPOINT	["hack/dind"]
+ENTRYPOINT ["hack/dind"]
 
 # Upload docker source
-COPY	.	/go/src/github.com/docker/docker
+COPY . /go/src/github.com/docker/docker
