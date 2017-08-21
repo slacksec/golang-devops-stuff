@@ -3,19 +3,18 @@ package store
 import (
 	"errors"
 	"fmt"
-	"github.com/cloudfoundry/hm9000/config"
-	"github.com/cloudfoundry/hm9000/helpers/logger"
-	"github.com/cloudfoundry/hm9000/models"
-	"github.com/cloudfoundry/storeadapter"
 	"reflect"
 	"strconv"
 	"sync"
 	"time"
+
+	"code.cloudfoundry.org/lager"
+	"github.com/cloudfoundry/hm9000/config"
+	"github.com/cloudfoundry/hm9000/models"
+	"github.com/cloudfoundry/storeadapter"
 )
 
 var ActualIsNotFreshError = errors.New("Actual state is not fresh")
-var DesiredIsNotFreshError = errors.New("Desired state is not fresh")
-var ActualAndDesiredAreNotFreshError = errors.New("Actual and desired state are not fresh")
 var AppNotFoundError = errors.New("App not found")
 
 type Storeable interface {
@@ -23,12 +22,11 @@ type Storeable interface {
 	ToJSON() []byte
 }
 
+//go:generate counterfeiter -o fakestore/fake_store.go . Store
 type Store interface {
-	BumpDesiredFreshness(timestamp time.Time) error
 	BumpActualFreshness(timestamp time.Time) error
 	RevokeActualFreshness() error
 
-	IsDesiredStateFresh() (bool, error)
 	IsActualStateFresh(time.Time) (bool, error)
 
 	VerifyFreshness(time.Time) error
@@ -37,10 +35,7 @@ type Store interface {
 	GetApps() (map[string]*models.App, error)
 	GetApp(appGuid string, appVersion string) (*models.App, error)
 
-	SyncDesiredState(desiredStates ...models.DesiredAppState) error
-	GetDesiredState() (map[string]models.DesiredAppState, error)
-
-	SyncHeartbeats(heartbeat ...models.Heartbeat) error
+	SyncHeartbeats(heartbeat ...*models.Heartbeat) ([]models.InstanceHeartbeat, error)
 	GetInstanceHeartbeats() (results []models.InstanceHeartbeat, err error)
 	GetInstanceHeartbeatsForApp(appGuid string, appVersion string) (results []models.InstanceHeartbeat, err error)
 
@@ -58,26 +53,33 @@ type Store interface {
 	GetMetric(metric string) (float64, error)
 
 	Compact() error
+
+	GetDeaCache() (map[string]struct{}, error)
 }
 
 type RealStore struct {
 	config  *config.Config
 	adapter storeadapter.StoreAdapter
-	logger  logger.Logger
+	logger  lager.Logger
 
+	heartbeatCache                  map[string]map[string]struct{}
 	instanceHeartbeatCache          map[string]models.InstanceHeartbeat
-	instanceHeartbeatCacheMutex     *sync.Mutex
+	instanceHeartbeatCacheMutex     sync.Mutex
 	instanceHeartbeatCacheTimestamp time.Time
+
+	deaLock                     sync.Mutex
+	deaCache                    map[string]struct{}
+	deaCacheExperationTimestamp time.Time
 }
 
-func NewStore(config *config.Config, adapter storeadapter.StoreAdapter, logger logger.Logger) *RealStore {
+func NewStore(config *config.Config, adapter storeadapter.StoreAdapter, logger lager.Logger) *RealStore {
 	return &RealStore{
-		config:                          config,
-		adapter:                         adapter,
-		logger:                          logger,
-		instanceHeartbeatCache:          map[string]models.InstanceHeartbeat{},
-		instanceHeartbeatCacheMutex:     &sync.Mutex{},
-		instanceHeartbeatCacheTimestamp: time.Unix(0, 0),
+		config:                 config,
+		adapter:                adapter,
+		logger:                 logger,
+		heartbeatCache:         map[string]map[string]struct{}{},
+		instanceHeartbeatCache: map[string]models.InstanceHeartbeat{},
+		deaCache:               map[string]struct{}{},
 	}
 }
 
@@ -88,15 +90,14 @@ func (store *RealStore) SchemaRoot() string {
 func (store *RealStore) fetchNodesUnderDir(dir string) ([]storeadapter.StoreNode, error) {
 	node, err := store.adapter.ListRecursively(dir)
 	if err != nil {
-		if err == storeadapter.ErrorKeyNotFound {
+		if storeErr, ok := err.(storeadapter.Error); ok && storeErr.Type() == storeadapter.ErrorKeyNotFound {
 			return []storeadapter.StoreNode{}, nil
 		}
 		return []storeadapter.StoreNode{}, err
 	}
+
 	return node.ChildNodes, nil
 }
-
-// buckle up, here be dragons...
 
 func (store *RealStore) save(stuff interface{}, root string, ttl uint64) error {
 	t := time.Now()
@@ -114,7 +115,7 @@ func (store *RealStore) save(stuff interface{}, root string, ttl uint64) error {
 
 	err := store.adapter.SetMulti(nodes)
 
-	store.logger.Debug(fmt.Sprintf("Save Duration %s", root), map[string]string{
+	store.logger.Debug(fmt.Sprintf("Save Duration %s", root), lager.Data{
 		"Number of Items": fmt.Sprintf("%d", arrValue.Len()),
 		"Duration":        fmt.Sprintf("%.4f seconds", time.Since(t).Seconds()),
 	})
@@ -139,7 +140,7 @@ func (store *RealStore) get(root string, mapType reflect.Type, constructor refle
 		mapToReturn.SetMapIndex(reflect.ValueOf(item.StoreKey()), out[0])
 	}
 
-	store.logger.Debug(fmt.Sprintf("Get Duration %s", root), map[string]string{
+	store.logger.Debug(fmt.Sprintf("Get Duration %s", root), lager.Data{
 		"Number of Items": fmt.Sprintf("%d", mapToReturn.Len()),
 		"Duration":        fmt.Sprintf("%.4f seconds", time.Since(t).Seconds()),
 	})
@@ -158,7 +159,7 @@ func (store *RealStore) delete(stuff interface{}, root string) error {
 
 	err := store.adapter.Delete(keysToDelete...)
 
-	store.logger.Debug(fmt.Sprintf("Delete Duration %s", root), map[string]string{
+	store.logger.Debug(fmt.Sprintf("Delete Duration %s", root), lager.Data{
 		"Number of Items": fmt.Sprintf("%d", arrValue.Len()),
 		"Duration":        fmt.Sprintf("%.4f seconds", time.Since(t).Seconds()),
 	})

@@ -1,34 +1,29 @@
 package desiredstatefetcher_test
 
 import (
-	"github.com/cloudfoundry/gunk/timeprovider"
 	"github.com/cloudfoundry/hm9000/config"
 	"github.com/cloudfoundry/hm9000/desiredstatefetcher"
 	"github.com/cloudfoundry/hm9000/helpers/httpclient"
 	"github.com/cloudfoundry/hm9000/models"
-	storepackage "github.com/cloudfoundry/hm9000/store"
 	"github.com/cloudfoundry/hm9000/testhelpers/appfixture"
 	"github.com/cloudfoundry/hm9000/testhelpers/fakelogger"
-	"github.com/cloudfoundry/hm9000/testhelpers/fakemetricsaccountant"
-	"github.com/cloudfoundry/storeadapter/fakestoreadapter"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"code.cloudfoundry.org/clock"
 )
 
 var _ = Describe("Fetching from CC and storing the result in the Store", func() {
 	var (
-		fetcher      *desiredstatefetcher.DesiredStateFetcher
-		a1           appfixture.AppFixture
-		a2           appfixture.AppFixture
-		a3           appfixture.AppFixture
-		store        storepackage.Store
-		resultChan   chan desiredstatefetcher.DesiredStateFetcherResult
-		conf         *config.Config
-		storeAdapter *fakestoreadapter.FakeStoreAdapter
+		fetcher    *desiredstatefetcher.DesiredStateFetcher
+		a1         appfixture.AppFixture
+		a2         appfixture.AppFixture
+		a3         appfixture.AppFixture
+		resultChan chan desiredstatefetcher.DesiredStateFetcherResult
+		conf       *config.Config
+		appQueue   *models.AppQueue
 	)
 
 	BeforeEach(func() {
-		storeAdapter = fakestoreadapter.New()
 		resultChan = make(chan desiredstatefetcher.DesiredStateFetcherResult, 1)
 		a1 = appfixture.NewAppFixture()
 		a2 = appfixture.NewAppFixture()
@@ -41,44 +36,40 @@ var _ = Describe("Fetching from CC and storing the result in the Store", func() 
 		})
 
 		conf, _ = config.DefaultConfig()
+		conf.CCBaseURL = stateServer.URL()
 
-		store = storepackage.NewStore(conf, storeAdapter, fakelogger.NewFakeLogger())
+		appQueue = models.NewAppQueue()
 
-		fetcher = desiredstatefetcher.New(conf, store, fakemetricsaccountant.New(), httpclient.NewHttpClient(conf.SkipSSLVerification, conf.FetcherNetworkTimeout()), &timeprovider.RealTimeProvider{}, fakelogger.NewFakeLogger())
-		fetcher.Fetch(resultChan)
+		fetcher = desiredstatefetcher.New(conf,
+			httpclient.NewHttpClient(conf.SkipSSLVerification, conf.FetcherNetworkTimeout()),
+			clock.NewClock(),
+			fakelogger.NewFakeLogger(),
+		)
+		fetcher.Fetch(resultChan, appQueue)
 	})
 
-	It("requests for the first set of data from the CC and stores the response", func() {
+	It("requests for the first set of data from the CC and sends the response", func() {
 		var desired map[string]models.DesiredAppState
-		var err error
-		Eventually(func() interface{} {
-			desired, err = store.GetDesiredState()
-			return desired
-		}, 1, 0.1).ShouldNot(BeEmpty())
 
-		Ω(desired).Should(HaveKey(a1.AppGuid + "," + a1.AppVersion))
-		Ω(desired).Should(HaveKey(a2.AppGuid + "," + a2.AppVersion))
-		Ω(desired).Should(HaveKey(a3.AppGuid + "," + a3.AppVersion))
-	})
+		Eventually(appQueue.DesiredApps).Should(Receive(&desired))
 
-	It("bumps the freshness", func() {
-		Eventually(func() error {
-			_, err := storeAdapter.Get("/hm/v1" + conf.DesiredFreshnessKey)
-			return err
-		}, 1, 0.1).ShouldNot(HaveOccurred())
+		Expect(desired).To(HaveKey(a1.AppGuid + "," + a1.AppVersion))
+		Expect(desired).To(HaveKey(a2.AppGuid + "," + a2.AppVersion))
+		Expect(desired).To(HaveKey(a3.AppGuid + "," + a3.AppVersion))
 	})
 
 	It("reports success to the channel", func() {
-		result := <-resultChan
-		Ω(result.Success).Should(BeTrue())
-		Ω(result.NumResults).Should(Equal(3))
-		Ω(result.Message).Should(BeZero())
-		Ω(result.Error).ShouldNot(HaveOccurred())
+		var result desiredstatefetcher.DesiredStateFetcherResult
+		Eventually(resultChan).Should(Receive(&result))
+		Expect(result.Success).To(BeTrue())
+		Expect(result.NumResults).To(Equal(3))
+		Expect(result.Message).To(BeZero())
+		Expect(result.Error).NotTo(HaveOccurred())
 	})
 
 	Context("when fetching again, and apps have been stopped and/or deleted", func() {
 		BeforeEach(func() {
-			<-resultChan
+			Eventually(resultChan).Should(Receive())
 
 			desired1 := a1.DesiredState(1)
 			desired1.State = models.AppStateStopped
@@ -88,16 +79,7 @@ var _ = Describe("Fetching from CC and storing the result in the Store", func() 
 				a3.DesiredState(1),
 			})
 
-			fetcher.Fetch(resultChan)
-		})
-
-		It("should remove those apps from the store", func() {
-			<-resultChan
-
-			desired, err := store.GetDesiredState()
-			Ω(err).ShouldNot(HaveOccurred())
-			Ω(desired).Should(HaveLen(1))
-			Ω(desired).Should(HaveKey(a3.AppGuid + "," + a3.AppVersion))
+			fetcher.Fetch(resultChan, appQueue)
 		})
 	})
 })

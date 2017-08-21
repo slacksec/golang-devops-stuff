@@ -1,20 +1,33 @@
 package hm
 
 import (
+	"os"
+
+	"code.cloudfoundry.org/consuladapter"
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/locket"
 	"github.com/cloudfoundry/hm9000/config"
-	evacuatorpackage "github.com/cloudfoundry/hm9000/evacuator"
-	"github.com/cloudfoundry/hm9000/helpers/logger"
+	"github.com/cloudfoundry/hm9000/evacuator"
+	"github.com/cloudfoundry/hm9000/helpers/metricsaccountant"
 )
 
-func StartEvacuator(l logger.Logger, conf *config.Config) {
-	messageBus := connectToMessageBus(l, conf)
-	store, _ := connectToStore(l, conf)
+func StartEvacuator(logger lager.Logger, conf *config.Config) {
+	messageBus := connectToMessageBus(logger, conf)
+	store := connectToStore(logger, conf)
 
-	acquireLock(l, conf, "evacuator")
+	clock := buildClock(logger)
 
-	evacuator := evacuatorpackage.New(messageBus, store, buildTimeProvider(l), conf, l)
+	evac := evacuator.New(messageBus, store, clock, metricsaccountant.New(), conf, logger)
 
-	evacuator.Listen()
-	l.Info("Listening for DEA Evacuations")
-	select {}
+	consulClient, _ := consuladapter.NewClientFromUrl(conf.ConsulCluster)
+	lockRunner := locket.NewLock(logger, consulClient, "hm9000.evacuator", make([]byte, 0), clock, locket.RetryInterval, locket.LockTTL)
+
+	err := ifritize(logger, "evacuator", evac, conf, lockRunner)
+	if err != nil {
+		logger.Error("exited", err)
+		os.Exit(197)
+	}
+
+	logger.Info("exited")
+	os.Exit(0)
 }

@@ -2,12 +2,21 @@ package config
 
 import (
 	"encoding/json"
-	"github.com/cloudfoundry/gosteno"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"code.cloudfoundry.org/lager"
 )
+
+type SSL struct {
+	KeyFile    string `json:"key_file"`
+	CertFile   string `json:"cert_file"`
+	CACertFile string `json:"ca_file"`
+}
 
 type Config struct {
 	HeartbeatPeriod                 uint64 `json:"heartbeat_period_in_seconds"`
@@ -37,6 +46,8 @@ type Config struct {
 	CCBaseURL                      string `json:"cc_base_url"`
 	SkipSSLVerification            bool   `json:"skip_cert_verify"`
 
+	CCInternalURL string `json:"cc_internal_url"`
+
 	StoreSchemaVersion         int      `json:"store_schema_version"`
 	StoreURLs                  []string `json:"store_urls"`
 	StoreMaxConcurrentRequests int      `json:"store_max_concurrent_requests"`
@@ -53,6 +64,11 @@ type Config struct {
 	MetricsServerUser     string `json:"metrics_server_user"`
 	MetricsServerPassword string `json:"metrics_server_password"`
 
+	APIServerAddress  string `json:"api_server_address"`
+	APIServerPort     int    `json:"api_server_port"`
+	APIServerUsername string `json:"api_server_username"`
+	APIServerPassword string `json:"api_server_password"`
+
 	LogLevelString string `json:"log_level"`
 
 	NATS []struct {
@@ -61,6 +77,20 @@ type Config struct {
 		User     string `json:"user"`
 		Password string `json:"password"`
 	} `json:"nats"`
+
+	NatsClientPingInterval int `json:"nats_client_ping_interval"`
+
+	HttpHeartbeatServerAddress string `json:"http_heartbeat_server_address"`
+	HttpHeartbeatPort          int    `json:"http_heartbeat_port"`
+
+	SSLCerts SSL `json:"ssl"`
+
+	DropsondePort int `json:"dropsonde_port"`
+
+	ConsulCluster string `json:"config_cluster"`
+
+	ETCDRequireSSL bool `json:"etcd_require_ssl"`
+	ETCDSSLOptions SSL  `json:"etcd"`
 }
 
 func defaults() Config {
@@ -92,15 +122,33 @@ func defaults() Config {
 		MaximumBackoffDelayInHeartbeats:    96, // why?
 
 		ListenerHeartbeatSyncIntervalInMilliseconds:      1000,  // TODO: convert to time.Duration
-		StoreHeartbeatCacheRefreshIntervalInMilliseconds: 20000, // TODO: convert to time.Duration
+		StoreHeartbeatCacheRefreshIntervalInMilliseconds: 60000, // TODO: convert to time.Duration
 
 		MetricsServerPort: 7879,
+
+		APIServerAddress:  "0.0.0.0",
+		APIServerPort:     5155,
+		APIServerUsername: "magnet",
+		APIServerPassword: "orangutan4sale",
 
 		LogLevelString: "INFO",
 
 		ActualFreshnessKey:  "/actual-fresh",
 		DesiredFreshnessKey: "/desired-fresh",
+
+		HttpHeartbeatServerAddress: "0.0.0.0",
+		HttpHeartbeatPort:          5335,
+
+		SSLCerts: SSL{},
+
+		ConsulCluster: "http://127.0.0.1:8500",
+
+		NatsClientPingInterval: 30,
 	}
+}
+
+func (conf *Config) HeartbeatDuration() time.Duration {
+	return time.Duration(conf.HeartbeatPeriod) * time.Second
 }
 
 func (conf *Config) HeartbeatTTL() uint64 {
@@ -124,43 +172,43 @@ func (conf *Config) FetcherNetworkTimeout() time.Duration {
 }
 
 func (conf *Config) SenderPollingInterval() time.Duration {
-	return time.Duration(conf.SenderPollingIntervalInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.SenderPollingIntervalInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) SenderTimeout() time.Duration {
-	return time.Duration(conf.SenderTimeoutInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.SenderTimeoutInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) FetcherPollingInterval() time.Duration {
-	return time.Duration(conf.FetcherPollingIntervalInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.FetcherPollingIntervalInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) FetcherTimeout() time.Duration {
-	return time.Duration(conf.FetcherTimeoutInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.FetcherTimeoutInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) ShredderPollingInterval() time.Duration {
-	return time.Duration(conf.ShredderPollingIntervalInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.ShredderPollingIntervalInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) ShredderTimeout() time.Duration {
-	return time.Duration(conf.ShredderTimeoutInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.ShredderTimeoutInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) AnalyzerPollingInterval() time.Duration {
-	return time.Duration(conf.AnalyzerPollingIntervalInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.AnalyzerPollingIntervalInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) AnalyzerTimeout() time.Duration {
-	return time.Duration(conf.AnalyzerTimeoutInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.AnalyzerTimeoutInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) StartingBackoffDelay() time.Duration {
-	return time.Duration(conf.StartingBackoffDelayInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.StartingBackoffDelayInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) MaximumBackoffDelay() time.Duration {
-	return time.Duration(conf.MaximumBackoffDelayInHeartbeats*int(conf.HeartbeatPeriod)) * time.Second
+	return time.Duration(conf.MaximumBackoffDelayInHeartbeats) * conf.HeartbeatDuration()
 }
 
 func (conf *Config) ListenerHeartbeatSyncInterval() time.Duration {
@@ -171,14 +219,16 @@ func (conf *Config) StoreHeartbeatCacheRefreshInterval() time.Duration {
 	return time.Millisecond * time.Duration(conf.StoreHeartbeatCacheRefreshIntervalInMilliseconds)
 }
 
-func (conf *Config) LogLevel() gosteno.LogLevel {
+func (conf *Config) LogLevel() (lager.LogLevel, error) {
 	switch conf.LogLevelString {
 	case "INFO":
-		return gosteno.LOG_INFO
+		return lager.INFO, nil
 	case "DEBUG":
-		return gosteno.LOG_DEBUG
+		return lager.DEBUG, nil
+	case "":
+		return lager.INFO, nil
 	default:
-		return gosteno.LOG_INFO
+		return 0, errors.New(fmt.Sprintf("Unknown log level %s", conf.LogLevelString))
 	}
 }
 

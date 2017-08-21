@@ -1,10 +1,14 @@
-# Health Manager 9000
+## Please read before you submit any issue or PR ##
 
-[![Build Status](https://travis-ci.org/cloudfoundry/hm-workspace.png)](https://travis-ci.org/cloudfoundry/hm-workspace)
+HM9000 will only be updated in response to vulnerability discoveries and major bugs. No new features will be introduced during this period.
+
+See [EOL Timeline for Legacy DEA Backend](https://lists.cloudfoundry.org/archives/list/cf-dev@lists.cloudfoundry.org/message/GMXXJTTM2Q6SIRGVXSQH4TPLHTVHKNNG/)
+
+# Health Manager 9000
 
 HM 9000 is a rewrite of CloudFoundry's Health Manager.  HM 9000 is written in Golang and has a more modular architecture compared to the original ruby implementation.  HM 9000's dependencies are locked down in a separate repo, the [hm-workspace](https://github.com/cloudfoundry/hm-workspace).
 
-There are several Go Packages in this repository, each with a comprehensive set of unit tests.  In addition there is an integration test that excercises the interactions between the various components.  What follows is a detailed breakdown.
+There are several Go Packages in this repository, each with a comprehensive set of unit tests.  In addition there is an integration test that exercises the interactions between the various components.  What follows is a detailed breakdown.
 
 ## HM9000's Architecture and High-Availability
 
@@ -19,71 +23,64 @@ For more information, see [the HM9000 release announcement](http://blog.cloudfou
 ### Recovering from Failure
 
 If HM9000 enters a bad state, the simplest solution - typically - is to delete the contents of the data store.
-
-1. `bosh ssh` into each etcd node (`bosh vms` is your friend here.  We typically have `etcd_leader_z1/0`, `etcd_z1/0`, and `etcd_z2/0`)
-2. `monit stop etcd` on all the boxes (better to stop them all simultaenously!)
-3. Blow away (or move) the etcd storage directory.  It's located under `/var/vcap/store`
-4. `monit start etcd` on all the boxes
-5. HM9000 should recover on its own.
-
-### If Clustered etcd can't handle the load
-
-You can identify this scenario by monitoring the `DesiredStateSyncTimeInMilliseconds` and the `ActualStateListenerStoreUsagePercentage` metrics.  If the `DesiredStateSyncTimeInMilliseconds` exceeds ~5000 (5 seconds)  *and* the `ActualStateListenerStoreUsagePercentage` exceeds 50-70 (this is a percentage - so out of 100) then clustered etcd *may* be unable to handle the load.
-
-To resolve this, you'll need to pick one of the HM9000 nodes (`hm9000_z1/0` or `hm9000_z2/0`) and make it the solitary HM9000 node and point it at its local etcd database.  Here's how - let's say we want to keep `hm9000_z1/0` around:
-
-1. `bosh ssh` onto `hm9000_z2/0` and issue a `monit stop all`
-2. `bosh ssh` onto `hm9000_z1/0` and issue a `monit stop all`
-3. Edit `/var/vcap/jobs/hm9000/config/hm9000.json` and set `store_urls` to a single entry: `"store_urls": ["http://127.0.0.1:4001"],`
-4. Now `monit start all` and tail `/var/vcap/sys/log/hm9000/hm9000_listener.stdout.log` you should see heartbeats come in and get succesfully saved to the store.
-5. Eventually, `/var/vcap/packages/hm9000/hm9000 dump --config=/var/vcap/jobs/hm9000/config/hm9000.json` should report that the store is fresh (this is near the top of the output).
-
+Follow the steps defined by the etcd-release for [Disaster Recovery](https://github.com/cloudfoundry-incubator/etcd-release#disaster-recovery)
+HM9000 should recover on its own.
 
 ## Installing HM9000 locally
 
-Assuming you have `go` v1.1.* installed:
+Assuming you have `go` v1.5+ installed:
 
-1. Clone the HM-workspace:
+1. Clone `dea-hm-workspace` and its submodules:
 
-        $ cd $HOME
-        $ git clone https://github.com/cloudfoundry/hm-workspace
-        $ export GOPATH=$HOME/hm-workspace
-        $ export PATH=$HOME/hm-workspace/bin:$PATH
-        $ cd hm-workspace
-        $ git submodule update --init
+        $ cd $HOME (or other appropriate base directory)
+        $ git clone https://github.com/cloudfoundry/dea-hm-workspace
+        $ cd dea-hm-workspace
+        $ git submodule update --init --recursive
+        $ mkdir bin
+        $ export GOPATH=$PWD
+        $ export PATH=$PATH:$GOPATH/bin
 
-2. Install `etcd`
+2. Download and install `gnatsd` (the version downloaded here is for linux-x64 - if you have a different platform, be sure to download the correct tarball):
 
-        $ pushd ./src/github.com/coreos/etcd
-        $ ./build
-        $ mv etcd $GOPATH/bin/
-        $ popd
+        $ wget https://github.com/nats-io/gnatsd/releases/download/v0.7.2/gnatsd-v0.7.2-linux-amd64.tar.gz
+        $ tar xzf gnatsd-v0.7.2-linux-amd64.tar.gz
+        $ mv ./gnatsd $GOPATH/bin
 
-3. Start `etcd`.  Open a new terminal session and:
+3. Install `etcd` to $GOPATH/bin (the downloaded version here is for linux-x64 - if you have a different platform, be sure to download the correct tarball)
 
-        $ export PATH=$HOME/hm-workspace/bin:$PATH
-        $ cd $HOME
-        $ mkdir etcdstorage
-        $ cd etcdstorage
-        $ etcd
+        $ wget https://github.com/coreos/etcd/releases/download/v2.2.4/etcd-v2.2.4-linux-amd64.tar.gz
+        $ tar xzf etcd-v2.2.4-linux-amd64.tar.gz
+        $ mv etcd-v2.2.4-linux-amd64/etcd $GOPATH/bin
 
-    `etcd` generates a number of files in CWD when run locally, hence `etcdstorage`
+3. Start `etcd`:
 
-4. Running `hm9000`.  Back in the terminal you used to clone the hm-workspace you should be able to
+        $ mkdir $HOME/etcdstorage
+        $ (cd $HOME/etcdstorage && etcd &)
 
-        $ hm9000
+    `etcd` generates a number of files in the current working directory when run locally, hence `etcdstorage`
 
-    and get usage information
+4. Run `hm9000`:
 
-5. Running the tests
-    
+        $ go install github.com/cloudfoundry/hm9000
+        $ hm9000 <args>
+
+    and get usage information.  Run `hm9000 --help` to see supported commands.
+
+5. Install consul (if you plan to run the integration test suite):
+
+    The `mcat` integration test suite requires that the `consul` binary be in your `PATH`.  Refer to the [installation
+    instructions](https://www.consul.io/intro/getting-started/install.html) for your specific platform to download an install
+    consul.
+
+6. Running the tests
+
         $ go get github.com/onsi/ginkgo/ginkgo
         $ cd src/github.com/cloudfoundry/hm9000/
-        $ ginkgo -r -skipMeasurements -race -failOnPending
+        $ ginkgo -r -p -skipMeasurements -race -failOnPending -randomizeAllSpecs
 
     These tests will spin up their own instances of `etcd` as needed.  It shouldn't interfere with your long-running `etcd` server.
 
-6. Updating hm9000.  You'll need to fetch the latest code *and* recompile the hm9000 binary:
+7. Updating hm9000.  You'll need to fetch the latest code *and* recompile the hm9000 binary:
 
         $ cd $GOPATH/src/github.com/cloudfoundry/hm9000
         $ git checkout master
@@ -100,47 +97,29 @@ Assuming you have `go` v1.1.* installed:
 
 You *must* specify a config file for all the `hm9000` commands.  You do this with (e.g.) `--config=./local_config.json`
 
-### Fetching desired state
+### Analyzing desired state
 
-    hm9000 fetch_desired --config=./local_config.json
+    hm9000 analyze --config=./local_config.json
 
-will connect to CC, fetch the desired state, put it in the store, then exit.  You can optionally pass `-poll` to fetch desired state periodically.
+will connect to CC, fetch the desired state, put it in the store, compute the delta between desired and actual state, and then evaluate the pending starts and stops and publishes them over NATS.  You can optionally pass `-poll` to manage desired state periodically.
 
 ### Listening for actual state
 
     hm9000 listen --config=./local_config.json
 
-will come up, listen to NATS for heartbeats, and put them in the store.
-
-### Analyzing the desired and actual state
-
-    hm9000 analyze --config=./local_config.json
-
-will come up, compare the desired/actual state, and submit start and stop messages to the store.  You can optionally pass `-poll` to analyze periodically.
-
-### Sending start and stop messages
-
-    hm9000 send --config=./local_config.json
-
-will come up, evaluate the pending starts and stops and publish them over NATS. You can optionally pass `-poll` to send messages periodically.
-
-### Serving metrics (varz)
-
-    hm9000 serve_metrics --config=./local_config.json
-
-will come up, register with the [collector](http://github.com/cloudfoundry/collector) and provide a `/varz` end-point with data.
+will come up, listen for heartbeat messages via NATS and HTTP, and put them in the store.
 
 ### Serving API
 
     hm9000 serve_api --config=./local_config.json
 
-will come up and provide response to requests for `app.state` over NATS.
+will come up and provide response to requests for `/bulk_app_state` over HTTP.
 
 ### Evacuator
 
     hm9000 evacuator --config=./local_config.json
 
-will come up and listen for `droplet.exited` messages and send `start` messages for any evacuating droplets.  The `evacuator` is *not* necessary for deterministic evacuation but is provided for backward compatibility with old DEAs.  There is no harm in running the `evacuator` *during* deterministic evacuation.
+will come up and listen for `droplet.exited` messages and queue `start` messages for any evacuating droplets. Start messages will be sent when the analyzer sends start and stop messages.  The `evacuator` is *not* necessary for deterministic evacuation but is provided for backward compatibility with old DEAs.  There is no harm in running the `evacuator` *during* deterministic evacuation.
 
 ### Shredder
 
@@ -230,11 +209,16 @@ HM9000 is configured using a JSON file.  Here are the available entries:
 - `desired_freshness_key`: The key for the actual freshness in the store.  Set to `"/desired-fresh"`.
 
 
-- `metrics_server_port`: The port on which to serve /varz metrics.  If set to 0 a random available port will be chosen.
+- `dropsonde_port`: The port which metron is listening on to receive metrics.
 
-- `metrics_server_user`: The username that must be used to authenticate with /varz.  If set to "" a random username will be generated.
 
-- `metrics_server_password`: The password that must be used to authenticate with /varz.  If set to "" a random password will be generated.
+- `api_server_address`: The IP address of machine runnine HM9000.
+
+- `api_server_port`: The port in which to serve the HTTP API.
+
+- `api_server_username`: User name to be used for basic auth on the API server.
+
+- `api_server_password`: Password to be used for basic auth on the API server.
 
 
 - `log_level`: Must be one of `"INFO"` or `"DEBUG"`
@@ -274,14 +258,7 @@ Desired state is stored under `/desired/APP_GUID-APP_VERSION
 
 The `analyzer` comes up, analyzes the actual and desired state, and puts pending `start` and `stop` messages in the store.  If a `start` or `stop` message is *already* in the store, the analyzer will *not* override it.
 
-### `sender`
-
-The `sender` runs periodically and pulls pending messages out of the store and sends them over `NATS`.  The `sender` verifies that the messages should be sent before sending them (i.e. missing instances are still missing, extra instances are still extra, etc...) The `sender` is also responsible for throttling the rate at which messages are sent over NATS.
-
-### `metricsserver`
-
-The `metricsserver` registers with the CF collector and aggregates and provides metrics via a /varz end-point.  These are the available metrics:
-
+These are the metrics emitted:
 - NumberOfAppsWithAllInstancesReporting: The number of desired applications for which all instances are reporting (the state of the instance is irrelevant: STARTING/RUNNING/CRASHED all count).
 - NumberOfAppsWithMissingInstances: The number of desired applications for which an instance is missing (i.e. the instance is simply not heartbeating at all).
 - NumberOfUndesiredRunningApps: The number of *undesired* applications with at least one instance reporting as STARTING or RUNNING.
@@ -292,6 +269,10 @@ The `metricsserver` registers with the CF collector and aggregates and provides 
 
 If either the actual state or desired state are not *fresh* all of these metrics will have the value `-1`.
 
+### `sender`
+
+The `sender` runs periodically and pulls pending messages out of the store and sends them over `NATS`.  The `sender` verifies that the messages should be sent before sending them (i.e. missing instances are still missing, extra instances are still extra, etc...) The `sender` is also responsible for throttling the rate at which messages are sent over NATS.
+ÂÂ
 ### `apiserver`
 
 The `apiserver` responds to NATS `app.state` messages and allow other CloudFoundry components to obtain information about arbitrary applications.
@@ -370,7 +351,7 @@ Some brief documentation -- look at the code and tests for more:
 app := NewApp()
 
 //Get the desired state for the app.  This can be passed into
-//the desired state server to simulate the APP's presence in 
+//the desired state server to simulate the APP's presence in
 //the CC's DB.  By default the app is staged and started, to change
 //this, modify the return value.
 desiredState := app.DesiredState(NUMBER_OF_DESIRED_INSTANCES)

@@ -3,19 +3,25 @@ package desiredstateserver
 import (
 	"encoding/json"
 	"fmt"
-	. "github.com/cloudfoundry/hm9000/models"
 	"net/http"
 	"strconv"
+	"sync"
+
+	. "github.com/cloudfoundry/hm9000/models"
 )
 
 type DesiredStateServerInterface interface {
-	SpinUp(port int)
+	SpinUp()
 	SetDesiredState([]DesiredAppState)
+	URL() string
 }
 
 type DesiredStateServer struct {
+	mu                      sync.Mutex
 	Apps                    []DesiredAppState
 	NumberOfCompleteFetches int
+	port                    int
+	url                     string
 }
 
 type DesiredStateServerResponse struct {
@@ -32,11 +38,18 @@ func min(a, b int) int {
 	return a
 }
 
-func NewDesiredStateServer() *DesiredStateServer {
-	return &DesiredStateServer{}
+func NewDesiredStateServer(port int) *DesiredStateServer {
+	return &DesiredStateServer{
+		port: port,
+		url:  fmt.Sprintf("http://127.0.0.1:%d", port),
+	}
 }
 
-func (server *DesiredStateServer) SpinUp(port int) {
+func (server *DesiredStateServer) URL() string {
+	return server.url
+}
+
+func (server *DesiredStateServer) SpinUp() {
 	http.HandleFunc("/bulk/apps", func(w http.ResponseWriter, r *http.Request) {
 		server.handleApps(w, r)
 	})
@@ -45,16 +58,20 @@ func (server *DesiredStateServer) SpinUp(port int) {
 		fmt.Fprintf(w, `{"counts":{"user":17}}`)
 	})
 
-	http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
+	http.ListenAndServe(fmt.Sprintf(":%d", server.port), nil)
 }
 
 func (server *DesiredStateServer) SetDesiredState(newState []DesiredAppState) {
+	server.mu.Lock()
 	server.Apps = newState
+	server.mu.Unlock()
 }
 
 func (server *DesiredStateServer) Reset() {
+	server.mu.Lock()
 	server.Apps = make([]DesiredAppState, 0)
 	server.NumberOfCompleteFetches = 0
+	server.mu.Unlock()
 }
 
 func (server *DesiredStateServer) GetNumberOfCompleteFetches() int {
@@ -70,17 +87,20 @@ func (server *DesiredStateServer) handleApps(w http.ResponseWriter, r *http.Requ
 
 	batchSize := server.extractBatchSize(r)
 	bulkToken := server.extractBulkToken(r)
+	server.mu.Lock()
+	apps := server.Apps
+	server.mu.Unlock()
 
 	endIndex := bulkToken + batchSize
-	endIndex = min(endIndex, len(server.Apps))
+	endIndex = min(endIndex, len(apps))
 
 	results := make(map[string]DesiredAppState, 0)
 
-	for _, app := range server.Apps[bulkToken:endIndex] {
+	for _, app := range apps[bulkToken:endIndex] {
 		results[app.AppGuid] = app
 	}
 
-	if bulkToken == len(server.Apps) {
+	if bulkToken == len(apps) {
 		server.NumberOfCompleteFetches += 1
 	}
 

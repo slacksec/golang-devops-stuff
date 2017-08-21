@@ -1,25 +1,34 @@
 package sender
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"github.com/cloudfoundry/gunk/timeprovider"
+	"net/http"
+	"time"
+
+	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry/hm9000/config"
-	"github.com/cloudfoundry/hm9000/helpers/logger"
 	"github.com/cloudfoundry/hm9000/helpers/metricsaccountant"
 	"github.com/cloudfoundry/hm9000/models"
 	"github.com/cloudfoundry/hm9000/store"
 	"github.com/cloudfoundry/yagnats"
+	"code.cloudfoundry.org/clock"
 )
 
-type Sender struct {
+//go:generate counterfeiter -o fakesender/fake_sender.go . Sender
+type Sender interface {
+	Send(clock.Clock, map[string]*models.App, []models.PendingStartMessage, []models.PendingStopMessage) error
+}
+
+type sender struct {
 	store  store.Store
 	conf   *config.Config
-	logger logger.Logger
+	logger lager.Logger
 
-	apps         map[string]*models.App
-	messageBus   yagnats.NATSClient
-	timeProvider timeprovider.TimeProvider
+	apps        map[string]*models.App
+	messageBus  yagnats.NATSConn
+	currentTime time.Time
 
 	numberOfStartMessagesSent int
 	sentStartMessages         []models.PendingStartMessage
@@ -29,17 +38,16 @@ type Sender struct {
 	stopMessagesToSave        []models.PendingStopMessage
 	stopMessagesToDelete      []models.PendingStopMessage
 	metricsAccountant         metricsaccountant.MetricsAccountant
-
-	didSucceed bool
+	clock                     clock.Clock
+	didSucceed                bool
 }
 
-func New(store store.Store, metricsAccountant metricsaccountant.MetricsAccountant, conf *config.Config, messageBus yagnats.NATSClient, timeProvider timeprovider.TimeProvider, logger logger.Logger) *Sender {
-	return &Sender{
+func New(store store.Store, metricsAccountant metricsaccountant.MetricsAccountant, conf *config.Config, messageBus yagnats.NATSConn, logger lager.Logger, clock clock.Clock) *sender {
+	return &sender{
 		store:                 store,
 		conf:                  conf,
 		logger:                logger,
 		messageBus:            messageBus,
-		timeProvider:          timeProvider,
 		sentStartMessages:     []models.PendingStartMessage{},
 		startMessagesToSave:   []models.PendingStartMessage{},
 		startMessagesToDelete: []models.PendingStartMessage{},
@@ -48,31 +56,17 @@ func New(store store.Store, metricsAccountant metricsaccountant.MetricsAccountan
 		stopMessagesToDelete:  []models.PendingStopMessage{},
 		metricsAccountant:     metricsAccountant,
 		didSucceed:            true,
+		clock:                 clock,
 	}
 }
 
-func (sender *Sender) Send() error {
-	err := sender.store.VerifyFreshness(sender.timeProvider.Time())
+func (sender *sender) Send(clock clock.Clock, apps map[string]*models.App, pendingStartMessages []models.PendingStartMessage, pendingStopMessages []models.PendingStopMessage) error {
+	sender.currentTime = clock.Now()
+	sender.apps = apps
+
+	err := sender.store.VerifyFreshness(sender.currentTime)
 	if err != nil {
 		sender.logger.Error("Store is not fresh", err)
-		return err
-	}
-
-	pendingStartMessages, err := sender.store.GetPendingStartMessages()
-	if err != nil {
-		sender.logger.Error("Failed to fetch pending start messages", err)
-		return err
-	}
-
-	pendingStopMessages, err := sender.store.GetPendingStopMessages()
-	if err != nil {
-		sender.logger.Error("Failed to fetch pending stop messages", err)
-		return err
-	}
-
-	sender.apps, err = sender.store.GetApps()
-	if err != nil {
-		sender.logger.Error("Failed to fetch apps", err)
 		return err
 	}
 
@@ -116,29 +110,29 @@ func (sender *Sender) Send() error {
 	return nil
 }
 
-func (sender *Sender) sendStartMessages(startMessages map[string]models.PendingStartMessage) {
+func (sender *sender) sendStartMessages(startMessages []models.PendingStartMessage) {
 	sortedStartMessages := models.SortStartMessagesByPriority(startMessages)
 
 	for _, startMessage := range sortedStartMessages {
-		if startMessage.IsTimeToSend(sender.timeProvider.Time()) {
-			sender.sendStartMessage(startMessage)
-		} else if startMessage.IsExpired(sender.timeProvider.Time()) {
+		if startMessage.IsTimeToSend(sender.currentTime) {
+			sender.sendStartMessageHttp(startMessage)
+		} else if startMessage.IsExpired(sender.currentTime) {
 			sender.queueStartMessageForDeletion(startMessage, "expired start message")
 		}
 	}
 }
 
-func (sender *Sender) sendStopMessages(stopMessages map[string]models.PendingStopMessage) {
+func (sender *sender) sendStopMessages(stopMessages []models.PendingStopMessage) {
 	for _, stopMessage := range stopMessages {
-		if stopMessage.IsTimeToSend(sender.timeProvider.Time()) {
-			sender.sendStopMessage(stopMessage)
-		} else if stopMessage.IsExpired(sender.timeProvider.Time()) {
+		if stopMessage.IsTimeToSend(sender.currentTime) {
+			sender.sendStopMessageHttp(stopMessage)
+		} else if stopMessage.IsExpired(sender.currentTime) {
 			sender.queueStopMessageForDeletion(stopMessage, "expired stop message")
 		}
 	}
 }
 
-func (sender *Sender) sendStartMessage(startMessage models.PendingStartMessage) {
+func (sender *sender) sendStartMessage(startMessage models.PendingStartMessage) {
 	messageToSend, shouldSend := sender.startMessageToSend(startMessage)
 	if shouldSend {
 		if sender.numberOfStartMessagesSent < sender.conf.SenderMessageLimit {
@@ -166,13 +160,87 @@ func (sender *Sender) sendStartMessage(startMessage models.PendingStartMessage) 
 	}
 }
 
-func (sender *Sender) sendStopMessage(stopMessage models.PendingStopMessage) {
-	messageToSend, shouldSend := sender.stopMessageToSend(stopMessage)
+func (sender *sender) sendStartMessageHttp(startMessage models.PendingStartMessage) {
+	messageToSend, shouldSend := sender.startMessageToSend(startMessage)
+
 	if shouldSend {
-		err := sender.messageBus.Publish(sender.conf.SenderNatsStopSubject, messageToSend.ToJSON())
+		if sender.numberOfStartMessagesSent < sender.conf.SenderMessageLimit {
+			sender.logger.Info("Sending message", startMessage.LogDescription())
+
+			client := http.Client{}
+			targetURL := fmt.Sprintf("%s/internal/dea/hm9000/start/%s", sender.conf.CCInternalURL, startMessage.AppGuid)
+			req, err := http.NewRequest("POST", targetURL, bytes.NewReader(messageToSend.ToJSON()))
+
+			authorization := models.BasicAuthInfo{
+				User:     sender.conf.APIServerUsername,
+				Password: sender.conf.APIServerPassword,
+			}.Encode()
+
+			req.Header.Add("Authorization", authorization)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+
+			if err != nil {
+				sender.logger.Error("Failed to send start message", err, startMessage.LogDescription())
+				sender.didSucceed = false
+				return
+			}
+
+			if resp.StatusCode != 200 {
+				buf := new(bytes.Buffer)
+				buf.ReadFrom(resp.Body)
+				respBody := buf.String()
+				err = errors.New(respBody)
+
+				sender.logger.Error("Cloud Controller did not accept start message", err, startMessage.LogDescription())
+				sender.didSucceed = false
+				return
+			}
+
+			sender.sentStartMessages = append(sender.sentStartMessages, startMessage)
+			sender.numberOfStartMessagesSent += 1
+
+			if startMessage.KeepAlive == 0 {
+				sender.queueStartMessageForDeletion(startMessage, "sent start message with no keep alive")
+			} else {
+				sender.markStartMessageSent(startMessage)
+			}
+		}
+	} else {
+		sender.queueStartMessageForDeletion(startMessage, "start message that will not be sent")
+	}
+}
+
+func (sender *sender) sendStopMessageHttp(stopMessage models.PendingStopMessage) {
+	messageToSend, shouldSend := sender.stopMessageToSend(stopMessage)
+
+	if shouldSend {
+		client := http.Client{}
+		targetURL := fmt.Sprintf("%s/internal/dea/hm9000/stop/%s", sender.conf.CCInternalURL, stopMessage.AppGuid)
+		req, err := http.NewRequest("POST", targetURL, bytes.NewReader(messageToSend.ToJSON()))
+
+		authorization := models.BasicAuthInfo{
+			User:     sender.conf.APIServerUsername,
+			Password: sender.conf.APIServerPassword,
+		}.Encode()
+
+		req.Header.Add("Authorization", authorization)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
 
 		if err != nil {
 			sender.logger.Error("Failed to send stop message", err, stopMessage.LogDescription())
+			sender.didSucceed = false
+			return
+		}
+
+		if resp.StatusCode != 200 {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(resp.Body)
+			respBody := buf.String()
+			err = errors.New(respBody)
+
+			sender.logger.Error("Cloud Controller did not accept stop message", err, stopMessage.LogDescription())
 			sender.didSucceed = false
 			return
 		}
@@ -189,27 +257,27 @@ func (sender *Sender) sendStopMessage(stopMessage models.PendingStopMessage) {
 	}
 }
 
-func (sender *Sender) markStartMessageSent(startMessage models.PendingStartMessage) {
-	startMessage.SentOn = sender.timeProvider.Time().Unix()
+func (sender *sender) markStartMessageSent(startMessage models.PendingStartMessage) {
+	startMessage.SentOn = sender.currentTime.Unix()
 	sender.startMessagesToSave = append(sender.startMessagesToSave, startMessage)
 }
 
-func (sender *Sender) markStopMessageSent(stopMessage models.PendingStopMessage) {
-	stopMessage.SentOn = sender.timeProvider.Time().Unix()
+func (sender *sender) markStopMessageSent(stopMessage models.PendingStopMessage) {
+	stopMessage.SentOn = sender.currentTime.Unix()
 	sender.stopMessagesToSave = append(sender.stopMessagesToSave, stopMessage)
 }
 
-func (sender *Sender) queueStartMessageForDeletion(startMessage models.PendingStartMessage, reason string) {
+func (sender *sender) queueStartMessageForDeletion(startMessage models.PendingStartMessage, reason string) {
 	sender.logger.Info(fmt.Sprintf("Deleting %s", reason), startMessage.LogDescription())
 	sender.startMessagesToDelete = append(sender.startMessagesToDelete, startMessage)
 }
 
-func (sender *Sender) queueStopMessageForDeletion(stopMessage models.PendingStopMessage, reason string) {
+func (sender *sender) queueStopMessageForDeletion(stopMessage models.PendingStopMessage, reason string) {
 	sender.logger.Info(fmt.Sprintf("Deleting %s", reason), stopMessage.LogDescription())
 	sender.stopMessagesToDelete = append(sender.stopMessagesToDelete, stopMessage)
 }
 
-func (sender *Sender) startMessageToSend(message models.PendingStartMessage) (models.StartMessage, bool) {
+func (sender *sender) startMessageToSend(message models.PendingStartMessage) (models.StartMessage, bool) {
 	messageToSend := models.StartMessage{
 		MessageId:     message.MessageId,
 		AppGuid:       message.AppGuid,
@@ -249,7 +317,7 @@ func (sender *Sender) startMessageToSend(message models.PendingStartMessage) (mo
 	return messageToSend, true
 }
 
-func (sender *Sender) stopMessageToSend(message models.PendingStopMessage) (models.StopMessage, bool) {
+func (sender *sender) stopMessageToSend(message models.PendingStopMessage) (models.StopMessage, bool) {
 	appKey := sender.store.AppKey(message.AppGuid, message.AppVersion)
 	app, found := sender.apps[appKey]
 

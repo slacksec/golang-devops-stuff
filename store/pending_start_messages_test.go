@@ -3,6 +3,7 @@ package store_test
 import (
 	"time"
 
+	"code.cloudfoundry.org/workpool"
 	"github.com/cloudfoundry/hm9000/config"
 	"github.com/cloudfoundry/hm9000/models"
 	. "github.com/cloudfoundry/hm9000/store"
@@ -10,7 +11,6 @@ import (
 	"github.com/cloudfoundry/storeadapter"
 	"github.com/cloudfoundry/storeadapter/etcdstoreadapter"
 	"github.com/cloudfoundry/storeadapter/storenodematchers"
-	"github.com/cloudfoundry/storeadapter/workerpool"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
@@ -28,10 +28,16 @@ var _ = Describe("Storing PendingStartMessages", func() {
 	BeforeEach(func() {
 		var err error
 		conf, err = config.DefaultConfig()
-		Ω(err).ShouldNot(HaveOccurred())
-		storeAdapter = etcdstoreadapter.NewETCDStoreAdapter(etcdRunner.NodeURLS(), workerpool.NewWorkerPool(conf.StoreMaxConcurrentRequests))
+		Expect(err).NotTo(HaveOccurred())
+		wpool, err := workpool.NewWorkPool(conf.StoreMaxConcurrentRequests)
+		Expect(err).NotTo(HaveOccurred())
+		storeAdapter, err = etcdstoreadapter.New(
+			&etcdstoreadapter.ETCDOptions{ClusterUrls: etcdRunner.NodeURLS()},
+			wpool,
+		)
+		Expect(err).NotTo(HaveOccurred())
 		err = storeAdapter.Connect()
-		Ω(err).ShouldNot(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred())
 
 		message1 = models.NewPendingStartMessage(time.Unix(100, 0), 10, 4, "ABC", "123", 1, 1.0, models.PendingStartMessageReasonInvalid)
 		message2 = models.NewPendingStartMessage(time.Unix(100, 0), 10, 4, "DEF", "123", 1, 1.0, models.PendingStartMessageReasonInvalid)
@@ -50,19 +56,19 @@ var _ = Describe("Storing PendingStartMessages", func() {
 				message1,
 				message2,
 			)
-			Ω(err).ShouldNot(HaveOccurred())
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("stores the passed in start messages", func() {
 			node, err := storeAdapter.ListRecursively("/hm/v1/start")
-			Ω(err).ShouldNot(HaveOccurred())
-			Ω(node.ChildNodes).Should(HaveLen(2))
-			Ω(node.ChildNodes).Should(ContainElement(storenodematchers.MatchStoreNode(storeadapter.StoreNode{
+			Expect(err).NotTo(HaveOccurred())
+			Expect(node.ChildNodes).To(HaveLen(2))
+			Expect(node.ChildNodes).To(ContainElement(storenodematchers.MatchStoreNode(storeadapter.StoreNode{
 				Key:   "/hm/v1/start/" + message1.StoreKey(),
 				Value: message1.ToJSON(),
 				TTL:   0,
 			})))
-			Ω(node.ChildNodes).Should(ContainElement(storenodematchers.MatchStoreNode(storeadapter.StoreNode{
+			Expect(node.ChildNodes).To(ContainElement(storenodematchers.MatchStoreNode(storeadapter.StoreNode{
 				Key:   "/hm/v1/start/" + message2.StoreKey(),
 				Value: message2.ToJSON(),
 				TTL:   0,
@@ -77,15 +83,15 @@ var _ = Describe("Storing PendingStartMessages", func() {
 					message1,
 					message2,
 				)
-				Ω(err).ShouldNot(HaveOccurred())
+				Expect(err).NotTo(HaveOccurred())
 			})
 
 			It("can fetch the start message", func() {
 				desired, err := store.GetPendingStartMessages()
-				Ω(err).ShouldNot(HaveOccurred())
-				Ω(desired).Should(HaveLen(2))
-				Ω(desired).Should(ContainElement(message1))
-				Ω(desired).Should(ContainElement(message2))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(desired).To(HaveLen(2))
+				Expect(desired).To(ContainElement(message1))
+				Expect(desired).To(ContainElement(message2))
 			})
 		})
 
@@ -93,28 +99,28 @@ var _ = Describe("Storing PendingStartMessages", func() {
 			BeforeEach(func() {
 				hb := message1
 				err := store.SavePendingStartMessages(hb)
-				Ω(err).ShouldNot(HaveOccurred())
+				Expect(err).NotTo(HaveOccurred())
 				err = store.DeletePendingStartMessages(hb)
-				Ω(err).ShouldNot(HaveOccurred())
+				Expect(err).NotTo(HaveOccurred())
 			})
 
 			It("returns an empty array", func() {
 				start, err := store.GetPendingStartMessages()
-				Ω(err).ShouldNot(HaveOccurred())
-				Ω(start).Should(BeEmpty())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(start).To(BeEmpty())
 			})
 		})
 
 		Context("When the start message key is missing", func() {
 			BeforeEach(func() {
 				_, err := storeAdapter.ListRecursively("/hm/v1/start")
-				Ω(err).Should(Equal(storeadapter.ErrorKeyNotFound))
+				Expect(err.(storeadapter.Error).Type()).To(Equal(storeadapter.ErrorKeyNotFound))
 			})
 
 			It("returns an empty array and no error", func() {
 				start, err := store.GetPendingStartMessages()
-				Ω(err).ShouldNot(HaveOccurred())
-				Ω(start).Should(BeEmpty())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(start).To(BeEmpty())
 			})
 		})
 	})
@@ -126,7 +132,7 @@ var _ = Describe("Storing PendingStartMessages", func() {
 				message2,
 				message3,
 			)
-			Ω(err).ShouldNot(HaveOccurred())
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("can deletes start messages", func() {
@@ -135,12 +141,12 @@ var _ = Describe("Storing PendingStartMessages", func() {
 				models.NewPendingStartMessage(time.Time{}, 0, 0, message3.AppGuid, message3.AppVersion, message3.IndexToStart, 0, models.PendingStartMessageReasonInvalid),
 			}
 			err := store.DeletePendingStartMessages(toDelete...)
-			Ω(err).ShouldNot(HaveOccurred())
+			Expect(err).NotTo(HaveOccurred())
 
 			desired, err := store.GetPendingStartMessages()
-			Ω(err).ShouldNot(HaveOccurred())
-			Ω(desired).Should(HaveLen(1))
-			Ω(desired).Should(ContainElement(message2))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(desired).To(HaveLen(1))
+			Expect(desired).To(ContainElement(message2))
 		})
 	})
 })

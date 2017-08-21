@@ -13,14 +13,21 @@ var etcdRunner *etcdstorerunner.ETCDClusterRunner
 
 func TestHM9000(t *testing.T) {
 	RegisterFailHandler(Fail)
-
-	etcdRunner = etcdstorerunner.NewETCDClusterRunner(5001, 1)
-	etcdRunner.Start()
-
 	RunSpecs(t, "HM9000 CLI Suite")
-
-	etcdRunner.Stop()
 }
+
+var _ = SynchronizedBeforeSuite(func() []byte {
+	return nil
+}, func([]byte) {
+	etcdRunner = etcdstorerunner.NewETCDClusterRunner(5001+10*GinkgoParallelNode(), 1, nil)
+	etcdRunner.Start()
+})
+
+var _ = SynchronizedAfterSuite(func() {
+	etcdRunner.Stop()
+}, func() {
+
+})
 
 var _ = BeforeEach(func() {
 	etcdRunner.Reset()

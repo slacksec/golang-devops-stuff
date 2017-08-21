@@ -16,7 +16,7 @@ var _ = Describe("Prioritizing and sending messages in batches", func() {
 
 		BeforeEach(func() {
 			var desiredStates = []models.DesiredAppState{}
-			var heartbeats = []models.Heartbeat{}
+			var heartbeats = []*models.Heartbeat{}
 
 			lowPriorityAppGuids = make([]string, 0)
 			for i := 0; i < 8; i += 1 {
@@ -42,41 +42,20 @@ var _ = Describe("Prioritizing and sending messages in batches", func() {
 
 			simulator.SetDesiredState(desiredStates...)
 			simulator.SetCurrentHeartbeats(heartbeats...)
-			simulator.Tick(simulator.TicksToAttainFreshness)
-			simulator.Tick(simulator.GracePeriod)
+			simulator.Tick(simulator.TicksToAttainFreshness, false)
+			simulator.Tick(simulator.GracePeriod, false)
 		})
 
 		It("should send all the stops", func() {
-			Ω(startStopListener.Stops).Should(HaveLen(40))
+			Expect(startStopListener.StopCount()).To(Equal(40))
 		})
 
 		It("should send up to the limit # of starts with the highest priorities first", func() {
-			Ω(startStopListener.Starts).Should(HaveLen(8))
-			for _, startMessage := range startStopListener.Starts {
-				Ω(highPriorityAppGuids).Should(ContainElement(startMessage.AppGuid))
+			Expect(startStopListener.StartCount()).To(Equal(8))
+			for i := 0; i < 8; i++ {
+				startMessage := startStopListener.Start(i)
+				Expect(highPriorityAppGuids).To(ContainElement(startMessage.AppGuid))
 			}
-		})
-
-		Context("when told to send again", func() {
-			BeforeEach(func() {
-				startStopListener.Reset()
-				cliRunner.Run("send", simulator.currentTimestamp)
-			})
-
-			It("should send the next batch of starts", func() {
-				Ω(startStopListener.Starts).Should(HaveLen(8))
-				for i, startMessage := range startStopListener.Starts {
-					if i == 0 {
-						Ω(highPriorityAppGuids).Should(ContainElement(startMessage.AppGuid))
-					} else {
-						Ω(lowPriorityAppGuids).Should(ContainElement(startMessage.AppGuid))
-					}
-				}
-			})
-
-			It("should not send anymore stops (as they were all sent)", func() {
-				Ω(startStopListener.Stops).Should(BeEmpty())
-			})
 		})
 	})
 })

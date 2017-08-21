@@ -18,10 +18,19 @@
 
     "log_level": "INFO",
 
+    "ssl":{
+        "key_file": "/var/vcap/jobs/hm9000/config/certs/server.key",
+        "cert_file": "/var/vcap/jobs/hm9000/config/certs/server.crt",
+        "ca_file": "/var/vcap/jobs/hm9000/config/certs/ca.crt"
+    },
+
+    "nats_client_ping_interval": 30,
     "nats": [{
         "host": "127.0.0.1",
         "port": 4222,
         "user": "",
         "password": ""
-    }]
+    }],
+
+    "dropsonde_port": 12345
 }
