@@ -4,23 +4,20 @@
 
 package auth
 
-import "fmt"
-
-// TODO: These interfaces are a Work In Progress
-// Everything could change in minutes, please don't
-// rely on them until this notice is gone.
+import "github.com/pkg/errors"
 
 type SchemeInfo map[string]interface{}
 
 type Scheme interface {
 	AppLogin(appName string) (Token, error)
+	AppLogout(token string) error
 	Login(params map[string]string) (Token, error)
 	Logout(token string) error
 	Auth(token string) (Token, error)
 	Info() (SchemeInfo, error)
 	Name() string
 	Create(user *User) (*User, error)
-	Remove(token Token) error
+	Remove(user *User) error
 }
 
 type ManagedScheme interface {
@@ -54,7 +51,7 @@ func UnregisterScheme(name string) {
 func GetScheme(name string) (Scheme, error) {
 	scheme, ok := schemes[name]
 	if !ok {
-		return nil, fmt.Errorf("Unknown scheme: %q.", name)
+		return nil, errors.Errorf("Unknown auth scheme: %q.", name)
 	}
 	return scheme, nil
 }

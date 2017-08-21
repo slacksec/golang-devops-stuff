@@ -4,9 +4,7 @@
 
 package safe
 
-import (
-	"sync/atomic"
-)
+import "sync/atomic"
 
 // Counter implements a thread-safe, lock-free counter, that supports
 // operations like increment and decrement.
@@ -16,7 +14,7 @@ type Counter struct {
 	v int64
 }
 
-// NewCounter creates a new counter have the given value as the initial value.
+// NewCounter creates a new counter with the given value as the initial value.
 func NewCounter(initial int64) *Counter {
 	return &Counter{v: initial}
 }

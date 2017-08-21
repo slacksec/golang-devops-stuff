@@ -1,43 +1,71 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2017 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package api
 
 import (
-	"github.com/gorilla/mux"
-	"github.com/tsuru/tsuru/api/context"
+	"encoding/json"
 	"net/http"
-	"net/url"
+
+	"github.com/tsuru/tsuru/auth"
+	"github.com/tsuru/tsuru/permission"
+	"github.com/tsuru/tsuru/provision/pool"
+	"github.com/tsuru/tsuru/router"
 )
 
-type delayedRouter struct {
-	mux.Router
-}
-
-func (r *delayedRouter) registerVars(req *http.Request, vars map[string]string) {
-	values := make(url.Values)
-	for key, value := range vars {
-		values[":"+key] = []string{value}
+// title: router list
+// path: /routers
+// method: GET
+// produce: application/json
+// responses:
+//   200: OK
+//   204: No content
+func listRouters(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	contexts := permission.ContextsForPermission(t, permission.PermAppCreate)
+	var teams []string
+	var global bool
+contexts:
+	for _, c := range contexts {
+		switch c.CtxType {
+		case permission.CtxGlobal:
+			global = true
+			break contexts
+		case permission.CtxTeam:
+			teams = append(teams, c.Value)
+		}
 	}
-	req.URL.RawQuery = url.Values(values).Encode() + "&" + req.URL.RawQuery
-}
-
-func (r *delayedRouter) Add(method string, path string, h http.Handler) *mux.Route {
-	return r.Router.Handle(path, h).Methods(method)
-}
-
-// AddAll binds a path to GET, POST, PUT and DELETE methods.
-func (r *delayedRouter) AddAll(path string, h http.Handler) *mux.Route {
-	return r.Router.Handle(path, h).Methods("GET", "POST", "PUT", "DELETE")
-}
-
-func (r *delayedRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	var match mux.RouteMatch
-	if !r.Match(req, &match) {
-		http.NotFound(w, req)
-		return
+	routers, err := router.List()
+	if err != nil {
+		return err
 	}
-	r.registerVars(req, match.Vars)
-	context.SetDelayedHandler(req, match.Handler)
+	filteredRouters := routers
+	if !global {
+		routersAllowed := make(map[string]struct{})
+		filteredRouters = []router.PlanRouter{}
+		pools, err := pool.ListPossiblePools(teams)
+		if err != nil {
+			return err
+		}
+		for _, p := range pools {
+			rs, err := p.GetRouters()
+			if err != nil {
+				return err
+			}
+			for _, r := range rs {
+				routersAllowed[r] = struct{}{}
+			}
+		}
+		for _, r := range routers {
+			if _, ok := routersAllowed[r.Name]; ok {
+				filteredRouters = append(filteredRouters, r)
+			}
+		}
+	}
+	if len(filteredRouters) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return nil
+	}
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(filteredRouters)
 }

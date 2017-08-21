@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -12,8 +12,11 @@
 package db
 
 import (
+	"fmt"
+
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/db/storage"
+	"github.com/tsuru/tsuru/hc"
 	"gopkg.in/mgo.v2"
 )
 
@@ -26,28 +29,62 @@ type Storage struct {
 	*storage.Storage
 }
 
-// conn reads the tsuru config and calls storage.Open to get a database connection.
+type LogStorage struct {
+	*storage.Storage
+}
+
+func init() {
+	hc.AddChecker("MongoDB", healthCheck)
+}
+
+func healthCheck() error {
+	conn, err := Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return conn.Apps().Database.Session.Ping()
+}
+
+func DbConfig(prefix string) (string, string) {
+	url, _ := config.GetString(fmt.Sprintf("database:%surl", prefix))
+	if url == "" {
+		url, _ = config.GetString("database:url")
+		if url == "" {
+			url = DefaultDatabaseURL
+		}
+	}
+	dbname, _ := config.GetString(fmt.Sprintf("database:%sname", prefix))
+	if dbname == "" {
+		dbname, _ = config.GetString("database:name")
+		if dbname == "" {
+			dbname = DefaultDatabaseName
+		}
+	}
+	return url, dbname
+}
+
+// Conn reads the tsuru config and calls storage.Open to get a database connection.
 //
 // Most tsuru packages should probably use this function. storage.Open is intended for
 // use when supporting more than one database.
-func conn() (*storage.Storage, error) {
-	url, _ := config.GetString("database:url")
-	if url == "" {
-		url = DefaultDatabaseURL
-	}
-	dbname, _ := config.GetString("database:name")
-	if dbname == "" {
-		dbname = DefaultDatabaseName
-	}
-	return storage.Open(url, dbname)
-}
-
 func Conn() (*Storage, error) {
 	var (
 		strg Storage
 		err  error
 	)
-	strg.Storage, err = conn()
+	url, dbname := DbConfig("")
+	strg.Storage, err = storage.Open(url, dbname)
+	return &strg, err
+}
+
+func LogConn() (*LogStorage, error) {
+	var (
+		strg LogStorage
+		err  error
+	)
+	url, dbname := DbConfig("logdb-")
+	strg.Storage, err = storage.Open(url, dbname)
 	return &strg, err
 }
 
@@ -57,47 +94,6 @@ func (s *Storage) Apps() *storage.Collection {
 	c := s.Collection("apps")
 	c.EnsureIndex(nameIndex)
 	return c
-}
-
-func (s *Storage) Deploys() *storage.Collection {
-	return s.Collection("deploys")
-}
-
-// Platforms returns the platforms collection from MongoDB.
-func (s *Storage) Platforms() *storage.Collection {
-	return s.Collection("platforms")
-}
-
-// Logs returns the logs collection from MongoDB.
-func (s *Storage) Logs(appName string) *storage.Collection {
-	if appName == "" {
-		return nil
-	}
-	sourceIndex := mgo.Index{Key: []string{"source"}}
-	unitIndex := mgo.Index{Key: []string{"unit"}}
-	c := s.Collection("logs_" + appName)
-	meanSize := 200
-	maxLines := 5000
-	info := mgo.CollectionInfo{Capped: true, MaxBytes: meanSize * maxLines, MaxDocs: maxLines}
-	c.Create(&info)
-	c.EnsureIndex(sourceIndex)
-	c.EnsureIndex(unitIndex)
-	return c
-}
-
-func (s *Storage) LogsCollections() ([]*storage.Collection, error) {
-	var names []struct {
-		Name string
-	}
-	err := s.Apps().Find(nil).All(&names)
-	if err != nil {
-		return nil, err
-	}
-	var colls []*storage.Collection
-	for _, name := range names {
-		colls = append(colls, s.Collection("logs_"+name.Name))
-	}
-	return colls, nil
 }
 
 // Services returns the services collection from MongoDB.
@@ -110,9 +106,17 @@ func (s *Storage) ServiceInstances() *storage.Collection {
 	return s.Collection("service_instances")
 }
 
-// Plans returns the plans collection.
-func (s *Storage) Plans() *storage.Collection {
-	return s.Collection("plans")
+// Pools returns the pool collection.
+func (s *Storage) Pools() *storage.Collection {
+	return s.Collection("pool")
+}
+
+// PoolsConstraints return the pool constraints collection.
+func (s *Storage) PoolsConstraints() *storage.Collection {
+	poolConstraintIndex := mgo.Index{Key: []string{"poolexpr", "field"}, Unique: true}
+	c := s.Collection("pool_constraints")
+	c.EnsureIndex(poolConstraintIndex)
+	return c
 }
 
 // Users returns the users collection from MongoDB.
@@ -124,7 +128,9 @@ func (s *Storage) Users() *storage.Collection {
 }
 
 func (s *Storage) Tokens() *storage.Collection {
-	return s.Collection("tokens")
+	coll := s.Collection("tokens")
+	coll.EnsureIndex(mgo.Index{Key: []string{"token"}})
+	return coll
 }
 
 func (s *Storage) PasswordTokens() *storage.Collection {
@@ -135,15 +141,107 @@ func (s *Storage) UserActions() *storage.Collection {
 	return s.Collection("user_actions")
 }
 
-// Teams returns the teams collection from MongoDB.
-func (s *Storage) Teams() *storage.Collection {
-	return s.Collection("teams")
-}
-
 // Quota returns the quota collection from MongoDB.
 func (s *Storage) Quota() *storage.Collection {
 	userIndex := mgo.Index{Key: []string{"owner"}, Unique: true}
 	c := s.Collection("quota")
 	c.EnsureIndex(userIndex)
+	return c
+}
+
+// SAMLRequests returns the saml_requests from MongoDB.
+func (s *Storage) SAMLRequests() *storage.Collection {
+	id := mgo.Index{Key: []string{"id"}}
+	coll := s.Collection("saml_requests")
+	coll.EnsureIndex(id)
+	return coll
+}
+
+var logCappedInfo = mgo.CollectionInfo{
+	Capped:   true,
+	MaxBytes: 200 * 5000,
+	MaxDocs:  5000,
+}
+
+// Logs returns the logs collection for one app from MongoDB.
+func (s *LogStorage) Logs(appName string) *storage.Collection {
+	if appName == "" {
+		return nil
+	}
+	c := s.Collection("logs_" + appName)
+	c.Create(&logCappedInfo)
+	return c
+}
+
+// LogsCollections returns logs collections for all apps from MongoDB.
+func (s *LogStorage) LogsCollections() ([]*storage.Collection, error) {
+	var names []struct {
+		Name string
+	}
+	conn, err := Conn()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	err = conn.Apps().Find(nil).All(&names)
+	if err != nil {
+		return nil, err
+	}
+	var colls []*storage.Collection
+	for _, name := range names {
+		colls = append(colls, s.Collection("logs_"+name.Name))
+	}
+	return colls, nil
+}
+
+func (s *Storage) Roles() *storage.Collection {
+	return s.Collection("roles")
+}
+
+func (s *Storage) Limiter() *storage.Collection {
+	return s.Collection("limiter")
+}
+
+func (s *Storage) Events() *storage.Collection {
+	ownerIndex := mgo.Index{Key: []string{"owner"}}
+	kindIndex := mgo.Index{Key: []string{"kind"}}
+	startTimeIndex := mgo.Index{Key: []string{"-starttime"}}
+	uniqueIdIndex := mgo.Index{Key: []string{"uniqueid"}}
+	c := s.Collection("events")
+	c.EnsureIndex(ownerIndex)
+	c.EnsureIndex(kindIndex)
+	c.EnsureIndex(startTimeIndex)
+	c.EnsureIndex(uniqueIdIndex)
+	return c
+}
+
+func (s *Storage) EventBlocks() *storage.Collection {
+	index := mgo.Index{Key: []string{"ownername", "kindname", "target"}}
+	startTimeIndex := mgo.Index{Key: []string{"-starttime"}}
+	c := s.Collection("event_blocks")
+	c.EnsureIndex(index)
+	c.EnsureIndex(startTimeIndex)
+	return c
+}
+
+func (s *Storage) InstallHosts() *storage.Collection {
+	nameIndex := mgo.Index{Key: []string{"name"}, Unique: true}
+	c := s.Collection("install_hosts")
+	c.EnsureIndex(nameIndex)
+	return c
+}
+
+func (s *Storage) ProvisionerClusters() *storage.Collection {
+	c := s.Collection("provisioner_clusters")
+	return c
+}
+
+func (s *Storage) Volumes() *storage.Collection {
+	c := s.Collection("volumes")
+	return c
+}
+
+func (s *Storage) VolumeBinds() *storage.Collection {
+	c := s.Collection("volume_binds")
 	return c
 }

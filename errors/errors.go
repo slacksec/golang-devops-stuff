@@ -1,11 +1,14 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 // Package errors provides facilities with error handling.
 package errors
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // HTTP represents an HTTP error. It implements the error interface.
 //
@@ -42,6 +45,62 @@ type NotAuthorizedError ValidationError
 
 func (err *NotAuthorizedError) Error() string {
 	return err.Message
+}
+
+type MultiError struct {
+	errors []error
+}
+
+func NewMultiError(errs ...error) *MultiError {
+	return &MultiError{errors: errs}
+}
+
+func (m *MultiError) Add(err error) {
+	m.errors = append(m.errors, err)
+}
+
+func (m *MultiError) Len() int {
+	return len(m.errors)
+}
+
+func (m *MultiError) ToError() error {
+	if len(m.errors) == 0 {
+		return nil
+	}
+	return m
+}
+
+func (m *MultiError) Error() string {
+	if m.Len() == 0 {
+		return "multi error created but no errors added"
+	}
+	if m.Len() == 1 {
+		return fmt.Sprintf("%+v", m.errors[0])
+	}
+	msg := fmt.Sprintf("multiple errors reported (%d):\n", len(m.errors))
+	for i, err := range m.errors {
+		msg += fmt.Sprintf("error #%d: %+v\n", i, err)
+	}
+	return msg
+}
+
+func (m *MultiError) Format(s fmt.State, verb rune) {
+	if m.Len() == 0 {
+		return
+	}
+	fmtString := "%"
+	if s.Flag('+') {
+		fmtString += "+"
+	}
+	if s.Flag('#') {
+		fmtString += "#"
+	}
+	fmtString += string(verb)
+	errors := make([]string, len(m.errors))
+	for i, err := range m.errors {
+		errors[i] = fmt.Sprintf(fmtString, err)
+	}
+	fmt.Fprintf(s, "%s", strings.Join(errors, " "))
 }
 
 type CompositeError struct {

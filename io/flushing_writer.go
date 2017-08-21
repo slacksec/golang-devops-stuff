@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,21 +6,21 @@ package io
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
-	"github.com/tsuru/tsuru/log"
 	"net"
 	"net/http"
 	"sync"
-)
 
-var writeMutex sync.Mutex
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/log"
+)
 
 // FlushingWriter is a custom writer that flushes after writing, if the
 // underlying ResponseWriter is also an http.Flusher.
 type FlushingWriter struct {
 	http.ResponseWriter
-	wrote bool
+	wrote      bool
+	writeMutex sync.Mutex
 }
 
 func (w *FlushingWriter) WriteHeader(code int) {
@@ -30,8 +30,8 @@ func (w *FlushingWriter) WriteHeader(code int) {
 
 // Write writes and flushes the data.
 func (w *FlushingWriter) Write(data []byte) (written int, err error) {
-	writeMutex.Lock()
-	defer writeMutex.Unlock()
+	w.writeMutex.Lock()
+	defer w.writeMutex.Unlock()
 	w.wrote = true
 	written, err = w.ResponseWriter.Write(data)
 	if err != nil {
@@ -42,7 +42,7 @@ func (w *FlushingWriter) Write(data []byte) (written int, err error) {
 			if r := recover(); r != nil {
 				msg := fmt.Sprintf("Error recovered on flushing writer: %#v", r)
 				log.Debugf(msg)
-				err = fmt.Errorf(msg)
+				err = errors.Errorf(msg)
 			}
 		}()
 		f.Flush()
@@ -62,4 +62,11 @@ func (w *FlushingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		return hijacker.Hijack()
 	}
 	return nil, nil, errors.New("cannot hijack connection")
+}
+
+func (w *FlushingWriter) CloseNotify() <-chan bool {
+	if notifier, ok := w.ResponseWriter.(http.CloseNotifier); ok {
+		return notifier.CloseNotify()
+	}
+	return make(chan bool)
 }

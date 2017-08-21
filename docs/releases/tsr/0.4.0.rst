@@ -1,14 +1,18 @@
+.. Copyright 2014 tsuru authors. All rights reserved.
+   Use of this source code is governed by a BSD-style
+   license that can be found in the LICENSE file.
+
 =======================
 tsr 0.4.0 release notes
 =======================
 
 Welcome to tsr 0.4.0!
 
-These release notes cover the `new features`_ and `backwards incompatible
-changes`_ you'll want to be aware of when upgrading from tsr 0.3.x or older
-versions.
+These release notes cover the :ref:`new features <new-0.4.0>` and
+:ref:`backwards incompatible changes <backwards-0.4.0>` you'll want to be aware
+of when upgrading from tsr 0.3.x or older versions.
 
-.. _`new features`: `What's new in tsr 0.4.0`_
+.. _new-0.4.0:
 
 What's new in tsr 0.4.0
 =======================
@@ -26,13 +30,15 @@ Docker
   https://github.com/tsuru/tsuru-unit-agent.
 * added an administrative command to move and rebalance containers between
   nodes (issue `#646 <https://github.com/tsuru/tsuru/issues/646>`_). For more
-  details, see the :ref:`containers-rebalance reference
-  <tsuru_admin_containers_rebalance_cmd>`.
+  details, see the `containers-rebalance reference
+  <http://tsuru-admin.readthedocs.org/en/latest/#containers-rebalance>`_.
 * memory swap limit is configurable (issue `#764
   <https://github.com/tsuru/tsuru/issues/764>`_)
 * added a command to add a new platform (issue `#780
   <https://github.com/tsuru/tsuru/issues/780>`_). For more details, see the
-  :ref:`platform-add reference <tsuru_admin_platform_add_cmd>`.
+  `platform-add reference <http://tsuru-admin.readthedocs.org/en/latest/#platform-add>`_.
+
+.. _backwards-0.4.0:
 
 Backwards incompatible changes
 ==============================

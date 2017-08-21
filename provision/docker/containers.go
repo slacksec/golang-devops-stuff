@@ -5,37 +5,34 @@
 package docker
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"sync"
+
+	"github.com/fsouza/go-dockerclient"
+	"github.com/pkg/errors"
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/tsuru/action"
 	"github.com/tsuru/tsuru/app"
+	"github.com/tsuru/tsuru/app/image"
 	tsuruErrors "github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/event"
 	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/net"
 	"github.com/tsuru/tsuru/provision"
-	"gopkg.in/mgo.v2/bson"
-	"io"
-	"math"
-	"sync"
+	"github.com/tsuru/tsuru/provision/docker/container"
+	"github.com/tsuru/tsuru/router/rebuild"
 )
-
-var (
-	appDBMutex sync.Mutex
-	logMutex   sync.Mutex
-)
-
-type progressLog struct {
-	Message string
-}
 
 type appLocker struct {
+	mut      sync.Mutex
 	refCount map[string]int
 }
 
-func (l *appLocker) lock(appName string) bool {
-	appDBMutex.Lock()
-	defer appDBMutex.Unlock()
+func (l *appLocker) Lock(appName string) bool {
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	if l.refCount == nil {
 		l.refCount = make(map[string]int)
 	}
@@ -51,289 +48,366 @@ func (l *appLocker) lock(appName string) bool {
 	return true
 }
 
-func (l *appLocker) unlock(appName string) {
-	appDBMutex.Lock()
-	defer appDBMutex.Unlock()
+func (l *appLocker) Unlock(appName string) {
+	l.mut.Lock()
+	defer l.mut.Unlock()
 	if l.refCount == nil {
 		return
 	}
 	l.refCount[appName]--
 	if l.refCount[appName] <= 0 {
 		l.refCount[appName] = 0
+		rebuild.RoutesRebuildOrEnqueue(appName)
 		app.ReleaseApplicationLock(appName)
 	}
 }
 
-var containerMovementErr = errors.New("Error moving some containers.")
-
-func logProgress(encoder *json.Encoder, format string, params ...interface{}) {
-	logMutex.Lock()
-	defer logMutex.Unlock()
-	encoder.Encode(progressLog{Message: fmt.Sprintf(format, params...)})
-}
-
-func handleMoveErrors(moveErrors chan error, encoder *json.Encoder) error {
-	hasError := false
+func (p *dockerProvisioner) HandleMoveErrors(moveErrors chan error, writer io.Writer) error {
+	multiErr := tsuruErrors.NewMultiError()
 	for err := range moveErrors {
-		errMsg := fmt.Sprintf("Error moving container: %s", err.Error())
-		log.Errorf(errMsg)
-		logProgress(encoder, errMsg)
-		hasError = true
+		multiErr.Add(err)
+		err = errors.Wrap(err, "Error moving container")
+		log.Error(err)
+		fmt.Fprintf(writer, "%s\n", err)
 	}
-	if hasError {
-		return containerMovementErr
+	if multiErr.Len() > 0 {
+		return multiErr
 	}
 	return nil
 }
 
-func runReplaceUnitsPipeline(w io.Writer, a provision.App, toRemoveContainers []container, toHosts ...string) ([]container, error) {
+func (p *dockerProvisioner) runReplaceUnitsPipeline(w io.Writer, a provision.App, toAdd map[string]*containersToAdd, toRemoveContainers []container.Container, imageID string, toHosts ...string) ([]container.Container, error) {
 	var toHost string
 	if len(toHosts) > 0 {
 		toHost = toHosts[0]
 	}
+	if w == nil {
+		w = ioutil.Discard
+	}
+	imageData, err := image.GetImageMetaData(imageID)
+	if err != nil {
+		return nil, err
+	}
+	evt, _ := w.(*event.Event)
 	args := changeUnitsPipelineArgs{
-		app:        a,
-		toRemove:   toRemoveContainers,
-		unitsToAdd: len(toRemoveContainers),
-		toHost:     toHost,
-		writer:     w,
+		app:         a,
+		toAdd:       toAdd,
+		toRemove:    toRemoveContainers,
+		toHost:      toHost,
+		writer:      w,
+		imageID:     imageID,
+		provisioner: p,
+		event:       evt,
+		exposedPort: imageData.ExposedPort,
+	}
+	var pipeline *action.Pipeline
+	if p.isDryMode {
+		pipeline = action.NewPipeline(
+			&provisionAddUnitsToHost,
+			&provisionRemoveOldUnits,
+		)
+	} else {
+		pipeline = action.NewPipeline(
+			&provisionAddUnitsToHost,
+			&bindAndHealthcheck,
+			&addNewRoutes,
+			&setRouterHealthcheck,
+			&removeOldRoutes,
+			&updateAppImage,
+			&provisionRemoveOldUnits,
+			&provisionUnbindOldUnits,
+		)
+	}
+	err = pipeline.Execute(args)
+	if err != nil {
+		return nil, err
+	}
+	return pipeline.Result().([]container.Container), nil
+}
+
+func (p *dockerProvisioner) runCreateUnitsPipeline(w io.Writer, a provision.App, toAdd map[string]*containersToAdd, imageID, exposedPort string) ([]container.Container, error) {
+	if w == nil {
+		w = ioutil.Discard
+	}
+	evt, _ := w.(*event.Event)
+	args := changeUnitsPipelineArgs{
+		app:         a,
+		toAdd:       toAdd,
+		writer:      w,
+		imageID:     imageID,
+		provisioner: p,
+		exposedPort: exposedPort,
+		event:       evt,
 	}
 	pipeline := action.NewPipeline(
 		&provisionAddUnitsToHost,
+		&bindAndHealthcheck,
 		&addNewRoutes,
-		&removeOldRoutes,
-		&provisionRemoveOldUnits,
+		&setRouterHealthcheck,
+		&updateAppImage,
 	)
 	err := pipeline.Execute(args)
 	if err != nil {
 		return nil, err
 	}
-	return pipeline.Result().([]container), nil
+	return pipeline.Result().([]container.Container), nil
 }
 
-func runCreateUnitsPipeline(w io.Writer, a provision.App, toAddCount int) ([]container, error) {
-	args := changeUnitsPipelineArgs{
-		app:        a,
-		unitsToAdd: toAddCount,
-		writer:     w,
+func (p *dockerProvisioner) MoveOneContainer(c container.Container, toHost string, errCh chan error, wg *sync.WaitGroup, writer io.Writer, locker container.AppLocker) container.Container {
+	if wg != nil {
+		defer wg.Done()
 	}
-	pipeline := action.NewPipeline(
-		&provisionAddUnitsToHost,
-		&addNewRoutes,
-	)
-	err := pipeline.Execute(args)
-	if err != nil {
-		return nil, err
-	}
-	return pipeline.Result().([]container), nil
-}
-
-func moveOneContainer(c container, toHost string, errors chan error, wg *sync.WaitGroup, encoder *json.Encoder, locker *appLocker) {
-	defer wg.Done()
-	locked := locker.lock(c.AppName)
+	locked := locker.Lock(c.AppName)
 	if !locked {
-		errors <- fmt.Errorf("Couldn't move %s, unable to lock %q.", c.ID, c.AppName)
-		return
+		errCh <- errors.Errorf("couldn't move %s, unable to lock %q", c.ID, c.AppName)
+		return container.Container{}
 	}
-	defer locker.unlock(c.AppName)
+	defer locker.Unlock(c.AppName)
 	a, err := app.GetByName(c.AppName)
 	if err != nil {
-		errors <- &tsuruErrors.CompositeError{
+		errCh <- &tsuruErrors.CompositeError{
 			Base:    err,
-			Message: fmt.Sprintf("Error getting app %q for unit %s.", c.AppName, c.ID),
+			Message: fmt.Sprintf("error getting app %q for unit %s", c.AppName, c.ID),
 		}
-		return
+		return container.Container{}
 	}
-	logProgress(encoder, "Moving unit %s for %q: %s -> %s...", c.ID, c.AppName, c.HostAddr, toHost)
-	addedContainers, err := runReplaceUnitsPipeline(nil, a, []container{c}, toHost)
+	imageID, err := image.AppCurrentImageName(a.GetName())
 	if err != nil {
-		errors <- &tsuruErrors.CompositeError{
+		errCh <- &tsuruErrors.CompositeError{
 			Base:    err,
-			Message: fmt.Sprintf("Error moving unit %s.", c.ID),
+			Message: fmt.Sprintf("error getting app %q image name for unit %s", c.AppName, c.ID),
 		}
-		return
+		return container.Container{}
 	}
-	logProgress(encoder, "Finished moving unit %s for %q.", c.ID, c.AppName)
-	addedUnit := addedContainers[0].asUnit(a)
-	err = a.BindUnit(&addedUnit)
+	var destHosts []string
+	var suffix string
+	if toHost != "" {
+		destHosts = []string{toHost}
+		suffix = " -> " + toHost
+	}
+	if !p.isDryMode {
+		fmt.Fprintf(writer, "Moving unit %s for %q from %s%s...\n", c.ID, c.AppName, c.HostAddr, suffix)
+	}
+	toAdd := map[string]*containersToAdd{c.ProcessName: {Quantity: 1, Status: c.ExpectedStatus()}}
+	addedContainers, err := p.runReplaceUnitsPipeline(nil, a, toAdd, []container.Container{c}, imageID, destHosts...)
 	if err != nil {
-		errors <- &tsuruErrors.CompositeError{
+		errCh <- &tsuruErrors.CompositeError{
 			Base:    err,
-			Message: fmt.Sprintf("Error binding unit %s to service instances.", c.ID),
+			Message: fmt.Sprintf("Error moving unit %s", c.ID),
 		}
-		return
+		return container.Container{}
 	}
-	logProgress(encoder, "Moved unit %s -> %s for %s with bindings.", c.ID, addedUnit.Name, c.AppName)
+	prefix := "Moved unit"
+	if p.isDryMode {
+		prefix = "Would move unit"
+	}
+	fmt.Fprintf(writer, "%s %s -> %s for %q from %s -> %s\n", prefix, c.ID, addedContainers[0].ID, c.AppName, c.HostAddr, addedContainers[0].HostAddr)
+	return addedContainers[0]
 }
 
-func moveContainer(contId string, toHost string, encoder *json.Encoder) error {
-	cont, err := getContainer(contId)
+func (p *dockerProvisioner) moveContainer(contId string, toHost string, writer io.Writer) (container.Container, error) {
+	cont, err := p.GetContainer(contId)
 	if err != nil {
-		return err
+		return container.Container{}, err
 	}
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	moveErrors := make(chan error, 1)
 	locker := &appLocker{}
-	moveOneContainer(*cont, toHost, moveErrors, &wg, encoder, locker)
+	createdContainer := p.MoveOneContainer(*cont, toHost, moveErrors, &wg, writer, locker)
 	close(moveErrors)
-	return handleMoveErrors(moveErrors, encoder)
+	return createdContainer, p.HandleMoveErrors(moveErrors, writer)
 }
 
-func moveContainers(fromHost, toHost string, encoder *json.Encoder) error {
-	containers, err := listContainersByHost(fromHost)
-	if err != nil {
-		return err
-	}
-	numberContainers := len(containers)
-	if numberContainers == 0 {
-		logProgress(encoder, "No units to move in %s.", fromHost)
-		return nil
-	}
-	logProgress(encoder, "Moving %d units...", numberContainers)
+func (p *dockerProvisioner) moveContainerList(containers []container.Container, toHost string, writer io.Writer) error {
 	locker := &appLocker{}
-	moveErrors := make(chan error, numberContainers)
+	moveErrors := make(chan error, len(containers))
 	wg := sync.WaitGroup{}
-	wg.Add(numberContainers)
+	wg.Add(len(containers))
 	for _, c := range containers {
-		go moveOneContainer(c, toHost, moveErrors, &wg, encoder, locker)
+		go p.MoveOneContainer(c, toHost, moveErrors, &wg, writer, locker)
 	}
 	go func() {
 		wg.Wait()
 		close(moveErrors)
 	}()
-	return handleMoveErrors(moveErrors, encoder)
+	return p.HandleMoveErrors(moveErrors, writer)
 }
 
-type hostWithContainers struct {
-	HostAddr   string `bson:"_id"`
-	Count      int
-	Containers []container
-}
-
-func minCountHost(hosts []hostWithContainers) *hostWithContainers {
-	var minCountHost *hostWithContainers
-	minCount := math.MaxInt32
-	for i, dest := range hosts {
-		if dest.Count < minCount {
-			minCount = dest.Count
-			minCountHost = &hosts[i]
-		}
-	}
-	return minCountHost
-}
-
-func rebalanceContainers(encoder *json.Encoder, dryRun bool) error {
-	coll := collection()
-	defer coll.Close()
-	fullDocQuery := bson.M{
-		// Could use $$ROOT instead of repeating fields but only in Mongo 2.6+.
-		"_id":      "$_id",
-		"id":       "$id",
-		"name":     "$name",
-		"appname":  "$appname",
-		"type":     "$type",
-		"ip":       "$ip",
-		"image":    "$image",
-		"hostaddr": "$hostaddr",
-		"hostport": "$hostport",
-		"status":   "$status",
-		"version":  "$version",
-	}
-	appsPipe := coll.Pipe([]bson.M{
-		{"$group": bson.M{"_id": "$appname", "count": bson.M{"$sum": 1}}},
-	})
-	var appsInfo []struct {
-		Name  string `bson:"_id"`
-		Count int
-	}
-	err := appsPipe.All(&appsInfo)
+func (p *dockerProvisioner) MoveContainers(fromHost, toHost string, writer io.Writer) error {
+	containers, err := p.listContainersByHost(fromHost)
 	if err != nil {
 		return err
 	}
-	clusterInstance := dockerCluster()
-	for _, appInfo := range appsInfo {
-		if appInfo.Count < 2 {
-			continue
-		}
-		logProgress(encoder, "Rebalancing app %q (%d units)...", appInfo.Name, appInfo.Count)
-		var possibleDests []cluster.Node
-		if isSegregateScheduler() {
-			possibleDests, err = nodesForAppName(clusterInstance, appInfo.Name)
-		} else {
-			possibleDests, err = clusterInstance.Nodes()
-		}
+	if len(containers) == 0 {
+		fmt.Fprintf(writer, "No units to move in %s\n", fromHost)
+		return nil
+	}
+	fmt.Fprintf(writer, "Moving %d units...\n", len(containers))
+	return p.moveContainerList(containers, toHost, writer)
+}
+
+func (p *dockerProvisioner) rebalanceContainersByFilter(writer io.Writer, appFilter []string, metadataFilter map[string]string, dryRun bool) (*dockerProvisioner, error) {
+	var hostsFilter []string
+	if metadataFilter != nil {
+		nodes, err := p.cluster.UnfilteredNodesForMetadata(metadataFilter)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		maxContPerUnit := int(math.Ceil(float64(appInfo.Count) / float64(len(possibleDests))))
-		pipe := coll.Pipe([]bson.M{
-			{"$match": bson.M{"hostaddr": bson.M{"$ne": ""}, "appname": appInfo.Name}},
-			{"$group": bson.M{
-				"_id":        "$hostaddr",
-				"count":      bson.M{"$sum": 1},
-				"containers": bson.M{"$push": fullDocQuery}}},
-		})
-		var hosts []hostWithContainers
-		hostsSet := make(map[string]bool)
-		err = pipe.All(&hosts)
-		if err != nil {
-			return err
+		for _, n := range nodes {
+			hostsFilter = append(hostsFilter, net.URLToHost(n.Address))
 		}
-		for _, host := range hosts {
-			hostsSet[host.HostAddr] = true
-		}
-		for _, node := range possibleDests {
-			hostAddr := urlToHost(node.Address)
-			_, present := hostsSet[hostAddr]
-			if !present {
-				hosts = append(hosts, hostWithContainers{HostAddr: hostAddr})
-			}
-		}
-		anythingDone := false
-		for _, host := range hosts {
-			toMoveCount := host.Count - maxContPerUnit
-			if toMoveCount <= 0 {
-				continue
-			}
-			anythingDone = true
-			logProgress(encoder, "Trying to move %d units for %q from %s...", toMoveCount, appInfo.Name, host.HostAddr)
-			locker := &appLocker{}
-			wg := sync.WaitGroup{}
-			moveErrors := make(chan error, toMoveCount)
-			for _, cont := range host.Containers {
-				minDest := minCountHost(hosts)
-				if minDest.Count < maxContPerUnit {
-					toMoveCount--
-					minDest.Count++
-					if dryRun {
-						logProgress(encoder, "Would move unit %s for %q: %s -> %s...", cont.ID, appInfo.Name, cont.HostAddr, minDest.HostAddr)
-					} else {
-						wg.Add(1)
-						go moveOneContainer(cont, minDest.HostAddr, moveErrors, &wg, encoder, locker)
-					}
-				}
-				if toMoveCount == 0 {
-					break
-				}
-			}
-			if toMoveCount > 0 {
-				logProgress(encoder, "Couldn't find suitable destination for %d units for app %q", toMoveCount, appInfo.Name)
-			}
-			go func() {
-				wg.Wait()
-				close(moveErrors)
-			}()
-			err := handleMoveErrors(moveErrors, encoder)
-			if err != nil {
-				return err
-			}
-		}
-		if anythingDone {
-			logProgress(encoder, "Rebalance finished for %q", appInfo.Name)
-		} else {
-			logProgress(encoder, "Nothing to do for %q", appInfo.Name)
+		if len(hostsFilter) == 0 {
+			fmt.Fprintf(writer, "No hosts matching metadata filters\n")
+			return nil, nil
 		}
 	}
+	containers, err := p.listContainersByAppAndHost(appFilter, hostsFilter)
+	if err != nil {
+		return nil, err
+	}
+	if len(containers) == 0 {
+		fmt.Fprintf(writer, "No containers found to rebalance\n")
+		return nil, nil
+	}
+	if dryRun {
+		p, err = p.dryMode(containers)
+		if err != nil {
+			return nil, err
+		}
+		defer p.stopDryMode()
+	} else {
+		// Create isolated provisioner, this allow us to use modify the
+		// scheduler to exclude old containers.
+		p, err = p.cloneProvisioner(containers)
+		if err != nil {
+			return nil, err
+		}
+	}
+	fmt.Fprintf(writer, "Rebalancing %d units...\n", len(containers))
+	return p, p.moveContainerList(containers, "", writer)
+}
+
+func (p *dockerProvisioner) rebalanceContainersByHost(address string, w io.Writer) error {
+	containers, err := p.listContainersByHost(address)
+	if err != nil {
+		return err
+	}
+	return p.moveContainerList(containers, "", w)
+}
+
+func (p *dockerProvisioner) rebalanceContainers(writer io.Writer, dryRun bool) error {
+	_, err := p.rebalanceContainersByFilter(writer, nil, nil, dryRun)
+	return err
+}
+
+func (p *dockerProvisioner) runCommandInContainer(image string, command string, app provision.App, stdout, stderr io.Writer) error {
+	if stdout == nil {
+		stdout = ioutil.Discard
+	}
+	if stderr == nil {
+		stderr = ioutil.Discard
+	}
+	var envs []string
+	for _, e := range provision.EnvsForApp(app, "", false) {
+		envs = append(envs, fmt.Sprintf("%s=%s", e.Name, e.Value))
+	}
+	createOptions := docker.CreateContainerOptions{
+		Config: &docker.Config{
+			AttachStdout: true,
+			AttachStderr: true,
+			Image:        image,
+			Entrypoint:   []string{"/bin/bash", "-c"},
+			Cmd:          []string{command},
+			Env:          envs,
+		},
+	}
+	cluster := p.Cluster()
+	schedOpts := &container.SchedulerOpts{
+		AppName:       app.GetName(),
+		ActionLimiter: p.ActionLimiter(),
+	}
+	addr, cont, err := cluster.CreateContainerSchedulerOpts(createOptions, schedOpts, net.StreamInactivityTimeout)
+	hostAddr := net.URLToHost(addr)
+	if schedOpts.LimiterDone != nil {
+		schedOpts.LimiterDone()
+	}
+	if err != nil {
+		return err
+	}
+	defer func() {
+		done := p.ActionLimiter().Start(hostAddr)
+		cluster.RemoveContainer(docker.RemoveContainerOptions{ID: cont.ID, Force: true})
+		done()
+	}()
+	attachOptions := docker.AttachToContainerOptions{
+		Container:    cont.ID,
+		OutputStream: stdout,
+		ErrorStream:  stderr,
+		Stream:       true,
+		Stdout:       true,
+		Stderr:       true,
+		Success:      make(chan struct{}),
+	}
+	waiter, err := cluster.AttachToContainerNonBlocking(attachOptions)
+	if err != nil {
+		return err
+	}
+	<-attachOptions.Success
+	close(attachOptions.Success)
+	done := p.ActionLimiter().Start(hostAddr)
+	err = cluster.StartContainer(cont.ID, nil)
+	done()
+	if err != nil {
+		return err
+	}
+	waiter.Wait()
 	return nil
+}
+
+func (p *dockerProvisioner) runningContainersByNode(nodes []*cluster.Node) (map[string][]container.Container, error) {
+	appNames, err := p.listAppsForNodes(nodes)
+	if err != nil {
+		return nil, err
+	}
+	for _, appName := range appNames {
+		locked, err := app.AcquireApplicationLock(appName, app.InternalAppName, "node auto scale")
+		if err != nil {
+			return nil, err
+		}
+		if !locked {
+			return nil, errors.Errorf("unable to lock app %q for container count", appName)
+		}
+		defer app.ReleaseApplicationLock(appName)
+	}
+	result := map[string][]container.Container{}
+	for _, n := range nodes {
+		nodeConts, err := p.listRunningContainersByHost(net.URLToHost(n.Address))
+		if err != nil {
+			return nil, err
+		}
+		result[n.Address] = nodeConts
+	}
+	return result, nil
+}
+
+func (p *dockerProvisioner) containerGapInNodes(nodes []*cluster.Node) (int, int, error) {
+	maxCount := 0
+	minCount := -1
+	totalCount := 0
+	containersMap, err := p.runningContainersByNode(nodes)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, containers := range containersMap {
+		contCount := len(containers)
+		if contCount > maxCount {
+			maxCount = contCount
+		}
+		if minCount == -1 || contCount < minCount {
+			minCount = contCount
+		}
+		totalCount += contCount
+	}
+	return totalCount, maxCount - minCount, nil
 }

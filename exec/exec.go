@@ -1,8 +1,8 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package exec provides a interface to run external commans as an
+// Package exec provides a interface to run external commands as an
 // abstraction layer.
 package exec
 
@@ -16,6 +16,7 @@ type ExecuteOptions struct {
 	Cmd    string
 	Args   []string
 	Envs   []string
+	Dir    string
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
@@ -34,5 +35,6 @@ func (OsExecutor) Execute(opts ExecuteOptions) error {
 	c.Stdout = opts.Stdout
 	c.Stderr = opts.Stderr
 	c.Env = opts.Envs
+	c.Dir = opts.Dir
 	return c.Run()
 }

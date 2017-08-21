@@ -1,11 +1,11 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package app
 
 import (
-	"errors"
+	"github.com/pkg/errors"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/quota"
 	"gopkg.in/mgo.v2"
@@ -44,7 +44,7 @@ func checkAppLimit(name string, quantity int) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	if app.Quota.Limit > -1 && app.Quota.InUse+quantity > app.Quota.Limit {
+	if !app.Quota.Unlimited() && app.Quota.InUse+quantity > app.Quota.Limit {
 		return nil, &quota.QuotaExceededError{
 			Available: uint(app.Quota.Limit - app.Quota.InUse),
 			Requested: uint(quantity),
@@ -89,4 +89,30 @@ func checkAppUsage(name string, quantity int) (*App, error) {
 		return nil, errors.New("Not enough reserved units")
 	}
 	return app, nil
+}
+
+// ChangeQuota redefines the limit of the app. The new limit must be bigger
+// than or equal to the current number of units in the app. The new limit may be
+// smaller than 0, which means that the app should have an unlimited number of
+// units.
+func ChangeQuota(app *App, limit int) error {
+	if limit < 0 {
+		limit = -1
+	} else if limit < app.Quota.InUse {
+		return errors.New("new limit is lesser than the current allocated value")
+	}
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	err = conn.Apps().Update(
+		bson.M{"name": app.Name},
+		bson.M{"$set": bson.M{"quota.limit": limit}},
+	)
+	if err != nil {
+		return err
+	}
+	app.Quota.Limit = limit
+	return nil
 }

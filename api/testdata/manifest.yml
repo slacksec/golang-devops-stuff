@@ -1,5 +1,0 @@
-id: mysqlapi
-password: yyyy
-endpoint:
-  production: mysqlapi.com
-  test: localhost:8000

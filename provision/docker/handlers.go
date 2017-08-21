@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -7,337 +7,317 @@ package docker
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/tsuru/tsuru/api"
-	"github.com/tsuru/tsuru/auth"
-	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/errors"
-	"github.com/tsuru/tsuru/iaas"
-	_ "github.com/tsuru/tsuru/iaas/cloudstack"
-	_ "github.com/tsuru/tsuru/iaas/ec2"
-	"gopkg.in/mgo.v2"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/ajg/form"
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/api"
+	"github.com/tsuru/tsuru/app"
+	"github.com/tsuru/tsuru/auth"
+	tsuruErrors "github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/event"
+	_ "github.com/tsuru/tsuru/iaas/cloudstack"
+	_ "github.com/tsuru/tsuru/iaas/digitalocean"
+	_ "github.com/tsuru/tsuru/iaas/dockermachine"
+	_ "github.com/tsuru/tsuru/iaas/ec2"
+	tsuruIo "github.com/tsuru/tsuru/io"
+	"github.com/tsuru/tsuru/permission"
+	"github.com/tsuru/tsuru/provision/docker/container"
 )
 
 func init() {
-	api.RegisterHandler("/docker/node", "GET", api.AdminRequiredHandler(listNodeHandler))
-	api.RegisterHandler("/docker/node/apps/{appname}/containers", "GET", api.AdminRequiredHandler(listContainersHandler))
-	api.RegisterHandler("/docker/node/{address}/containers", "GET", api.AdminRequiredHandler(listContainersHandler))
-	api.RegisterHandler("/docker/node", "POST", api.AdminRequiredHandler(addNodeHandler))
-	api.RegisterHandler("/docker/node", "DELETE", api.AdminRequiredHandler(removeNodeHandler))
-	api.RegisterHandler("/docker/container/{id}/move", "POST", api.AdminRequiredHandler(moveContainerHandler))
-	api.RegisterHandler("/docker/containers/move", "POST", api.AdminRequiredHandler(moveContainersHandler))
-	api.RegisterHandler("/docker/containers/rebalance", "POST", api.AdminRequiredHandler(rebalanceContainersHandler))
-	api.RegisterHandler("/docker/pool", "GET", api.AdminRequiredHandler(listPoolHandler))
-	api.RegisterHandler("/docker/pool", "POST", api.AdminRequiredHandler(addPoolHandler))
-	api.RegisterHandler("/docker/pool", "DELETE", api.AdminRequiredHandler(removePoolHandler))
-	api.RegisterHandler("/docker/pool/team", "POST", api.AdminRequiredHandler(addTeamToPoolHandler))
-	api.RegisterHandler("/docker/pool/team", "DELETE", api.AdminRequiredHandler(removeTeamToPoolHandler))
-	api.RegisterHandler("/docker/fix-containers", "POST", api.AdminRequiredHandler(fixContainersHandler))
-	api.RegisterHandler("/docker/ssh/{container_id}", "GET", api.AdminRequiredHandler(sshToContainerHandler))
+	api.RegisterHandler("/docker/container/{id}/move", "POST", api.AuthorizationRequiredHandler(moveContainerHandler))
+	api.RegisterHandler("/docker/containers/move", "POST", api.AuthorizationRequiredHandler(moveContainersHandler))
+	api.RegisterHandler("/docker/bs/upgrade", "POST", api.AuthorizationRequiredHandler(bsUpgradeHandler))
+	api.RegisterHandler("/docker/bs/env", "POST", api.AuthorizationRequiredHandler(bsEnvSetHandler))
+	api.RegisterHandler("/docker/bs", "GET", api.AuthorizationRequiredHandler(bsConfigGetHandler))
+	api.RegisterHandler("/docker/logs", "GET", api.AuthorizationRequiredHandler(logsConfigGetHandler))
+	api.RegisterHandler("/docker/logs", "POST", api.AuthorizationRequiredHandler(logsConfigSetHandler))
 }
 
-func validateNodeAddress(address string) error {
-	if address == "" {
-		return fmt.Errorf("address=url parameter is required")
-	}
-	url, err := url.ParseRequestURI(address)
+// title: move container
+// path: /docker/container/{id}/move
+// method: POST
+// consume: application/x-www-form-urlencoded
+// produce: application/x-json-stream
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   404: Not found
+func moveContainerHandler(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	err = r.ParseForm()
 	if err != nil {
-		return fmt.Errorf("Invalid address url: %s", err.Error())
+		return &tsuruErrors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
 	}
-	if url.Host == "" {
-		return fmt.Errorf("Invalid address url: host cannot be empty")
-	}
-	if !strings.HasPrefix(url.Scheme, "http") {
-		return fmt.Errorf("Invalid address url: scheme must be http[s]")
-	}
-	return nil
-}
-
-func addNodeForParams(params map[string]string, isRegister bool) (map[string]string, error) {
-	response := make(map[string]string)
-	var address string
-	if isRegister {
-		address, _ = params["address"]
-		delete(params, "address")
-	} else {
-		iaasName, _ := params["iaas"]
-		desc, err := iaas.Describe(iaasName)
-		if err != nil {
-			return response, err
-		}
-		response["description"] = desc
-		var m *iaas.Machine
-		if iaasName != "" {
-			m, err = iaas.CreateMachineForIaaS(iaasName, params)
-		} else {
-			m, err = iaas.CreateMachine(params)
-		}
-		if err != nil {
-			return response, err
-		}
-		nodeAddress, err := m.FormatNodeAddress()
-		if err != nil {
-			return response, err
-		}
-		params["iaas"] = m.Iaas
-		address = nodeAddress
-	}
-	err := validateNodeAddress(address)
+	params := map[string]string{}
+	dec := form.NewDecoder(nil)
+	dec.IgnoreUnknownKeys(true)
+	err = dec.DecodeValues(&params, r.Form)
 	if err != nil {
-		return response, err
-	}
-	err = dockerCluster().Register(address, params)
-	if err != nil {
-		return response, err
-	}
-	return response, err
-}
-
-// addNodeHandler can provide an machine and/or register a node address.
-// If register flag is true, it will just register a node.
-// It checks if node address is valid and accessible.
-func addNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	params, err := unmarshal(r.Body)
-	if err != nil {
-		return err
-	}
-	isRegister, _ := strconv.ParseBool(r.URL.Query().Get("register"))
-	response, err := addNodeForParams(params, isRegister)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		response["error"] = err.Error()
-	}
-	return json.NewEncoder(w).Encode(response)
-}
-
-// removeNodeHandler calls scheduler.Unregister to unregistering a node into it.
-func removeNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	params, err := unmarshal(r.Body)
-	if err != nil {
-		return err
-	}
-	address, _ := params["address"]
-	if address == "" {
-		return fmt.Errorf("Node address is required.")
-	}
-	err = dockerCluster().Unregister(address)
-	if err != nil {
-		return err
-	}
-	removeIaaS, _ := strconv.ParseBool(params["remove_iaas"])
-	if removeIaaS {
-		m, err := iaas.FindMachineByAddress(urlToHost(address))
-		if err != nil && err != mgo.ErrNotFound {
-			return err
-		}
-		return m.Destroy()
-	}
-	return nil
-}
-
-//listNodeHandler call scheduler.Nodes to list all nodes into it.
-func listNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	nodeList, err := dockerCluster().UnfilteredNodes()
-	if err != nil {
-		return err
-	}
-	machines, err := iaas.ListMachines()
-	if err != nil {
-		return err
-	}
-	result := map[string]interface{}{
-		"nodes":    nodeList,
-		"machines": machines,
-	}
-	return json.NewEncoder(w).Encode(result)
-}
-
-func fixContainersHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	err := fixContainers()
-	if err != nil {
-		return err
-	}
-	w.WriteHeader(http.StatusNoContent)
-	return nil
-}
-
-func moveContainerHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	params, err := unmarshal(r.Body)
-	if err != nil {
-		return err
+		return &tsuruErrors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
 	}
 	contId := r.URL.Query().Get(":id")
 	to := params["to"]
 	if to == "" {
-		return fmt.Errorf("Invalid params: id: %s - to: %s", contId, to)
+		return errors.Errorf("Invalid params: id: %s - to: %s", contId, to)
 	}
-	encoder := json.NewEncoder(w)
-	err = moveContainer(contId, to, encoder)
+	cont, err := mainDockerProvisioner.GetContainer(contId)
 	if err != nil {
-		logProgress(encoder, "Error trying to move container: %s", err.Error())
-	} else {
-		logProgress(encoder, "Containers moved successfully!")
+		return &tsuruErrors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
 	}
+	permContexts, err := moveContainersPermissionContexts(cont.HostAddr, to)
+	if err != nil {
+		return err
+	}
+	if !permission.Check(t, permission.PermNodeUpdateMoveContainer, permContexts...) {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     event.Target{Type: event.TargetTypeContainer, Value: contId},
+		Kind:       permission.PermNodeUpdateMoveContainer,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermPoolReadEvents, permContexts...),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	w.Header().Set("Content-Type", "application/x-json-stream")
+	keepAliveWriter := tsuruIo.NewKeepAliveWriter(w, 15*time.Second, "")
+	defer keepAliveWriter.Stop()
+	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(keepAliveWriter)}
+	_, err = mainDockerProvisioner.moveContainer(contId, to, writer)
+	if err != nil {
+		return errors.Wrap(err, "Error trying to move container")
+	}
+	fmt.Fprintf(writer, "Containers moved successfully!\n")
 	return nil
 }
 
-func moveContainersHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	params, err := unmarshal(r.Body)
+// title: move containers
+// path: /docker/containers/move
+// method: POST
+// consume: application/x-www-form-urlencoded
+// produce: application/x-json-stream
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   404: Not found
+func moveContainersHandler(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	err = r.ParseForm()
 	if err != nil {
-		return err
+		return &tsuruErrors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
+	}
+	params := map[string]string{}
+	dec := form.NewDecoder(nil)
+	dec.IgnoreUnknownKeys(true)
+	err = dec.DecodeValues(&params, r.Form)
+	if err != nil {
+		return &tsuruErrors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
 	}
 	from := params["from"]
 	to := params["to"]
 	if from == "" || to == "" {
-		return fmt.Errorf("Invalid params: from: %s - to: %s", from, to)
+		return errors.Errorf("Invalid params: from: %s - to: %s", from, to)
 	}
-	encoder := json.NewEncoder(w)
-	err = moveContainers(from, to, encoder)
+	permContexts, err := moveContainersPermissionContexts(from, to)
 	if err != nil {
-		logProgress(encoder, "Error: %s", err.Error())
-	} else {
-		logProgress(encoder, "Containers moved successfully!")
+		return err
+	}
+	if !permission.Check(t, permission.PermNodeUpdateMoveContainers, permContexts...) {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     event.Target{Type: event.TargetTypeNode, Value: from},
+		Kind:       permission.PermNodeUpdateMoveContainers,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermPoolReadEvents, permContexts...),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	w.Header().Set("Content-Type", "application/x-json-stream")
+	keepAliveWriter := tsuruIo.NewKeepAliveWriter(w, 15*time.Second, "")
+	defer keepAliveWriter.Stop()
+	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(keepAliveWriter)}
+	err = mainDockerProvisioner.MoveContainers(from, to, writer)
+	if err != nil {
+		return errors.Wrap(err, "Error trying to move containers")
+	}
+	fmt.Fprintf(writer, "Containers moved successfully!\n")
+	return nil
+}
+
+func moveContainersPermissionContexts(from, to string) ([]permission.PermissionContext, error) {
+	originHost, err := mainDockerProvisioner.GetNodeByHost(from)
+	if err != nil {
+		return nil, &tsuruErrors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
+	}
+	destinationHost, err := mainDockerProvisioner.GetNodeByHost(to)
+	if err != nil {
+		return nil, &tsuruErrors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
+	}
+	var permContexts []permission.PermissionContext
+	originPool, ok := originHost.Metadata["pool"]
+	if ok {
+		permContexts = append(permContexts, permission.Context(permission.CtxPool, originPool))
+	}
+	if pool, ok := destinationHost.Metadata["pool"]; ok && pool != originPool {
+		permContexts = append(permContexts, permission.Context(permission.CtxPool, pool))
+	}
+	return permContexts, nil
+}
+
+func bsEnvSetHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	return errors.New("this route is deprecated, please use POST /docker/nodecontainer/{name} (node-container-update command)")
+}
+
+func bsConfigGetHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	return errors.New("this route is deprecated, please use GET /docker/nodecontainer/{name} (node-container-info command)")
+}
+
+func bsUpgradeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	return errors.New("this route is deprecated, please use POST /docker/nodecontainer/{name}/upgrade (node-container-upgrade command)")
+}
+
+// title: logs config
+// path: /docker/logs
+// method: GET
+// produce: application/json
+// responses:
+//   200: Ok
+//   401: Unauthorized
+func logsConfigGetHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	pools, err := permission.ListContextValues(t, permission.PermPoolUpdateLogs, true)
+	if err != nil {
+		return err
+	}
+	configEntries, err := container.LogLoadAll()
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if len(pools) == 0 {
+		return json.NewEncoder(w).Encode(configEntries)
+	}
+	newMap := map[string]container.DockerLogConfig{}
+	for _, p := range pools {
+		if entry, ok := configEntries[p]; ok {
+			newMap[p] = entry
+		}
+	}
+	return json.NewEncoder(w).Encode(newMap)
+}
+
+// title: logs config set
+// path: /docker/logs
+// method: POST
+// consume: application/x-www-form-urlencoded
+// produce: application/x-json-stream
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+func logsConfigSetHandler(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	err = r.ParseForm()
+	if err != nil {
+		return &tsuruErrors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: fmt.Sprintf("unable to parse form values: %s", err),
+		}
+	}
+	pool := r.FormValue("pool")
+	restart, _ := strconv.ParseBool(r.FormValue("restart"))
+	delete(r.Form, "pool")
+	delete(r.Form, "restart")
+	var conf container.DockerLogConfig
+	dec := form.NewDecoder(nil)
+	dec.IgnoreUnknownKeys(true)
+	err = dec.DecodeValues(&conf, r.Form)
+	if err != nil {
+		return &tsuruErrors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: fmt.Sprintf("unable to parse fields in docker log config: %s", err),
+		}
+	}
+	var ctxs []permission.PermissionContext
+	if pool != "" {
+		ctxs = append(ctxs, permission.Context(permission.CtxPool, pool))
+	}
+	hasPermission := permission.Check(t, permission.PermPoolUpdateLogs, ctxs...)
+	if !hasPermission {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:      event.Target{Type: event.TargetTypePool, Value: pool},
+		Kind:        permission.PermPoolUpdateLogs,
+		Owner:       t,
+		CustomData:  event.FormToCustomData(r.Form),
+		DisableLock: true,
+		Allowed:     event.Allowed(permission.PermPoolReadEvents, ctxs...),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	err = conf.Save(pool)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/x-json-stream")
+	keepAliveWriter := tsuruIo.NewKeepAliveWriter(w, 15*time.Second, "")
+	defer keepAliveWriter.Stop()
+	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(keepAliveWriter)}
+	fmt.Fprintln(writer, "Log config successfully updated.")
+	if restart {
+		filter := &app.Filter{}
+		if pool != "" {
+			filter.Pools = []string{pool}
+		}
+		return tryRestartAppsByFilter(filter, writer)
 	}
 	return nil
 }
 
-func rebalanceContainersHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	dry := false
-	params, err := unmarshal(r.Body)
-	if err == nil {
-		dry = params["dry"] == "true"
-	}
-	encoder := json.NewEncoder(w)
-	err = rebalanceContainers(encoder, dry)
+func tryRestartAppsByFilter(filter *app.Filter, writer io.Writer) error {
+	apps, err := app.List(filter)
 	if err != nil {
-		logProgress(encoder, "Error trying to rebalance containers: %s", err.Error())
-	} else {
-		logProgress(encoder, "Containers rebalanced successfully!")
+		return err
 	}
+	if len(apps) == 0 {
+		return nil
+	}
+	appNames := make([]string, len(apps))
+	for i, a := range apps {
+		appNames[i] = a.Name
+	}
+	sort.Strings(appNames)
+	fmt.Fprintf(writer, "Restarting %d applications: [%s]\n", len(apps), strings.Join(appNames, ", "))
+	wg := sync.WaitGroup{}
+	for i := range apps {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			a := apps[i]
+			err := a.Restart("", writer)
+			if err != nil {
+				fmt.Fprintf(writer, "Error: unable to restart %s: %s\n", a.Name, err.Error())
+			} else {
+				fmt.Fprintf(writer, "App %s successfully restarted\n", a.Name)
+			}
+		}(i)
+	}
+	wg.Wait()
 	return nil
-}
-
-//listContainersHandler call scheduler.Containers to list all containers into it.
-func listContainersHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	address := r.URL.Query().Get(":address")
-	if address != "" {
-		containerList, err := listContainersByHost(address)
-		if err != nil {
-			return err
-		}
-		return json.NewEncoder(w).Encode(containerList)
-	}
-	app := r.URL.Query().Get(":appname")
-	containerList, err := listContainersByApp(app)
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(w).Encode(containerList)
-}
-
-func addPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	params, err := unmarshal(r.Body)
-	if err != nil {
-		return err
-	}
-	var segScheduler segregatedScheduler
-	return segScheduler.addPool(params["pool"])
-}
-
-func removePoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	params, err := unmarshal(r.Body)
-	if err != nil {
-		return err
-	}
-	var segScheduler segregatedScheduler
-	return segScheduler.removePool(params["pool"])
-}
-
-func listPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	var pools []Pool
-	err = conn.Collection(schedulerCollection).Find(nil).All(&pools)
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(w).Encode(pools)
-}
-
-type teamsToPoolParams struct {
-	Pool  string   `json:"pool"`
-	Teams []string `json:"teams"`
-}
-
-func addTeamToPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	var params teamsToPoolParams
-	err = json.Unmarshal(b, &params)
-	if err != nil {
-		return err
-	}
-	var segScheduler segregatedScheduler
-	return segScheduler.addTeamsToPool(params.Pool, params.Teams)
-}
-
-func removeTeamToPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	var params teamsToPoolParams
-	err = json.Unmarshal(b, &params)
-	if err != nil {
-		return err
-	}
-	var segScheduler segregatedScheduler
-	return segScheduler.removeTeamsFromPool(params.Pool, params.Teams)
-}
-
-func unmarshal(body io.ReadCloser) (map[string]string, error) {
-	b, err := ioutil.ReadAll(body)
-	if err != nil {
-		return nil, err
-	}
-	params := map[string]string{}
-	err = json.Unmarshal(b, &params)
-	if err != nil {
-		return nil, err
-	}
-	return params, nil
-}
-
-func sshToContainerHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	containerID := r.URL.Query().Get(":container_id")
-	container, err := getContainer(containerID)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
-	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		return &errors.HTTP{
-			Code:    http.StatusInternalServerError,
-			Message: "cannot hijack connection",
-		}
-	}
-	conn, _, err := hj.Hijack()
-	if err != nil {
-		return &errors.HTTP{
-			Code:    http.StatusInternalServerError,
-			Message: err.Error(),
-		}
-	}
-	defer conn.Close()
-	return container.shell(conn, conn, conn)
 }

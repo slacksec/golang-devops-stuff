@@ -1,78 +1,66 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package api
 
 import (
-	"github.com/gorilla/context"
+	"net/http"
+	"testing"
+
+	"golang.org/x/crypto/bcrypt"
+
+	stdcontext "context"
+
 	"github.com/tsuru/config"
+
 	"github.com/tsuru/tsuru/app"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/auth/native"
+	"github.com/tsuru/tsuru/autoscale"
 	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/quota"
+	"github.com/tsuru/tsuru/db/dbtest"
+	"github.com/tsuru/tsuru/permission"
+	"github.com/tsuru/tsuru/permission/permissiontest"
+	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/pool"
+	"github.com/tsuru/tsuru/provision/provisiontest"
+	"github.com/tsuru/tsuru/repository"
+	"github.com/tsuru/tsuru/repository/repositorytest"
+	"github.com/tsuru/tsuru/router/routertest"
 	"github.com/tsuru/tsuru/service"
-	tsuruTesting "github.com/tsuru/tsuru/testing"
-	"io"
-	"io/ioutil"
-	"launchpad.net/gocheck"
-	"net/http"
-	"os"
-	"path"
-	"testing"
+	_ "github.com/tsuru/tsuru/storage/mongodb"
+	appTypes "github.com/tsuru/tsuru/types/app"
+	authTypes "github.com/tsuru/tsuru/types/auth"
+	"gopkg.in/check.v1"
 )
 
-type testHandler struct {
-	body    [][]byte
-	method  []string
-	url     []string
-	content string
-	header  []http.Header
-}
-
-func (h *testHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.method = append(h.method, r.Method)
-	h.url = append(h.url, r.URL.String())
-	b, _ := ioutil.ReadAll(r.Body)
-	h.body = append(h.body, b)
-	h.header = append(h.header, r.Header)
-	w.Write([]byte(h.content))
-}
-
-type testBadHandler struct{}
-
-func (h *testBadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "some error", http.StatusInternalServerError)
-}
-
-func Test(t *testing.T) { gocheck.TestingT(t) }
+func Test(t *testing.T) { check.TestingT(t) }
 
 type S struct {
 	conn        *db.Storage
-	team        *auth.Team
+	logConn     *db.LogStorage
+	team        *authTypes.Team
 	user        *auth.User
 	token       auth.Token
-	adminteam   *auth.Team
-	adminuser   *auth.User
-	admintoken  auth.Token
-	t           *tsuruTesting.T
-	provisioner *tsuruTesting.FakeProvisioner
+	provisioner *provisiontest.FakeProvisioner
+	Pool        string
+	testServer  http.Handler
 }
 
-var _ = gocheck.Suite(&S{})
+var _ = check.Suite(&S{})
 
 type hasAccessToChecker struct{}
 
-func (c *hasAccessToChecker) Info() *gocheck.CheckerInfo {
-	return &gocheck.CheckerInfo{Name: "HasAccessTo", Params: []string{"team", "service"}}
+func (c *hasAccessToChecker) Info() *check.CheckerInfo {
+	return &check.CheckerInfo{Name: "HasAccessTo", Params: []string{"team", "service"}}
 }
 
 func (c *hasAccessToChecker) Check(params []interface{}, names []string) (bool, string) {
 	if len(params) != 2 {
 		return false, "you must provide two parameters"
 	}
-	team, ok := params[0].(auth.Team)
+	team, ok := params[0].(authTypes.Team)
 	if !ok {
 		return false, "first parameter should be a team instance"
 	}
@@ -83,57 +71,87 @@ func (c *hasAccessToChecker) Check(params []interface{}, names []string) (bool, 
 	return srv.HasTeam(&team), ""
 }
 
-var HasAccessTo gocheck.Checker = &hasAccessToChecker{}
+var HasAccessTo check.Checker = &hasAccessToChecker{}
 
-func (s *S) createUserAndTeam(c *gocheck.C) {
-	s.user = &auth.User{Email: "whydidifall@thewho.com", Password: "123456", Quota: quota.Unlimited}
-	_, err := nativeScheme.Create(s.user)
-	c.Assert(err, gocheck.IsNil)
-	s.adminuser = &auth.User{Email: "myadmin@arrakis.com", Password: "123456", Quota: quota.Unlimited}
-	_, err = nativeScheme.Create(s.adminuser)
-	c.Assert(err, gocheck.IsNil)
-	s.team = &auth.Team{Name: "tsuruteam", Users: []string{s.user.Email}}
-	err = s.conn.Teams().Insert(s.team)
-	c.Assert(err, gocheck.IsNil)
-	s.adminteam = &auth.Team{Name: "admin", Users: []string{s.adminuser.Email}}
-	err = s.conn.Teams().Insert(s.adminteam)
-	c.Assert(err, gocheck.IsNil)
-	s.token, err = nativeScheme.Login(map[string]string{"email": s.user.Email, "password": "123456"})
-	c.Assert(err, gocheck.IsNil)
-	s.admintoken, err = nativeScheme.Login(map[string]string{"email": s.adminuser.Email, "password": "123456"})
-	c.Assert(err, gocheck.IsNil)
+func (s *S) createUserAndTeam(c *check.C) {
+	// TODO: remove this token from the suite, each test should create their
+	// own user with specific permissions.
+	_, s.token = permissiontest.CustomUserWithPermission(c, nativeScheme, "super-root-toremove", permission.Permission{
+		Scheme:  permission.PermAll,
+		Context: permission.Context(permission.CtxGlobal, ""),
+	})
+	var err error
+	s.user, err = s.token.User()
+	c.Assert(err, check.IsNil)
+	s.team = &authTypes.Team{Name: "tsuruteam"}
+	err = auth.TeamService().Insert(*s.team)
+	c.Assert(err, check.IsNil)
 }
 
 var nativeScheme = auth.ManagedScheme(native.NativeScheme{})
 
-func (s *S) SetUpSuite(c *gocheck.C) {
+func (s *S) SetUpSuite(c *check.C) {
 	err := config.ReadConfigFile("testdata/config.yaml")
+	c.Assert(err, check.IsNil)
+	config.Set("log:disable-syslog", true)
+	config.Set("database:url", "127.0.0.1:27017")
+	config.Set("database:name", "tsuru_api_base_test")
+	config.Set("auth:hash-cost", bcrypt.MinCost)
+	s.testServer = RunServer(true)
+}
+
+func (s *S) SetUpTest(c *check.C) {
+	config.Set("routers:fake:default", true)
+	config.Set("routers:fake-tls:type", "fake-tls")
+	routertest.FakeRouter.Reset()
+	routertest.TLSRouter.Reset()
+	repositorytest.Reset()
+	var err error
 	s.conn, err = db.Conn()
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
+	dbtest.ClearAllCollections(s.conn.Apps().Database)
+	s.logConn, err = db.LogConn()
+	c.Assert(err, check.IsNil)
+	dbtest.ClearAllCollections(s.logConn.Logs("myapp").Database)
 	s.createUserAndTeam(c)
-	s.t = &tsuruTesting.T{}
-	s.provisioner = tsuruTesting.NewFakeProvisioner()
-	app.Provisioner = s.provisioner
-	app.AuthScheme = nativeScheme
-	p := app.Platform{Name: "zend"}
-	s.conn.Platforms().Insert(p)
-}
-
-func (s *S) TearDownSuite(c *gocheck.C) {
-	s.conn.Apps().Database.DropDatabase()
-}
-
-func (s *S) TearDownTest(c *gocheck.C) {
-	s.t.RollbackGitConfs(c)
+	s.provisioner = provisiontest.ProvisionerInstance
 	s.provisioner.Reset()
-	context.Purge(-1)
+	provision.DefaultProvisioner = "fake"
+	app.AuthScheme = nativeScheme
+	p := appTypes.Platform{Name: "zend"}
+	app.PlatformService().Insert(p)
+	app.PlatformService().Insert(appTypes.Platform{Name: "heimerdinger"})
+	s.Pool = "test1"
+	opts := pool.AddPoolOptions{Name: "test1", Default: true}
+	err = pool.AddPool(opts)
+	c.Assert(err, check.IsNil)
+	repository.Manager().CreateUser(s.user.Email)
 }
 
-func (s *S) getTestData(p ...string) io.ReadCloser {
-	p = append([]string{}, ".", "testdata")
-	fp := path.Join(p...)
-	f, _ := os.OpenFile(fp, os.O_RDONLY, 0)
-	return f
+func (s *S) TearDownTest(c *check.C) {
+	cfg, _ := autoscale.CurrentConfig()
+	if cfg != nil {
+		cfg.Shutdown(stdcontext.Background())
+	}
+	s.provisioner.Reset()
+	s.conn.Close()
+	s.logConn.Close()
+}
+
+func (s *S) TearDownSuite(c *check.C) {
+	conn, err := db.Conn()
+	c.Assert(err, check.IsNil)
+	defer conn.Close()
+	conn.Apps().Database.DropDatabase()
+	logConn, err := db.LogConn()
+	c.Assert(err, check.IsNil)
+	defer logConn.Close()
+	logConn.Logs("myapp").Database.DropDatabase()
+}
+
+func userWithPermission(c *check.C, perm ...permission.Permission) auth.Token {
+	_, token := permissiontest.CustomUserWithPermission(c, nativeScheme, "majortom", perm...)
+	return token
 }
 
 func resetHandlers() {

@@ -2,78 +2,158 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package provision provides interfaces that need to be satisfied in order to
+// Package iaas provides interfaces that need to be satisfied in order to
 // implement a new iaas on tsuru.
 package iaas
 
 import (
 	"fmt"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/db/storage"
 	"github.com/tsuru/tsuru/log"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
+
+var (
+	iaasDurationBuckets = append([]float64{10, 30}, prometheus.LinearBuckets(60, 60, 10)...)
+
+	machineCreateDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "tsuru_iaas_create_duration_seconds",
+		Help:    "The machine creation latency distributions.",
+		Buckets: iaasDurationBuckets,
+	}, []string{"iaas"})
+
+	machineDestroyDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "tsuru_iaas_destroy_duration_seconds",
+		Help:    "The machine destroy latency distributions.",
+		Buckets: iaasDurationBuckets,
+	}, []string{"iaas"})
+
+	machineCreateErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tsuru_iaas_create_errors_total",
+		Help: "The total number of machine creation errors.",
+	}, []string{"iaas"})
+
+	machineDestroyErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tsuru_iaas_destroy_errors_total",
+		Help: "The total number of machine destroy errors.",
+	}, []string{"iaas"})
+)
+
+func init() {
+	prometheus.MustRegister(machineCreateDuration)
+	prometheus.MustRegister(machineDestroyDuration)
+	prometheus.MustRegister(machineCreateErrors)
+	prometheus.MustRegister(machineDestroyErrors)
+}
 
 type Machine struct {
 	Id             string `bson:"_id"`
 	Iaas           string
 	Status         string
 	Address        string
+	Port           int
+	Protocol       string
 	CreationParams map[string]string
+	CustomData     map[string]interface{} `json:"-"`
+	CaCert         []byte                 `json:"-"`
+	ClientCert     []byte                 `json:"-"`
+	ClientKey      []byte                 `json:"-"`
 }
 
 func CreateMachine(params map[string]string) (*Machine, error) {
-	defaultIaaS, err := config.GetString("iaas:default")
-	if err != nil {
-		defaultIaaS = "ec2"
-	}
-	return CreateMachineForIaaS(defaultIaaS, params)
+	return CreateMachineForIaaS("", params)
 }
 
 func CreateMachineForIaaS(iaasName string, params map[string]string) (*Machine, error) {
+	if iaasName == "" {
+		iaasName = params["iaas"]
+	}
+	if iaasName == "" {
+		defaultIaaS, err := getDefaultIaasName()
+		if err != nil {
+			return nil, err
+		}
+		iaasName = defaultIaaS
+	}
+	params["iaas"] = iaasName
 	iaas, err := getIaasProvider(iaasName)
 	if err != nil {
 		return nil, err
 	}
-	paramsCopy := make(map[string]string)
-	for k, v := range params {
-		paramsCopy[k] = v
-	}
-	m, err := iaas.CreateMachine(paramsCopy)
+	t0 := time.Now()
+	m, err := iaas.CreateMachine(params)
+	machineCreateDuration.WithLabelValues(iaasName).Observe(time.Since(t0).Seconds())
 	if err != nil {
+		machineCreateErrors.WithLabelValues(iaasName).Inc()
 		return nil, err
 	}
+	params["iaas-id"] = m.Id
 	m.Iaas = iaasName
 	m.CreationParams = params
 	err = m.saveToDB()
 	if err != nil {
+		m.Destroy()
 		return nil, err
 	}
 	return m, nil
 }
 
 func ListMachines() ([]Machine, error) {
-	coll := collection()
+	coll, err := collection()
+	if err != nil {
+		return nil, err
+	}
 	defer coll.Close()
 	var result []Machine
-	err := coll.Find(nil).All(&result)
+	err = coll.Find(nil).All(&result)
+	return result, err
+}
+
+// Uses id or address, this is only used because previously we didn't have
+// iaas-id in node metadata.
+func FindMachineByIdOrAddress(id string, address string) (Machine, error) {
+	coll, err := collection()
+	if err != nil {
+		return Machine{}, err
+	}
+	defer coll.Close()
+	var result Machine
+	query := bson.M{}
+	if id != "" {
+		query["_id"] = id
+	} else {
+		query["address"] = address
+	}
+	err = coll.Find(query).One(&result)
 	return result, err
 }
 
 func FindMachineByAddress(address string) (Machine, error) {
-	coll := collection()
+	coll, err := collection()
+	if err != nil {
+		return Machine{}, err
+	}
 	defer coll.Close()
 	var result Machine
-	err := coll.Find(bson.M{"address": address}).One(&result)
+	err = coll.Find(bson.M{"address": address}).One(&result)
 	return result, err
 }
 
 func FindMachineById(id string) (Machine, error) {
-	coll := collection()
+	coll, err := collection()
+	if err != nil {
+		return Machine{}, err
+	}
 	defer coll.Close()
 	var result Machine
-	err := coll.FindId(id).One(&result)
+	err = coll.FindId(id).One(&result)
 	return result, err
 }
 
@@ -82,39 +162,54 @@ func (m *Machine) Destroy() error {
 	if err != nil {
 		return err
 	}
+	t0 := time.Now()
 	err = iaas.DeleteMachine(m)
+	machineDestroyDuration.WithLabelValues(m.Iaas).Observe(time.Since(t0).Seconds())
 	if err != nil {
-		return err
+		machineDestroyErrors.WithLabelValues(m.Iaas).Inc()
+		log.Errorf("failed to destroy machine in the IaaS: %s", err)
 	}
 	return m.removeFromDB()
 }
 
-func (m *Machine) FormatNodeAddress() (string, error) {
-	protocol, err := config.GetString("iaas:node-protocol")
-	if err != nil {
-		return "", err
+func (m *Machine) FormatNodeAddress() string {
+	protocol := m.Protocol
+	if protocol == "" {
+		protocol, _ = config.GetString("iaas:node-protocol")
 	}
-	port, err := config.GetInt("iaas:node-port")
-	if err != nil {
-		return "", err
+	if protocol == "" {
+		protocol = "http"
 	}
-	return fmt.Sprintf("%s://%s:%d", protocol, m.Address, port), nil
+	port := m.Port
+	if port == 0 {
+		port, _ = config.GetInt("iaas:node-port")
+	}
+	if port == 0 {
+		port = 2375
+	}
+	return fmt.Sprintf("%s://%s:%d", protocol, m.Address, port)
 }
 
 func (m *Machine) saveToDB() error {
-	coll := collection()
+	coll, err := collectionEnsureIdx()
+	if err != nil {
+		return err
+	}
 	defer coll.Close()
-	_, err := coll.UpsertId(m.Id, m)
+	_, err = coll.UpsertId(m.Id, m)
 	return err
 }
 
 func (m *Machine) removeFromDB() error {
-	coll := collection()
+	coll, err := collection()
+	if err != nil {
+		return err
+	}
 	defer coll.Close()
 	return coll.Remove(bson.M{"_id": m.Id})
 }
 
-func collection() *storage.Collection {
+func collection() (*storage.Collection, error) {
 	name, err := config.GetString("iaas:collection")
 	if err != nil {
 		name = "iaas_machines"
@@ -122,6 +217,28 @@ func collection() *storage.Collection {
 	conn, err := db.Conn()
 	if err != nil {
 		log.Errorf("Failed to connect to the database: %s", err)
+		return nil, err
 	}
-	return conn.Collection(name)
+	return conn.Collection(name), nil
+}
+
+func collectionEnsureIdx() (*storage.Collection, error) {
+	coll, err := collection()
+	if err != nil {
+		return nil, err
+	}
+	index := mgo.Index{
+		Key:    []string{"address"},
+		Unique: true,
+	}
+	err = coll.EnsureIndex(index)
+	if err != nil {
+		coll.Close()
+		return nil, errors.Errorf(`Could not create index on address for machines collection.
+This can be caused by multiple machines with the same address, please run
+"tsuru machine-list" to check for duplicated entries and "tsuru
+machine-destroy" to remove them.
+original error: %s`, err)
+	}
+	return coll, nil
 }

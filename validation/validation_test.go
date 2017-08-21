@@ -1,27 +1,29 @@
-// Copyright 2013 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package validation
 
 import (
-	"launchpad.net/gocheck"
 	"testing"
+
+	"gopkg.in/check.v1"
 )
 
 type S struct{}
 
-var _ = gocheck.Suite(&S{})
+var _ = check.Suite(&S{})
 
 func Test(t *testing.T) {
-	gocheck.TestingT(t)
+	check.TestingT(t)
 }
 
-func (s *S) TestValidateEmail(c *gocheck.C) {
+func (s *S) TestValidateEmail(c *check.C) {
 	var data = []struct {
 		input    string
 		expected bool
 	}{
+		{"test+testing@example.com", true},
 		{"gopher.golang@corp.globo.com", true},
 		{"gopher@corp.globo.com", true},
 		{"gopher@souza.cc", true},
@@ -34,11 +36,11 @@ func (s *S) TestValidateEmail(c *gocheck.C) {
 		{"invalid@validate", false},
 	}
 	for _, d := range data {
-		c.Assert(ValidateEmail(d.input), gocheck.Equals, d.expected)
+		c.Assert(ValidateEmail(d.input), check.Equals, d.expected)
 	}
 }
 
-func (s *S) TestValidateLength(c *gocheck.C) {
+func (s *S) TestValidateLength(c *check.C) {
 	var data = []struct {
 		input    string
 		min      int
@@ -50,6 +52,29 @@ func (s *S) TestValidateLength(c *gocheck.C) {
 		{"gopher", -1, 3, false},
 	}
 	for _, d := range data {
-		c.Assert(ValidateLength(d.input, d.min, d.max), gocheck.Equals, d.expected)
+		c.Assert(ValidateLength(d.input, d.min, d.max), check.Equals, d.expected)
+	}
+}
+
+func (s *S) TestValidateName(c *check.C) {
+	var data = []struct {
+		input    string
+		expected bool
+	}{
+		{"myappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyapp", false},
+		{"myappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyap", false},
+		{"myappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmya", true},
+		{"myApp", false},
+		{"my app", false},
+		{"123myapp", false},
+		{"myapp", true},
+		{"_theirapp", false},
+		{"my-app", true},
+		{"-myapp", false},
+		{"my_app", false},
+		{"b", true},
+	}
+	for _, d := range data {
+		c.Assert(ValidateName(d.input), check.Equals, d.expected)
 	}
 }

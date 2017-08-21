@@ -5,15 +5,17 @@
 package cmd
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/tsuru/tsuru/exec"
 	"io/ioutil"
 	"net"
 	"net/http"
-	"runtime"
+	"net/url"
 	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/exec"
+	tsuruNet "github.com/tsuru/tsuru/net"
 )
 
 var execut exec.Executor
@@ -59,57 +61,39 @@ func port(schemeData map[string]string) string {
 	return ":0"
 }
 
-func open(url string) error {
-	var opts exec.ExecuteOptions
-	opts = exec.ExecuteOptions{
-		Cmd:  "open",
-		Args: []string{url},
-	}
-	if runtime.GOOS == "linux" {
-		opts = exec.ExecuteOptions{
-			Cmd:  "xdg-open",
-			Args: []string{url},
-		}
-	}
-	return executor().Execute(opts)
-}
-
-func convertToken(code, redirectUrl string) (string, error) {
+func convertToken(code, redirectURL string) (string, error) {
 	var token string
-	params := map[string]string{"code": code, "redirectUrl": redirectUrl}
+	v := url.Values{}
+	v.Set("code", code)
+	v.Set("redirectUrl", redirectURL)
 	u, err := GetURL("/auth/login")
 	if err != nil {
-		return token, fmt.Errorf("Error in GetURL: %s", err.Error())
+		return token, errors.Wrap(err, "Error in GetURL")
 	}
-	var buf bytes.Buffer
-	err = json.NewEncoder(&buf).Encode(params)
+	resp, err := tsuruNet.Dial5Full300Client.Post(u, "application/x-www-form-urlencoded", strings.NewReader(v.Encode()))
 	if err != nil {
-		return token, fmt.Errorf("Error encoding params %#v: %s", params, err.Error())
-	}
-	resp, err := http.Post(u, "application/json", &buf)
-	if err != nil {
-		return token, fmt.Errorf("Error during login post: %s", err.Error())
+		return token, errors.Wrap(err, "Error during login post")
 	}
 	defer resp.Body.Close()
 	result, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return token, fmt.Errorf("Error reading body: %s", err.Error())
+		return token, errors.Wrap(err, "Error reading body")
 	}
 	data := make(map[string]interface{})
 	err = json.Unmarshal(result, &data)
 	if err != nil {
-		return token, fmt.Errorf("Error parsing response: %s - %s", result, err.Error())
+		return token, errors.Wrapf(err, "Error parsing response: %s", result)
 	}
 	return data["token"].(string), nil
 }
 
-func callback(redirectUrl string, finish chan bool) http.HandlerFunc {
+func callback(redirectURL string, finish chan bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			finish <- true
 		}()
 		var page string
-		token, err := convertToken(r.URL.Query().Get("code"), redirectUrl)
+		token, err := convertToken(r.URL.Query().Get("code"), redirectURL)
 		if err == nil {
 			writeToken(token)
 			page = fmt.Sprintf(callbackPage, successMarkup)
@@ -133,12 +117,17 @@ func (c *login) oauthLogin(context *Context, client *Client) error {
 	if err != nil {
 		return err
 	}
-	redirectUrl := fmt.Sprintf("http://localhost:%s", port)
-	authUrl := strings.Replace(schemeData["authorizeUrl"], "__redirect_url__", redirectUrl, 1)
-	http.HandleFunc("/", callback(redirectUrl, finish))
+	redirectURL := fmt.Sprintf("http://localhost:%s", port)
+	authURL := strings.Replace(schemeData["authorizeUrl"], "__redirect_url__", redirectURL, 1)
+	http.HandleFunc("/", callback(redirectURL, finish))
 	server := &http.Server{}
 	go server.Serve(l)
-	open(authUrl)
+	err = open(authURL)
+	if err != nil {
+		fmt.Fprintln(context.Stdout, "Failed to start your browser.")
+		fmt.Fprintf(context.Stdout, "Please open the following URL in your browser: %s\n", authURL)
+	}
 	<-finish
+	fmt.Fprintln(context.Stdout, "Successfully logged in!")
 	return nil
 }

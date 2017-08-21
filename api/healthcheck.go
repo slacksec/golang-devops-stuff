@@ -1,28 +1,41 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package api
 
 import (
+	"bytes"
 	"fmt"
-	"github.com/tsuru/tsuru/db"
 	"net/http"
+
+	"github.com/tsuru/tsuru/hc"
 )
 
+// title: healthcheck
+// path: /healthcheck
+// method: GET
+// responses:
+//   200: OK
+//   500: Internal server error
 func healthcheck(w http.ResponseWriter, r *http.Request) {
-	conn, err := db.Conn()
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Failed to connect to MongoDB: %s", err)
+	if r.URL.Query().Get("check") == "all" {
+		fullHealthcheck(w, r)
 		return
 	}
-	defer conn.Close()
-	err = conn.Apps().Database.Session.Ping()
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Failed to ping MongoDB: %s", err)
-		return
+	w.Write([]byte(hc.HealthCheckOK))
+}
+
+func fullHealthcheck(w http.ResponseWriter, r *http.Request) {
+	var buf bytes.Buffer
+	results := hc.Check()
+	status := http.StatusOK
+	for _, result := range results {
+		fmt.Fprintf(&buf, "%s: %s (%s)\n", result.Name, result.Status, result.Duration)
+		if result.Status != hc.HealthCheckOK {
+			status = http.StatusInternalServerError
+		}
 	}
-	w.Write([]byte("WORKING"))
+	w.WriteHeader(status)
+	w.Write(buf.Bytes())
 }

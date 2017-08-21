@@ -1,12 +1,14 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package auth
 
 import (
-	"errors"
 	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/permission"
 )
 
 type Token interface {
@@ -15,6 +17,7 @@ type Token interface {
 	GetUserName() string
 	IsAppToken() bool
 	User() (*User, error)
+	Permissions() ([]permission.Permission, error)
 }
 
 var ErrInvalidToken = errors.New("Invalid token")
@@ -31,4 +34,35 @@ func ParseToken(header string) (string, error) {
 		return value, nil
 	}
 	return value, ErrInvalidToken
+}
+
+func BaseTokenPermission(t Token) ([]permission.Permission, error) {
+	if t.IsAppToken() {
+		// TODO(cezarsa): Improve handling of app tokens. These permissions
+		// listed here are the ones required by deploy-agent and legacy tsuru-
+		// unit-agent.
+		return []permission.Permission{
+			{
+				Scheme:  permission.PermAppUpdateUnitRegister,
+				Context: permission.Context(permission.CtxApp, t.GetAppName()),
+			},
+			{
+				Scheme:  permission.PermAppUpdateLog,
+				Context: permission.Context(permission.CtxApp, t.GetAppName()),
+			},
+			{
+				Scheme:  permission.PermAppUpdateUnitStatus,
+				Context: permission.Context(permission.CtxApp, t.GetAppName()),
+			},
+			{
+				Scheme:  permission.PermAppReadDeploy,
+				Context: permission.Context(permission.CtxApp, t.GetAppName()),
+			},
+		}, nil
+	}
+	user, err := t.User()
+	if err != nil {
+		return nil, err
+	}
+	return user.Permissions()
 }

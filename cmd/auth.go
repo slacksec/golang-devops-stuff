@@ -1,108 +1,24 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package cmd
 
 import (
-	"bytes"
-	"code.google.com/p/go.crypto/ssh/terminal"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"launchpad.net/gnuflag"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strings"
+
+	"github.com/pkg/errors"
+	tsuruNet "github.com/tsuru/tsuru/net"
+	"golang.org/x/crypto/ssh/terminal"
 )
-
-type userCreate struct{}
-
-func (c *userCreate) Info() *Info {
-	return &Info{
-		Name:    "user-create",
-		Usage:   "user-create <email>",
-		Desc:    "creates a user.",
-		MinArgs: 1,
-	}
-}
-
-func (c *userCreate) Run(context *Context, client *Client) error {
-	url, err := GetURL("/users")
-	if err != nil {
-		return err
-	}
-	email := context.Args[0]
-	fmt.Fprint(context.Stdout, "Password: ")
-	password, err := passwordFromReader(context.Stdin)
-	if err != nil {
-		return err
-	}
-	fmt.Fprint(context.Stdout, "\nConfirm: ")
-	confirm, err := passwordFromReader(context.Stdin)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(context.Stdout)
-	if password != confirm {
-		return errors.New("Passwords didn't match.")
-	}
-	b := bytes.NewBufferString(`{"email":"` + email + `", "password":"` + password + `"}`)
-	request, err := http.NewRequest("POST", url, b)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(request)
-	if resp != nil {
-		if resp.StatusCode == http.StatusNotFound ||
-			resp.StatusCode == http.StatusMethodNotAllowed {
-			return errors.New("User creation is disabled.")
-		}
-	}
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(context.Stdout, `User "%s" successfully created!`+"\n", email)
-	return nil
-}
-
-type userRemove struct{}
-
-func (c *userRemove) Run(context *Context, client *Client) error {
-	var answer string
-	fmt.Fprint(context.Stdout, `Are you sure you want to remove your user from tsuru? (y/n) `)
-	fmt.Fscanf(context.Stdin, "%s", &answer)
-	if answer != "y" {
-		fmt.Fprintln(context.Stdout, "Abort.")
-		return nil
-	}
-	url, err := GetURL("/users")
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	filesystem().Remove(JoinWithUserDir(".tsuru_token"))
-	fmt.Fprint(context.Stdout, "User successfully removed.\n")
-	return nil
-}
-
-func (c *userRemove) Info() *Info {
-	return &Info{
-		Name:    "user-remove",
-		Usage:   "user-remove",
-		Desc:    "removes your user from tsuru server.",
-		MinArgs: 0,
-	}
-}
 
 type loginScheme struct {
 	Name string
@@ -114,22 +30,31 @@ type login struct {
 }
 
 func nativeLogin(context *Context, client *Client) error {
-	email := context.Args[0]
+	var email string
+	if len(context.Args) > 0 {
+		email = context.Args[0]
+	} else {
+		fmt.Fprint(context.Stdout, "Email: ")
+		fmt.Fscanf(context.Stdin, "%s\n", &email)
+	}
 	fmt.Fprint(context.Stdout, "Password: ")
-	password, err := passwordFromReader(context.Stdin)
+	password, err := PasswordFromReader(context.Stdin)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(context.Stdout)
-	url, err := GetURL("/users/" + email + "/tokens")
+	u, err := GetURL("/users/" + email + "/tokens")
 	if err != nil {
 		return err
 	}
-	b := bytes.NewBufferString(`{"password":"` + password + `"}`)
-	request, err := http.NewRequest("POST", url, b)
+	v := url.Values{}
+	v.Set("password", password)
+	b := strings.NewReader(v.Encode())
+	request, err := http.NewRequest("POST", u, b)
 	if err != nil {
 		return err
 	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, err := client.Do(request)
 	if err != nil {
 		return err
@@ -152,7 +77,6 @@ func (c *login) getScheme() *loginScheme {
 	if c.scheme == nil {
 		info, err := schemeInfo()
 		if err != nil {
-			fmt.Printf("Error trying to figure auth scheme, using native as fallback: %s\n", err.Error())
 			c.scheme = &loginScheme{Name: "native", Data: make(map[string]string)}
 		} else {
 			c.scheme = info
@@ -165,25 +89,28 @@ func (c *login) Run(context *Context, client *Client) error {
 	if c.getScheme().Name == "oauth" {
 		return c.oauthLogin(context, client)
 	}
+	if c.getScheme().Name == "saml" {
+		return c.samlLogin(context, client)
+	}
 	return nativeLogin(context, client)
 }
 
-func (c *login) Name() string {
-	return "login"
-}
-
 func (c *login) Info() *Info {
-	args := 1
-	usage := "login <email>"
-	if c.getScheme().Name == "oauth" {
-		usage = "login"
-		args = 0
-	}
+	usage := "login [email]"
 	return &Info{
-		Name:    c.Name(),
-		Usage:   usage,
-		Desc:    "log in with your credentials.",
-		MinArgs: args,
+		Name:  "login",
+		Usage: usage,
+		Desc: `Initiates a new tsuru session for a user. If using tsuru native authentication
+scheme, it will ask for the email and the password and check if the user is
+successfully authenticated. If using OAuth, it will open a web browser for the
+user to complete the login.
+
+After that, the token generated by the tsuru server will be stored in
+[[${HOME}/.tsuru/token]].
+
+All tsuru actions require the user to be authenticated (except [[tsuru login]]
+and [[tsuru version]]).`,
+		MinArgs: 0,
 	}
 }
 
@@ -193,7 +120,7 @@ func (c *logout) Info() *Info {
 	return &Info{
 		Name:  "logout",
 		Usage: "logout",
-		Desc:  "clear local authentication credentials.",
+		Desc:  "Logout will terminate the session with the tsuru server.",
 	}
 }
 
@@ -202,7 +129,7 @@ func (c *logout) Run(context *Context, client *Client) error {
 		request, _ := http.NewRequest("DELETE", url, nil)
 		client.Do(request)
 	}
-	err := filesystem().Remove(JoinWithUserDir(".tsuru_token"))
+	err := filesystem().Remove(JoinWithUserDir(".tsuru", "token"))
 	if err != nil && os.IsNotExist(err) {
 		return errors.New("You're not logged in!")
 	}
@@ -210,333 +137,99 @@ func (c *logout) Run(context *Context, client *Client) error {
 	return nil
 }
 
-type teamCreate struct{}
-
-func (c *teamCreate) Info() *Info {
-	return &Info{
-		Name:    "team-create",
-		Usage:   "team-create <teamname>",
-		Desc:    "creates a new team.",
-		MinArgs: 1,
-	}
+type APIRolePermissionData struct {
+	Name         string
+	ContextType  string
+	ContextValue string
 }
 
-func (c *teamCreate) Run(context *Context, client *Client) error {
-	team := context.Args[0]
-	b := bytes.NewBufferString(fmt.Sprintf(`{"name":"%s"}`, team))
-	url, err := GetURL("/teams")
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("POST", url, b)
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(context.Stdout, `Team "%s" successfully created!`+"\n", team)
-	return nil
+// APIUser is a user in the tsuru API.
+type APIUser struct {
+	Email       string
+	Roles       []APIRolePermissionData
+	Permissions []APIRolePermissionData
 }
 
-type teamRemove struct{}
-
-func (c *teamRemove) Run(context *Context, client *Client) error {
-	team := context.Args[0]
-	var answer string
-	fmt.Fprintf(context.Stdout, `Are you sure you want to remove team "%s"? (y/n) `, team)
-	fmt.Fscanf(context.Stdin, "%s", &answer)
-	if answer != "y" {
-		fmt.Fprintln(context.Stdout, "Abort.")
-		return nil
+func (u *APIUser) RoleInstances() []string {
+	roles := make([]string, len(u.Roles))
+	for i, r := range u.Roles {
+		if r.ContextValue != "" {
+			r.ContextValue = " " + r.ContextValue
+		}
+		roles[i] = fmt.Sprintf("%s(%s%s)", r.Name, r.ContextType, r.ContextValue)
 	}
-	url, err := GetURL(fmt.Sprintf("/teams/%s", team))
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(context.Stdout, `Team "%s" successfully removed!`+"\n", team)
-	return nil
+	sort.Strings(roles)
+	return roles
 }
 
-func (c *teamRemove) Info() *Info {
-	return &Info{
-		Name:    "team-remove",
-		Usage:   "team-remove <team-name>",
-		Desc:    "removes a team from tsuru server.",
-		MinArgs: 1,
+func (u *APIUser) PermissionInstances() []string {
+	permissions := make([]string, len(u.Permissions))
+	for i, r := range u.Permissions {
+		if r.Name == "" {
+			r.Name = "*"
+		}
+		if r.ContextValue != "" {
+			r.ContextValue = " " + r.ContextValue
+		}
+		permissions[i] = fmt.Sprintf("%s(%s%s)", r.Name, r.ContextType, r.ContextValue)
 	}
+	sort.Strings(permissions)
+	return permissions
 }
 
-type teamUserAdd struct{}
-
-func (c *teamUserAdd) Info() *Info {
-	return &Info{
-		Name:    "team-user-add",
-		Usage:   "team-user-add <teamname> <useremail>",
-		Desc:    "adds a user to a team.",
-		MinArgs: 2,
-	}
-}
-
-func (c *teamUserAdd) Run(context *Context, client *Client) error {
-	teamName, userName := context.Args[0], context.Args[1]
-	url, err := GetURL(fmt.Sprintf("/teams/%s/%s", teamName, userName))
+func GetUser(client *Client) (*APIUser, error) {
+	url, err := GetURL("/users/info")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	request, err := http.NewRequest("PUT", url, nil)
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(context.Stdout, `User "%s" was added to the "%s" team`+"\n", userName, teamName)
-	return nil
-}
-
-type teamUserRemove struct{}
-
-func (c *teamUserRemove) Info() *Info {
-	return &Info{
-		Name:    "team-user-remove",
-		Usage:   "team-user-remove <teamname> <useremail>",
-		Desc:    "removes a user from a team.",
-		MinArgs: 2,
-	}
-}
-
-func (c *teamUserRemove) Run(context *Context, client *Client) error {
-	teamName, userName := context.Args[0], context.Args[1]
-	url, err := GetURL(fmt.Sprintf("/teams/%s/%s", teamName, userName))
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(context.Stdout, `User "%s" was removed from the "%s" team`+"\n", userName, teamName)
-	return nil
-}
-
-type teamUserList struct{}
-
-func (teamUserList) Run(context *Context, client *Client) error {
-	teamName := context.Args[0]
-	url, err := GetURL("/teams/" + teamName)
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
+	request, _ := http.NewRequest("GET", url, nil)
 	resp, err := client.Do(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	var t struct{ Users []string }
-	err = json.NewDecoder(resp.Body).Decode(&t)
+	var u APIUser
+	err = json.NewDecoder(resp.Body).Decode(&u)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+type userInfo struct{}
+
+func (userInfo) Info() *Info {
+	return &Info{
+		Name:  "user-info",
+		Usage: "user-info",
+		Desc:  "Displays information about the current user.",
+	}
+}
+
+func (userInfo) Run(context *Context, client *Client) error {
+	u, err := GetUser(client)
 	if err != nil {
 		return err
 	}
-	sort.Strings(t.Users)
-	for _, user := range t.Users {
-		fmt.Fprintf(context.Stdout, "- %s\n", user)
+	fmt.Fprintf(context.Stdout, "Email: %s\n", u.Email)
+	roles := u.RoleInstances()
+	if len(roles) > 0 {
+		fmt.Fprintf(context.Stdout, "Roles:\n\t%s\n", strings.Join(roles, "\n\t"))
+	}
+	perms := u.PermissionInstances()
+	if len(perms) > 0 {
+		fmt.Fprintf(context.Stdout, "Permissions:\n\t%s\n", strings.Join(perms, "\n\t"))
 	}
 	return nil
 }
 
-func (teamUserList) Info() *Info {
-	return &Info{
-		Name:    "team-user-list",
-		Usage:   "team-user-list <teamname>",
-		Desc:    "List members of a team.",
-		MinArgs: 1,
-	}
-}
-
-type teamList struct{}
-
-func (c *teamList) Info() *Info {
-	return &Info{
-		Name:    "team-list",
-		Usage:   "team-list",
-		Desc:    "List all teams that you are member.",
-		MinArgs: 0,
-	}
-}
-
-func (c *teamList) Run(context *Context, client *Client) error {
-	url, err := GetURL("/teams")
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == http.StatusOK {
-		defer resp.Body.Close()
-		b, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		var teams []map[string]string
-		err = json.Unmarshal(b, &teams)
-		if err != nil {
-			return err
-		}
-		io.WriteString(context.Stdout, "Teams:\n\n")
-		for _, team := range teams {
-			fmt.Fprintf(context.Stdout, "  - %s\n", team["name"])
-		}
-	}
-	return nil
-}
-
-type changePassword struct{}
-
-func (c *changePassword) Run(context *Context, client *Client) error {
-	url, err := GetURL("/users/password")
-	if err != nil {
-		return err
-	}
-	var body bytes.Buffer
-	fmt.Fprint(context.Stdout, "Current password: ")
-	old, err := passwordFromReader(context.Stdin)
-	if err != nil {
-		return err
-	}
-	fmt.Fprint(context.Stdout, "\nNew password: ")
-	new, err := passwordFromReader(context.Stdin)
-	if err != nil {
-		return err
-	}
-	fmt.Fprint(context.Stdout, "\nConfirm: ")
-	confirm, err := passwordFromReader(context.Stdin)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(context.Stdout)
-	if new != confirm {
-		return errors.New("New password and password confirmation didn't match.")
-	}
-	jsonBody := map[string]string{
-		"old": old,
-		"new": new,
-	}
-	err = json.NewEncoder(&body).Encode(jsonBody)
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("PUT", url, &body)
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(context.Stdout, "Password successfully updated!")
-	return nil
-}
-
-func (c *changePassword) Info() *Info {
-	return &Info{
-		Name:  "change-password",
-		Usage: "change-password",
-		Desc:  "Change your password.",
-	}
-}
-
-type resetPassword struct {
-	token string
-}
-
-func (c *resetPassword) Info() *Info {
-	return &Info{
-		Name:  "reset-password",
-		Usage: "reset-password <email> [--token|-t <token>]",
-		Desc: `Redefines the user password.
-
-This process is composed by two steps:
-
-1. Generate a new token
-2. Reset the password using the token
-
-In order to generate the token, users should run this command without the --token flag.
-The token will be mailed to the user.
-
-With the token in hand, the user can finally reset the password using the --token flag.
-The new password will also be mailed to the user.`,
-		MinArgs: 1,
-	}
-}
-
-func (c *resetPassword) msg() string {
-	if c.token == "" {
-		return `You've successfully started the password reset process.
-
-Please check your email.`
-	}
-	return `Your password has been redefined and mailed to you.
-
-Please check your email.`
-}
-
-func (c *resetPassword) Run(context *Context, client *Client) error {
-	url := fmt.Sprintf("/users/%s/password", context.Args[0])
-	if c.token != "" {
-		url += "?token=" + c.token
-	}
-	url, err := GetURL(url)
-	if err != nil {
-		return err
-	}
-	request, _ := http.NewRequest("POST", url, nil)
-	_, err = client.Do(request)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(context.Stdout, c.msg())
-	return nil
-}
-
-func (c *resetPassword) Flags() *gnuflag.FlagSet {
-	fs := gnuflag.NewFlagSet("reset-password", gnuflag.ExitOnError)
-	fs.StringVar(&c.token, "token", "", "Token to reset the password")
-	fs.StringVar(&c.token, "t", "", "Token to reset the password")
-	return fs
-}
-
-func passwordFromReader(reader io.Reader) (string, error) {
+func PasswordFromReader(reader io.Reader) (string, error) {
 	var (
 		password []byte
 		err      error
 	)
-	if file, ok := reader.(*os.File); ok && terminal.IsTerminal(int(file.Fd())) {
-		password, err = terminal.ReadPassword(int(file.Fd()))
+	if desc, ok := reader.(descriptable); ok && terminal.IsTerminal(int(desc.Fd())) {
+		password, err = terminal.ReadPassword(int(desc.Fd()))
 		if err != nil {
 			return "", err
 		}
@@ -555,7 +248,7 @@ func schemeInfo() (*loginScheme, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.Get(url)
+	resp, err := tsuruNet.Dial5Full60ClientNoKeepAlive.Get(url)
 	if err != nil {
 		return nil, err
 	}

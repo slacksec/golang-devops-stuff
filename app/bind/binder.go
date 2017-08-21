@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,16 +6,24 @@
 // service.
 package bind
 
+import "io"
+
 // EnvVar represents a environment variable for an app.
 type EnvVar struct {
-	Name         string
-	Value        string
-	Public       bool
-	InstanceName string
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Public bool   `json:"public"`
 }
 
+type ServiceEnvVar struct {
+	EnvVar       `bson:",inline"`
+	ServiceName  string `json:"-"`
+	InstanceName string `json:"-"`
+}
+
+// Unit represents an application unit to be used in binds.
 type Unit interface {
-	// GetIp returns the unit ip.
+	GetID() string
 	GetIp() string
 }
 
@@ -27,28 +35,36 @@ type App interface {
 	GetName() string
 
 	// GetUnits returns the app units.
-	GetUnits() []Unit
+	GetUnits() ([]Unit, error)
 
-	// InstanceEnv returns the app enviroment variables.
-	InstanceEnv(string) map[string]EnvVar
+	// AddInstance adds an instance to the application.
+	AddInstance(args AddInstanceArgs) error
 
-	// SetEnvs adds enviroment variables in the app.
-	SetEnvs([]EnvVar, bool) error
-
-	// UnsetEnvs removes the given enviroment variables from the app.
-	UnsetEnvs([]string, bool) error
+	// RemoveInstance removes an instance from the application.
+	RemoveInstance(args RemoveInstanceArgs) error
 }
 
-type Binder interface {
-	// BindApp makes the bind between the binder and an app.
-	BindApp(App) error
+type SetEnvArgs struct {
+	Envs          []EnvVar
+	Writer        io.Writer
+	ShouldRestart bool
+}
 
-	// BindUnit makes the bind between the binder and an unit.
-	BindUnit(App, Unit) (map[string]string, error)
+type UnsetEnvArgs struct {
+	VariableNames []string
+	Writer        io.Writer
+	ShouldRestart bool
+}
 
-	// UnbindApp makes the unbind between the binder and an app.
-	UnbindApp(App) error
+type AddInstanceArgs struct {
+	Envs          []ServiceEnvVar
+	Writer        io.Writer
+	ShouldRestart bool
+}
 
-	// UnbindUnit makes the unbind between the binder and an unit.
-	UnbindUnit(Unit) error
+type RemoveInstanceArgs struct {
+	ServiceName   string
+	InstanceName  string
+	Writer        io.Writer
+	ShouldRestart bool
 }

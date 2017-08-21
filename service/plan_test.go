@@ -5,21 +5,22 @@
 package service
 
 import (
-	"launchpad.net/gocheck"
 	"net/http"
 	"net/http/httptest"
+
+	"gopkg.in/check.v1"
 )
 
-func (s *S) TestPlan(c *gocheck.C) {
+func (s *S) TestPlan(c *check.C) {
 	plan := Plan{
 		Name:        "Ignite",
 		Description: "A simple plan",
 	}
-	c.Assert("Ignite", gocheck.Equals, plan.Name)
-	c.Assert("A simple plan", gocheck.Equals, plan.Description)
+	c.Assert("Ignite", check.Equals, plan.Name)
+	c.Assert("A simple plan", check.Equals, plan.Description)
 }
 
-func (s *S) TestGetPlansByServiceName(c *gocheck.C) {
+func (s *S) TestGetPlansByServiceName(c *check.C) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		content := `[{"name": "ignite", "description": "some value"}, {"name": "small", "description": "not space left for you"}]`
 		w.Write([]byte(content))
@@ -27,24 +28,43 @@ func (s *S) TestGetPlansByServiceName(c *gocheck.C) {
 	defer ts.Close()
 	srvc := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
 	err := s.conn.Services().Insert(&srvc)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	defer s.conn.Services().RemoveId(srvc.Name)
-	plans, err := GetPlansByServiceName("mysql")
-	c.Assert(err, gocheck.IsNil)
+	plans, err := GetPlansByServiceName("mysql", "")
+	c.Assert(err, check.IsNil)
 	expected := []Plan{
 		{Name: "ignite", Description: "some value"},
 		{Name: "small", Description: "not space left for you"},
 	}
-	c.Assert(plans, gocheck.DeepEquals, expected)
+	c.Assert(plans, check.DeepEquals, expected)
 }
 
-func (s *S) TestGetPlansByServiceNameWithoutEndpoint(c *gocheck.C) {
+func (s *S) TestGetPlanByServiceNameAndPlanName(c *check.C) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		content := `[{"name": "ignite", "description": "some value"}, {"name": "small", "description": "not space left for you"}]`
+		w.Write([]byte(content))
+	}))
+	defer ts.Close()
+	srvc := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := s.conn.Services().Insert(&srvc)
+	c.Assert(err, check.IsNil)
+	defer s.conn.Services().RemoveId(srvc.Name)
+	plan, err := GetPlanByServiceNameAndPlanName("mysql", "small", "")
+	c.Assert(err, check.IsNil)
+	expected := Plan{
+		Name:        "small",
+		Description: "not space left for you",
+	}
+	c.Assert(plan, check.DeepEquals, expected)
+}
+
+func (s *S) TestGetPlansByServiceNameWithoutEndpoint(c *check.C) {
 	srvc := Service{Name: "mysql"}
 	err := s.conn.Services().Insert(&srvc)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	defer s.conn.Services().RemoveId(srvc.Name)
-	plans, err := GetPlansByServiceName("mysql")
-	c.Assert(err, gocheck.IsNil)
+	plans, err := GetPlansByServiceName("mysql", "")
+	c.Assert(err, check.IsNil)
 	expected := []Plan{}
-	c.Assert(plans, gocheck.DeepEquals, expected)
+	c.Assert(plans, check.DeepEquals, expected)
 }

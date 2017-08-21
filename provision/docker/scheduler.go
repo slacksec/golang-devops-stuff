@@ -1,53 +1,125 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package docker
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"fmt"
+	"math"
+	"strconv"
+	"sync"
+
 	"github.com/fsouza/go-dockerclient"
+	"github.com/pkg/errors"
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/tsuru/app"
-	"github.com/tsuru/tsuru/cmd"
-	"github.com/tsuru/tsuru/db"
+	"github.com/tsuru/tsuru/autoscale"
 	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/net"
+	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/docker/container"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	"io/ioutil"
-	"math"
-	"net/http"
-	"strings"
-	"sync"
 )
 
-// errNoFallback is the error returned when no fallback hosts are configured in
-// the segregated scheduler.
-var errNoFallback = errors.New("No fallback configured in the scheduler: you should have a pool without any teams")
-
-const schedulerCollection = "docker_scheduler"
-
-type Pool struct {
-	Name  string `bson:"_id"`
-	Teams []string
+type segregatedScheduler struct {
+	hostMutex           sync.Mutex
+	maxMemoryRatio      float32
+	TotalMemoryMetadata string
+	provisioner         *dockerProvisioner
+	// ignored containers is only set in provisioner returned by
+	// cloneProvisioner which will set this field to exclude some container
+	// ids from balancing (containers being removed by rebalance usually).
+	ignoredContainers []string
 }
 
-type segregatedScheduler struct{}
-
-func (s segregatedScheduler) Schedule(c *cluster.Cluster, opts docker.CreateContainerOptions, schedulerOpts cluster.SchedulerOptions) (cluster.Node, error) {
-	appName, _ := schedulerOpts.(string)
-	a, _ := app.GetByName(appName)
-	nodes, err := nodesForApp(c, a)
-	if err != nil {
-		return cluster.Node{}, err
+func (s *segregatedScheduler) Schedule(c *cluster.Cluster, opts docker.CreateContainerOptions, schedulerOpts cluster.SchedulerOptions) (cluster.Node, error) {
+	schedOpts, ok := schedulerOpts.(*container.SchedulerOpts)
+	if !ok {
+		return cluster.Node{}, &container.SchedulerError{
+			Base: errors.Errorf("invalid scheduler opts: %#v", schedulerOpts),
+		}
 	}
-	node, err := s.chooseNode(nodes, opts.Name, appName)
+	a, _ := app.GetByName(schedOpts.AppName)
+	nodes, err := s.provisioner.Nodes(a)
 	if err != nil {
-		return cluster.Node{}, err
+		return cluster.Node{}, &container.SchedulerError{Base: err}
+	}
+	nodes, err = s.filterByMemoryUsage(a, nodes, s.maxMemoryRatio, s.TotalMemoryMetadata)
+	if err != nil {
+		return cluster.Node{}, &container.SchedulerError{Base: err}
+	}
+	node, err := s.chooseNodeToAdd(nodes, opts.Name, schedOpts.AppName, schedOpts.ProcessName)
+	if err != nil {
+		return cluster.Node{}, &container.SchedulerError{Base: err}
+	}
+	if schedOpts.ActionLimiter != nil {
+		schedOpts.LimiterDone = schedOpts.ActionLimiter.Start(net.URLToHost(node))
 	}
 	return cluster.Node{Address: node}, nil
+}
+
+func (s *segregatedScheduler) filterByMemoryUsage(a *app.App, nodes []cluster.Node, maxMemoryRatio float32, TotalMemoryMetadata string) ([]cluster.Node, error) {
+	if maxMemoryRatio == 0 || TotalMemoryMetadata == "" {
+		return nodes, nil
+	}
+	hosts := make([]string, len(nodes))
+	for i := range nodes {
+		hosts[i] = net.URLToHost(nodes[i].Address)
+	}
+	containers, err := s.provisioner.ListContainers(bson.M{"hostaddr": bson.M{"$in": hosts}, "id": bson.M{"$nin": s.ignoredContainers}})
+	if err != nil {
+		return nil, err
+	}
+	hostReserved := make(map[string]int64)
+	for _, cont := range containers {
+		contApp, err := app.GetByName(cont.AppName)
+		if err != nil {
+			return nil, err
+		}
+		hostReserved[cont.HostAddr] += contApp.Plan.Memory
+	}
+	megabyte := float64(1024 * 1024)
+	nodeList := make([]cluster.Node, 0, len(nodes))
+	for _, node := range nodes {
+		totalMemory, _ := strconv.ParseFloat(node.Metadata[TotalMemoryMetadata], 64)
+		shouldAdd := true
+		if totalMemory != 0 {
+			maxMemory := totalMemory * float64(maxMemoryRatio)
+			host := net.URLToHost(node.Address)
+			nodeReserved := hostReserved[host] + a.Plan.Memory
+			if nodeReserved > int64(maxMemory) {
+				shouldAdd = false
+				tryingToReserveMB := float64(a.Plan.Memory) / megabyte
+				reservedMB := float64(hostReserved[host]) / megabyte
+				limitMB := maxMemory / megabyte
+				log.Errorf("Node %q has reached its memory limit. "+
+					"Limit %0.4fMB. Reserved: %0.4fMB. Needed additional %0.4fMB",
+					host, limitMB, reservedMB, tryingToReserveMB)
+			}
+		}
+		if shouldAdd {
+			nodeList = append(nodeList, node)
+		}
+	}
+	if len(nodeList) == 0 {
+		var autoScaleEnabled bool
+		rule, _ := autoscale.AutoScaleRuleForMetadata(a.Pool)
+		if rule != nil {
+			autoScaleEnabled = rule.Enabled
+		}
+		errMsg := fmt.Sprintf("no nodes found with enough memory for container of %q: %0.4fMB",
+			a.Name, float64(a.Plan.Memory)/megabyte)
+		if autoScaleEnabled {
+			// Allow going over quota temporarily because auto-scale will be
+			// able to detect this and automatically add a new nodes.
+			log.Errorf("WARNING: %s. Will ignore memory restrictions.", errMsg)
+			return nodes, nil
+		}
+		return nil, errors.New(errMsg)
+	}
+	return nodeList, nil
 }
 
 type nodeAggregate struct {
@@ -55,12 +127,10 @@ type nodeAggregate struct {
 	Count    int
 }
 
-var hostMutex sync.Mutex
-
-// aggregateNodesBy aggregates and counts how many containers
+// aggregateContainersBy aggregates and counts how many containers
 // exist each node that matches received filters
-func aggregateNodesBy(matcher bson.M) (map[string]int, error) {
-	coll := collection()
+func (s *segregatedScheduler) aggregateContainersBy(matcher bson.M) (map[string]int, error) {
+	coll := s.provisioner.Collection()
 	defer coll.Close()
 	pipe := coll.Pipe([]bson.M{
 		matcher,
@@ -78,311 +148,175 @@ func aggregateNodesBy(matcher bson.M) (map[string]int, error) {
 	return countMap, nil
 }
 
-func aggregateNodesByHost(hosts []string) (map[string]int, error) {
-	return aggregateNodesBy(bson.M{"$match": bson.M{"hostaddr": bson.M{"$in": hosts}}})
+func (s *segregatedScheduler) aggregateContainersByHost(hosts []string) (map[string]int, error) {
+	return s.aggregateContainersBy(bson.M{"$match": bson.M{"hostaddr": bson.M{"$in": hosts}, "id": bson.M{"$nin": s.ignoredContainers}}})
 }
 
-func aggregateNodesByHostApp(hosts []string, appName string) (map[string]int, error) {
-	return aggregateNodesBy(bson.M{"$match": bson.M{"appname": appName, "hostaddr": bson.M{"$in": hosts}}})
+func (s *segregatedScheduler) aggregateContainersByHostAppProcess(hosts []string, appName, process string) (map[string]int, error) {
+	matcher := bson.M{
+		"hostaddr": bson.M{"$in": hosts},
+		"id":       bson.M{"$nin": s.ignoredContainers},
+	}
+	if appName != "" {
+		matcher["appname"] = appName
+	}
+	if process == "" {
+		matcher["$or"] = []bson.M{{"processname": bson.M{"$exists": false}}, {"processname": ""}}
+	} else {
+		matcher["processname"] = process
+	}
+	return s.aggregateContainersBy(bson.M{"$match": matcher})
 }
 
-// chooseNode finds which is the node with the minimum number
-// of containers and returns it
-func (segregatedScheduler) chooseNode(nodes []cluster.Node, contName string, appName string) (string, error) {
-	var chosenNode string
+func (s *segregatedScheduler) GetRemovableContainer(appName string, process string) (string, error) {
+	a, err := app.GetByName(appName)
+	if err != nil {
+		return "", err
+	}
+	nodes, err := s.provisioner.Nodes(a)
+	if err != nil {
+		return "", err
+	}
+	return s.chooseContainerToRemove(nodes, appName, process)
+}
+
+type errContainerNotFound struct {
+	AppName     string
+	ProcessName string
+}
+
+func (m *errContainerNotFound) Error() string {
+	return fmt.Sprintf("Container of app %q with process %q was not found in any servers", m.AppName, m.ProcessName)
+}
+
+func (s *segregatedScheduler) getContainerPreferablyFromHost(host string, appName, process string) (string, error) {
+	coll := s.provisioner.Collection()
+	defer coll.Close()
+	var c container.Container
+	query := bson.M{
+		"id":       bson.M{"$nin": s.ignoredContainers},
+		"appname":  appName,
+		"hostaddr": net.URLToHost(host),
+	}
+	if process == "" {
+		query["$or"] = []bson.M{{"processname": bson.M{"$exists": false}}, {"processname": ""}}
+	} else {
+		query["processname"] = process
+	}
+	err := coll.Find(query).Select(bson.M{"id": 1}).One(&c)
+	if err == mgo.ErrNotFound {
+		delete(query, "hostaddr")
+		err = coll.Find(query).Select(bson.M{"id": 1}).One(&c)
+	}
+	if err == mgo.ErrNotFound {
+		return "", &errContainerNotFound{AppName: appName, ProcessName: process}
+	}
+	return c.ID, err
+}
+
+func (s *segregatedScheduler) nodesToHosts(nodes []cluster.Node) ([]string, map[string]string) {
 	hosts := make([]string, len(nodes))
 	hostsMap := make(map[string]string)
 	// Only hostname is saved in the docker containers collection
 	// so we need to extract and map then to the original node.
 	for i, node := range nodes {
-		host := urlToHost(node.Address)
+		host := net.URLToHost(node.Address)
 		hosts[i] = host
 		hostsMap[host] = node.Address
 	}
-	log.Debugf("[scheduler] Possible nodes for container %s: %#v", contName, hosts)
-	hostMutex.Lock()
-	defer hostMutex.Unlock()
-	hostCountMap, err := aggregateNodesByHost(hosts)
+	return hosts, hostsMap
+}
+
+// chooseNodeToAdd finds which is the node with the minimum number of containers
+// and returns it
+func (s *segregatedScheduler) chooseNodeToAdd(nodes []cluster.Node, contName string, appName, process string) (string, error) {
+	log.Debugf("[scheduler] Possible nodes for container %s: %#v", contName, nodes)
+	s.hostMutex.Lock()
+	defer s.hostMutex.Unlock()
+	chosenNode, _, err := s.minMaxNodes(nodes, appName, process)
 	if err != nil {
-		return chosenNode, err
+		return "", err
 	}
-	appCountMap, err := aggregateNodesByHostApp(hosts, appName)
-	if err != nil {
-		return chosenNode, err
+	log.Debugf("[scheduler] Chosen node for container %s: %#v", contName, chosenNode)
+	if contName != "" {
+		coll := s.provisioner.Collection()
+		defer coll.Close()
+		err = coll.Update(bson.M{"name": contName}, bson.M{"$set": bson.M{"hostaddr": net.URLToHost(chosenNode)}})
 	}
-	// Finally finding the host with the minimum value for
-	// the pair [appCount, hostCount]
-	var minHost string
-	minCount := math.MaxInt32
-	for _, host := range hosts {
-		adjCount := appCountMap[host]*10000 + hostCountMap[host]
-		if adjCount < minCount {
-			minCount = adjCount
-			minHost = host
-		}
-	}
-	chosenNode = hostsMap[minHost]
-	log.Debugf("[scheduler] Chosen node for container %s: %#v Count: %d", contName, chosenNode, minCount)
-	coll := collection()
-	defer coll.Close()
-	err = coll.Update(bson.M{"name": contName}, bson.M{"$set": bson.M{"hostaddr": minHost}})
 	return chosenNode, err
 }
 
-func poolsForApp(app *app.App) ([]Pool, error) {
-	var pools []Pool
-	var query bson.M
-	conn, err := db.Conn()
+// chooseContainerToRemove finds a container from the the node with maximum
+// number of containers and returns it
+func (s *segregatedScheduler) chooseContainerToRemove(nodes []cluster.Node, appName, process string) (string, error) {
+	_, chosenNode, err := s.minMaxNodes(nodes, appName, process)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	defer conn.Close()
-	if app != nil {
-		if app.TeamOwner != "" {
-			query = bson.M{"teams": app.TeamOwner}
-		} else {
-			query = bson.M{"teams": bson.M{"$in": app.Teams}}
+	log.Debugf("[scheduler] Chosen node for remove a container: %#v", chosenNode)
+	containerID, err := s.getContainerPreferablyFromHost(chosenNode, appName, process)
+	if err != nil {
+		return "", err
+	}
+	return containerID, err
+}
+
+func appGroupCount(hostGroups map[string]int, appCountHost map[string]int) map[string]int {
+	groupCounters := map[int]int{}
+	for host, count := range appCountHost {
+		groupCounters[hostGroups[host]] += count
+	}
+	result := map[string]int{}
+	for host := range hostGroups {
+		result[host] = groupCounters[hostGroups[host]]
+	}
+	return result
+}
+
+// Find the host with the minimum (good to add a new container) and maximum
+// (good to remove a container) value for the pair [(number of containers for
+// app-process), (number of containers in host)]
+func (s *segregatedScheduler) minMaxNodes(nodes []cluster.Node, appName, process string) (string, string, error) {
+	nodesList := make(provision.NodeList, len(nodes))
+	for i := range nodes {
+		nodesList[i] = &clusterNodeWrapper{Node: &nodes[i], prov: s.provisioner}
+	}
+	metaFreqList, _, err := nodesList.SplitMetadata()
+	if err != nil {
+		log.Debugf("[scheduler] ignoring metadata diff when selecting node: %s", err)
+	}
+	hostGroupMap := map[string]int{}
+	for i, m := range metaFreqList {
+		for _, n := range m.Nodes {
+			hostGroupMap[net.URLToHost(n.Address())] = i
 		}
-		conn.Collection(schedulerCollection).Find(query).All(&pools)
 	}
-	if len(pools) == 0 {
-		query = bson.M{"$or": []bson.M{{"teams": bson.M{"$exists": false}}, {"teams": bson.M{"$size": 0}}}}
-		err = conn.Collection(schedulerCollection).Find(query).All(&pools)
-		if err != nil {
-			return nil, err
+	hosts, hostsMap := s.nodesToHosts(nodes)
+	hostCountMap, err := s.aggregateContainersByHost(hosts)
+	if err != nil {
+		return "", "", err
+	}
+	appCountMap, err := s.aggregateContainersByHostAppProcess(hosts, appName, process)
+	if err != nil {
+		return "", "", err
+	}
+	priorityEntries := []map[string]int{appGroupCount(hostGroupMap, appCountMap), appCountMap, hostCountMap}
+	var minHost, maxHost string
+	var minScore uint64 = math.MaxUint64
+	var maxScore uint64 = 0
+	for _, host := range hosts {
+		var score uint64
+		for i, e := range priorityEntries {
+			score += uint64(e[host]) << uint((len(priorityEntries)-i-1)*(64/len(priorityEntries)))
+		}
+		if score < minScore {
+			minScore = score
+			minHost = host
+		}
+		if score >= maxScore {
+			maxScore = score
+			maxHost = host
 		}
 	}
-	if len(pools) == 0 {
-		return nil, errNoFallback
-	}
-	return pools, nil
-}
-
-func nodesForApp(c *cluster.Cluster, app *app.App) ([]cluster.Node, error) {
-	pools, err := poolsForApp(app)
-	if err != nil {
-		return nil, err
-	}
-	for _, pool := range pools {
-		nodes, err := c.NodesForMetadata(map[string]string{"pool": pool.Name})
-		if err != nil {
-			return nil, err
-		}
-		if len(nodes) > 0 {
-			return nodes, nil
-		}
-	}
-	return nil, fmt.Errorf("No nodes found in pools %v", pools)
-}
-
-func nodesForAppName(c *cluster.Cluster, appName string) ([]cluster.Node, error) {
-	a, err := app.GetByName(appName)
-	if err != nil {
-		return nil, err
-	}
-	return nodesForApp(c, a)
-}
-
-func (segregatedScheduler) addPool(poolName string) error {
-	if poolName == "" {
-		return errors.New("Pool name is required.")
-	}
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	pool := Pool{Name: poolName}
-	return conn.Collection(schedulerCollection).Insert(pool)
-}
-
-func (segregatedScheduler) removePool(poolName string) error {
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return conn.Collection(schedulerCollection).Remove(bson.M{"_id": poolName})
-}
-
-func (segregatedScheduler) addTeamsToPool(poolName string, teams []string) error {
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return conn.Collection(schedulerCollection).UpdateId(poolName, bson.M{"$push": bson.M{"teams": bson.M{"$each": teams}}})
-}
-
-func (segregatedScheduler) removeTeamsFromPool(poolName string, teams []string) error {
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return conn.Collection(schedulerCollection).UpdateId(poolName, bson.M{"$pullAll": bson.M{"teams": teams}})
-}
-
-type addPoolToSchedulerCmd struct{}
-
-func (addPoolToSchedulerCmd) Info() *cmd.Info {
-	return &cmd.Info{
-		Name:    "docker-pool-add",
-		Usage:   "docker-pool-add <pool>",
-		Desc:    "Add a pool to cluster",
-		MinArgs: 1,
-	}
-}
-
-func (addPoolToSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
-	b, err := json.Marshal(map[string]string{"pool": ctx.Args[0]})
-	if err != nil {
-		return err
-	}
-	url, err := cmd.GetURL("/docker/pool")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(b))
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-	ctx.Stdout.Write([]byte("Pool successfully registered.\n"))
-	return nil
-}
-
-type removePoolFromSchedulerCmd struct{}
-
-func (removePoolFromSchedulerCmd) Info() *cmd.Info {
-	return &cmd.Info{
-		Name:    "docker-pool-remove",
-		Usage:   "docker-pool-remove <pool>",
-		Desc:    "Remove a pool to cluster",
-		MinArgs: 1,
-	}
-}
-
-func (removePoolFromSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
-	b, err := json.Marshal(map[string]string{"pool": ctx.Args[0]})
-	if err != nil {
-		return err
-	}
-	url, err := cmd.GetURL("/docker/pool")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("DELETE", url, bytes.NewBuffer(b))
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-	ctx.Stdout.Write([]byte("Pool successfully removed.\n"))
-	return nil
-}
-
-type listPoolsInTheSchedulerCmd struct{}
-
-func (listPoolsInTheSchedulerCmd) Info() *cmd.Info {
-	return &cmd.Info{
-		Name:  "docker-pool-list",
-		Usage: "docker-pool-list",
-		Desc:  "List available pools in the cluster",
-	}
-}
-
-func (listPoolsInTheSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
-	t := cmd.Table{Headers: cmd.Row([]string{"Pools", "Teams"})}
-	url, err := cmd.GetURL("/docker/pool")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	var pools []Pool
-	err = json.Unmarshal(body, &pools)
-	for _, p := range pools {
-		t.AddRow(cmd.Row([]string{p.Name, strings.Join(p.Teams, ", ")}))
-	}
-	t.Sort()
-	ctx.Stdout.Write(t.Bytes())
-	return nil
-}
-
-type addTeamsToPoolCmd struct{}
-
-func (addTeamsToPoolCmd) Info() *cmd.Info {
-	return &cmd.Info{
-		Name:    "docker-pool-teams-add",
-		Usage:   "docker-pool-teams-add <pool> <teams>",
-		Desc:    "Add team to a pool",
-		MinArgs: 2,
-	}
-}
-
-func (addTeamsToPoolCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
-	body, err := json.Marshal(map[string]interface{}{"pool": ctx.Args[0], "teams": ctx.Args[1:]})
-	if err != nil {
-		return err
-	}
-	url, err := cmd.GetURL("/docker/pool/team")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-	ctx.Stdout.Write([]byte("Teams successfully registered.\n"))
-	return nil
-}
-
-type removeTeamsFromPoolCmd struct{}
-
-func (removeTeamsFromPoolCmd) Info() *cmd.Info {
-	return &cmd.Info{
-		Name:    "docker-pool-teams-remove",
-		Usage:   "docker-pool-teams-remove <pool> <teams>",
-		Desc:    "Remove team from pool",
-		MinArgs: 2,
-	}
-}
-
-func (removeTeamsFromPoolCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
-	body, err := json.Marshal(map[string]interface{}{"pool": ctx.Args[0], "teams": ctx.Args[1:]})
-	if err != nil {
-		return err
-	}
-	url, err := cmd.GetURL("/docker/pool/team")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("DELETE", url, bytes.NewBuffer(body))
-	if err != nil {
-		return err
-	}
-	_, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-	ctx.Stdout.Write([]byte("Teams successfully removed.\n"))
-	return nil
+	return hostsMap[minHost], hostsMap[maxHost], nil
 }

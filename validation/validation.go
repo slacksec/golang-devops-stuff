@@ -1,17 +1,19 @@
-// Copyright 2013 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 // Package validation provide utilities functions for data validation.
 package validation
 
-import (
-	"regexp"
+import "regexp"
+
+var (
+	emailRegexp = regexp.MustCompile(`^([^@\s]+)@((?:[-a-z0-9]+\.)+[a-z]{2,})$`)
+	nameRegexp  = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 )
 
 func ValidateEmail(email string) bool {
-	re := regexp.MustCompile(`^([^@\s]+)@((?:[-a-z0-9]+\.)+[a-z]{2,})$`)
-	return re.MatchString(email)
+	return emailRegexp.MatchString(email)
 }
 
 // ValidateLength checks whether the given data match the given rules.
@@ -31,4 +33,10 @@ func ValidateLength(value string, min, max int) bool {
 		return false
 	}
 	return true
+}
+
+// ValidateName checks wether the given data contains at most 63 characters
+// containing only lower case letters, numbers or dashes and starts with a letter
+func ValidateName(name string) bool {
+	return nameRegexp.MatchString(name)
 }

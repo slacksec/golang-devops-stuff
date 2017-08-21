@@ -1,25 +1,67 @@
 language: go
+install: true
+sudo: required
+addons:
+  apt:
+    packages:
+      - rsyslog
+      - xmlsec1
+      - rpm
 go:
-  - 1.2
-  - 1.3
-  - tip
+  - 1.8.3
+  - master
 env:
-  - GOARCH=amd64
-before_install:
-  - sudo apt-get update -qq > apt-get.out 2>&1  || (cat apt-get.out && exit 1)
-  - sudo apt-get install bzr mercurial git -qq > apt-get.out 2>&1 || (cat apt-get.out && exit 1)
-install:
-  - export PATH="$HOME/gopath/bin:$PATH"
-  - echo http://localhost > $HOME/.tsuru_target
-  - make get GO_EXTRAFLAGS=-x
-script:
-  - make test GO_EXTRAFLAGS=-x
+  global:
+    - GOARCH=amd64
+    - GO_FOR_RELEASE=1.8
+    - IMAGE_NAME=tsuru/api
+jobs:
+  fast_finish: true
+  allow_failures:
+    - go: master
+  include:
+    - stage: test
+      before_script:
+        - rsyslogd &
+        - sleep 1
+      before_install:
+        - git fetch --unshallow || true
+        - sleep 15
+        - sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+        - sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+        - sudo ifconfig
+        - sudo sysctl -a | grep ipv6.conf
+        - sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv 7F0CEB10
+        - echo "deb http://repo.mongodb.org/apt/ubuntu "$(lsb_release -sc)"/mongodb-org/3.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-3.0.list
+        - sudo apt-get -qq update
+        - sudo apt-get install -y mongodb-org
+        - sudo service mongod start || true
+        - service mongod status
+        - go env && pwd
+      script: make test
+    - stage: lint
+      script:
+        - while true; do echo .; sleep 30; done &
+        - if [ "${TRAVIS_EVENT_TYPE}" = "push" ] && [ "${TRAVIS_BRANCH}" = "master" ]; then make lint; else make metalint; fi
+    - script: ./misc/check-handlers.sh
+    - script: ./misc/check-events.sh
+    - script: make check-api-doc
+    - stage: deploy
+      script:
+        - CGO_ENABLED=0 go build -ldflags "-X github.com/tsuru/tsuru/cmd.GitHash=`git rev-parse HEAD`" ./cmd/tsurud/
+        - curl https://raw.githubusercontent.com/tsuru/push-to-docker/master/push.sh | bash
+    - script: if [ -n "$TRAVIS_TAG" ]; then curl -sL https://raw.githubusercontent.com/tsuru/push-to-packagecloud/master/push.sh | PACKAGE_NAME=tsuru-server bash; fi
+    - stage: integration-check
+      script: ./misc/trigger-integration.sh
 notifications:
   email:
-    recipients:
-      - tsuru@corp.globo.com
     on_success: change
     on_failure: always
+  slack:
+    rooms:
+      - secure: QJe4k18ACRUP4CDo245vBFu1hpVlcR3JPWjT7NL/vAE/Y5KDn5pNXIREPYIx9F/f8lvjF2RrQxjApeUujRh1PPt2Q53JulvaDCfM5a5SYnk5yoqu3ynlfqU4AOTDa6kzoJ3K4M9X8JhMpOtr3+IOPbwV88FjPvwviZN4p0L/0wc=
+      - secure: PUf33dfseOSrtp8Eoxx7cZoaR+O2zwJ3V++2k3zBXlhZRIntRdyoiZlax2NlKVGPgNMtT1WCQzufGVmvF1GVkkUC+c94wkEG8Qxzzwrcp476+VSfQSla95wFNuAjn0tuhqHommw9CncVUAF+2pfycPR/fmxDfgQaQTL3dsHy66E=
 services:
-  - mongodb
   - redis
+  - docker
+  - mongodb

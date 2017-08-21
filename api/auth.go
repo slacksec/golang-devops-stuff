@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -7,21 +7,23 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/tsuru/config"
-	"github.com/tsuru/go-gandalfclient"
-	"github.com/tsuru/tsuru/action"
-	"github.com/tsuru/tsuru/app"
-	"github.com/tsuru/tsuru/app/bind"
-	"github.com/tsuru/tsuru/auth"
-	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/errors"
-	"github.com/tsuru/tsuru/log"
-	"github.com/tsuru/tsuru/rec"
-	"github.com/tsuru/tsuru/repository"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
-	"io"
 	"net/http"
+	"reflect"
+	"runtime"
+
+	"github.com/ajg/form"
+	"github.com/tsuru/config"
+	"github.com/tsuru/tsuru/app"
+	"github.com/tsuru/tsuru/auth"
+	"github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/event"
+	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/permission"
+	"github.com/tsuru/tsuru/provision/pool"
+	"github.com/tsuru/tsuru/repository"
+	"github.com/tsuru/tsuru/service"
+	authTypes "github.com/tsuru/tsuru/types/auth"
+	"github.com/tsuru/tsuru/volume"
 )
 
 const (
@@ -49,6 +51,24 @@ func handleAuthError(err error) error {
 	}
 }
 
+func userTarget(u string) event.Target {
+	return event.Target{Type: event.TargetTypeUser, Value: u}
+}
+
+func teamTarget(t string) event.Target {
+	return event.Target{Type: event.TargetTypeTeam, Value: t}
+}
+
+// title: user create
+// path: /users
+// method: POST
+// consume: application/x-www-form-urlencoded
+// responses:
+//   201: User created
+//   400: Invalid data
+//   401: Unauthorized
+//   403: Forbidden
+//   409: User already exists
 func createUser(w http.ResponseWriter, r *http.Request) error {
 	registrationEnabled, _ := config.GetBool("auth:user-registration")
 	if !registrationEnabled {
@@ -57,551 +77,559 @@ func createUser(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return createDisabledErr
 		}
-		user, err := t.User()
-		if err != nil {
-			return createDisabledErr
-		}
-		if !user.IsAdmin() {
+		if !permission.Check(t, permission.PermUserCreate) {
 			return createDisabledErr
 		}
 	}
-	var u auth.User
-	err := json.NewDecoder(r.Body).Decode(&u)
+	email := r.FormValue("email")
+	password := r.FormValue("password")
+	delete(r.Form, "password")
+	evt, err := event.New(&event.Opts{
+		Target:     userTarget(email),
+		Kind:       permission.PermUserCreate,
+		RawOwner:   event.Owner{Type: event.OwnerTypeUser, Name: email},
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, email)),
+	})
 	if err != nil {
-		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	u := auth.User{
+		Email:    email,
+		Password: password,
 	}
 	_, err = app.AuthScheme.Create(&u)
 	if err != nil {
 		return handleAuthError(err)
 	}
-	err = u.CreateOnGandalf()
-	if err != nil {
-		return err
-	}
-	rec.Log(u.Email, "create-user")
 	w.WriteHeader(http.StatusCreated)
 	return nil
 }
 
-func login(w http.ResponseWriter, r *http.Request) error {
-	var params map[string]string
-	err := json.NewDecoder(r.Body).Decode(&params)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusBadRequest, Message: "Invalid JSON"}
+// title: login
+// path: /auth/login
+// method: POST
+// consume: application/x-www-form-urlencoded
+// produce: application/json
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   403: Forbidden
+//   404: Not found
+func login(w http.ResponseWriter, r *http.Request) (err error) {
+	params := map[string]string{
+		"email": r.URL.Query().Get(":email"),
 	}
-	params["email"] = r.URL.Query().Get(":email")
+	err = r.ParseForm()
+	if err != nil {
+		return err
+	}
+	for key := range r.Form {
+		params[key] = r.FormValue(key)
+	}
 	token, err := app.AuthScheme.Login(params)
 	if err != nil {
 		return handleAuthError(err)
 	}
-	u, err := token.User()
-	if err != nil {
-		return err
-	}
-	rec.Log(u.Email, "login")
-	fmt.Fprintf(w, `{"token":"%s","is_admin":%v}`, token.GetValue(), u.IsAdmin())
-	return nil
+	return json.NewEncoder(w).Encode(map[string]string{"token": token.GetValue()})
 }
 
-func logout(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+// title: logout
+// path: /users/tokens
+// method: DELETE
+// responses:
+//   200: Ok
+func logout(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
 	return app.AuthScheme.Logout(t.GetValue())
 }
 
-// ChangePassword changes the password from the logged in user.
-//
-// It reads the request body in JSON format. The JSON in the request body
-// should contain two attributes:
-//
-// - old: the old password
-// - new: the new password
-//
-// This handler will return 403 if the password didn't match the user, or 400
-// if the new password is invalid.
-func changePassword(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+// title: change password
+// path: /users/password
+// method: PUT
+// consume: application/x-www-form-urlencoded
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   403: Forbidden
+//   404: Not found
+func changePassword(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
 	managed, ok := app.AuthScheme.(auth.ManagedScheme)
 	if !ok {
 		return &errors.HTTP{Code: http.StatusBadRequest, Message: nonManagedSchemeMsg}
 	}
-	var body map[string]string
-	err := json.NewDecoder(r.Body).Decode(&body)
+	evt, err := event.New(&event.Opts{
+		Target:  userTarget(t.GetUserName()),
+		Kind:    permission.PermUserUpdatePassword,
+		Owner:   t,
+		Allowed: event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, t.GetUserName())),
+	})
 	if err != nil {
-		return &errors.HTTP{
-			Code:    http.StatusBadRequest,
-			Message: "Invalid JSON.",
-		}
+		return err
 	}
-	if body["old"] == "" || body["new"] == "" {
+	defer func() { evt.Done(err) }()
+	oldPassword := r.FormValue("old")
+	newPassword := r.FormValue("new")
+	confirmPassword := r.FormValue("confirm")
+	if oldPassword == "" || newPassword == "" {
 		return &errors.HTTP{
 			Code:    http.StatusBadRequest,
 			Message: "Both the old and the new passwords are required.",
 		}
 	}
-	err = managed.ChangePassword(t, body["old"], body["new"])
+	if newPassword != confirmPassword {
+		return &errors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: "New password and password confirmation didn't match.",
+		}
+	}
+	err = managed.ChangePassword(t, oldPassword, newPassword)
 	if err != nil {
 		return handleAuthError(err)
 	}
-	rec.Log(t.GetUserName(), "change-password")
 	return nil
 }
 
-func resetPassword(w http.ResponseWriter, r *http.Request) error {
+// title: reset password
+// path: /users/{email}/password
+// method: POST
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   403: Forbidden
+//   404: Not found
+func resetPassword(w http.ResponseWriter, r *http.Request) (err error) {
 	managed, ok := app.AuthScheme.(auth.ManagedScheme)
 	if !ok {
 		return &errors.HTTP{Code: http.StatusBadRequest, Message: nonManagedSchemeMsg}
 	}
+	r.ParseForm()
 	email := r.URL.Query().Get(":email")
-	token := r.URL.Query().Get("token")
+	token := r.FormValue("token")
+	evt, err := event.New(&event.Opts{
+		Target:     userTarget(email),
+		Kind:       permission.PermUserUpdateReset,
+		RawOwner:   event.Owner{Type: event.OwnerTypeUser, Name: email},
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, email)),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
 	u, err := auth.GetUserByEmail(email)
 	if err != nil {
 		if err == auth.ErrUserNotFound {
 			return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
-		} else if e, ok := err.(*errors.ValidationError); ok {
-			return &errors.HTTP{Code: http.StatusBadRequest, Message: e.Error()}
 		}
 		return err
 	}
 	if token == "" {
-		rec.Log(email, "reset-password-gen-token")
 		return managed.StartPasswordReset(u)
 	}
-	rec.Log(email, "reset-password")
 	return managed.ResetPassword(u, token)
 }
 
-func createTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	var params map[string]string
-	err := json.NewDecoder(r.Body).Decode(&params)
+var teamRenameFns = []func(oldName, newName string) error{
+	app.RenameTeam,
+	service.RenameServiceTeam,
+	service.RenameServiceInstanceTeam,
+	volume.RenameTeam,
+	pool.RenamePoolTeam,
+}
+
+// title: team update
+// path: /teams/{name}
+// method: POST
+// consume: application/x-www-form-urlencoded
+// responses:
+//   200: Team updated
+//   400: Invalid data
+//   401: Unauthorized
+//   404: Team not found
+func updateTeam(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	r.ParseForm()
+	name := r.URL.Query().Get(":name")
+	type teamChange struct {
+		NewName string
+	}
+	changeRequest := teamChange{}
+	dec := form.NewDecoder(nil)
+	dec.IgnoreUnknownKeys(true)
+	dec.IgnoreCase(true)
+	err = dec.DecodeValues(&changeRequest, r.Form)
 	if err != nil {
 		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
 	}
-	name := params["name"]
+	if changeRequest.NewName == "" {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: "new team name cannot be empty"}
+	}
+	allowed := permission.Check(t, permission.PermTeamUpdate,
+		permission.Context(permission.CtxTeam, name),
+	)
+	if !allowed {
+		return permission.ErrUnauthorized
+	}
+	_, err = auth.GetTeam(name)
+	if err != nil {
+		if err == authTypes.ErrTeamNotFound {
+			return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
+		}
+		return err
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     teamTarget(name),
+		Kind:       permission.PermTeamUpdate,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermTeamReadEvents, permission.Context(permission.CtxTeam, name)),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
-	rec.Log(u.Email, "create-team", name)
-	err = auth.CreateTeam(name, u)
-	switch err {
-	case auth.ErrInvalidTeamName:
-		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
-	case auth.ErrTeamAlreadyExists:
-		return &errors.HTTP{Code: http.StatusConflict, Message: err.Error()}
-	}
-	return nil
-}
-
-// RemoveTeam removes a team document from the database.
-func removeTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	conn, err := db.Conn()
+	err = auth.CreateTeam(changeRequest.NewName, u)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	name := r.URL.Query().Get(":name")
-	rec.Log(t.GetUserName(), "remove-team", name)
-	if n, err := conn.Apps().Find(bson.M{"teams": name}).Count(); err != nil || n > 0 {
-		msg := `This team cannot be removed because it have access to apps.
-
-Please remove the apps or revoke these accesses, and try again.`
-		return &errors.HTTP{Code: http.StatusForbidden, Message: msg}
+	var toRollback []func(oldName, newName string) error
+	defer func() {
+		if err == nil {
+			return
+		}
+		rollbackErr := auth.RemoveTeam(changeRequest.NewName)
+		if rollbackErr != nil {
+			log.Errorf("error rolling back team creation from %v to %v", name, changeRequest.NewName)
+		}
+		for _, rollbackFn := range toRollback {
+			rollbackErr := rollbackFn(changeRequest.NewName, name)
+			if rollbackErr != nil {
+				fnName := runtime.FuncForPC(reflect.ValueOf(rollbackFn).Pointer()).Name()
+				log.Errorf("error rolling back team name change in %v from %q to %q", fnName, name, changeRequest.NewName)
+			}
+		}
+	}()
+	for _, fn := range teamRenameFns {
+		err = fn(name, changeRequest.NewName)
+		if err != nil {
+			return err
+		}
+		toRollback = append(toRollback, fn)
 	}
-	query := bson.M{"_id": name, "users": t.GetUserName()}
-	err = conn.Teams().Remove(query)
-	if err == mgo.ErrNotFound {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf(`Team "%s" not found.`, name)}
+	return auth.RemoveTeam(name)
+}
+
+// title: team create
+// path: /teams
+// method: POST
+// consume: application/x-www-form-urlencoded
+// responses:
+//   201: Team created
+//   400: Invalid data
+//   401: Unauthorized
+//   409: Team already exists
+func createTeam(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	allowed := permission.Check(t, permission.PermTeamCreate)
+	if !allowed {
+		return permission.ErrUnauthorized
+	}
+	name := r.FormValue("name")
+	if name == "" {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: authTypes.ErrInvalidTeamName.Error()}
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     teamTarget(name),
+		Kind:       permission.PermTeamCreate,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermTeamReadEvents, permission.Context(permission.CtxTeam, name)),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	u, err := t.User()
+	if err != nil {
+		return err
+	}
+	err = auth.CreateTeam(name, u)
+	switch err {
+	case authTypes.ErrInvalidTeamName:
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
+	case authTypes.ErrTeamAlreadyExists:
+		return &errors.HTTP{Code: http.StatusConflict, Message: err.Error()}
+	}
+	if err == nil {
+		w.WriteHeader(http.StatusCreated)
 	}
 	return err
 }
 
+// title: remove team
+// path: /teams/{name}
+// method: DELETE
+// responses:
+//   200: Team removed
+//   401: Unauthorized
+//   403: Forbidden
+//   404: Not found
+func removeTeam(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	r.ParseForm()
+	name := r.URL.Query().Get(":name")
+	allowed := permission.Check(t, permission.PermTeamDelete,
+		permission.Context(permission.CtxTeam, name),
+	)
+	if !allowed {
+		return &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf(`Team "%s" not found.`, name)}
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     teamTarget(name),
+		Kind:       permission.PermTeamDelete,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermTeamReadEvents, permission.Context(permission.CtxTeam, name)),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	err = auth.RemoveTeam(name)
+	if err != nil {
+		if _, ok := err.(*auth.ErrTeamStillUsed); ok {
+			msg := fmt.Sprintf("This team cannot be removed because there are still references to it:\n%s", err)
+			return &errors.HTTP{Code: http.StatusForbidden, Message: msg}
+		}
+		if err == authTypes.ErrTeamNotFound {
+			return &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf(`Team "%s" not found.`, name)}
+		}
+		return err
+	}
+	return nil
+}
+
+// title: team list
+// path: /teams
+// method: GET
+// produce: application/json
+// responses:
+//   200: List teams
+//   204: No content
+//   401: Unauthorized
 func teamList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	u, err := t.User()
+	permsForTeam := permission.PermissionRegistry.PermissionsWithContextType(permission.CtxTeam)
+	teams, err := auth.ListTeams()
 	if err != nil {
 		return err
 	}
-	rec.Log(u.Email, "list-teams")
-	teams, err := u.Teams()
+	teamsMap := map[string][]string{}
+	perms, err := t.Permissions()
 	if err != nil {
 		return err
 	}
-	if len(teams) > 0 {
-		var result []map[string]string
-		for _, team := range teams {
-			result = append(result, map[string]string{"name": team.Name})
-		}
-		b, err := json.Marshal(result)
-		if err != nil {
-			return err
-		}
-		n, err := w.Write(b)
-		if err != nil {
-			return err
-		}
-		if n != len(b) {
-			return &errors.HTTP{Code: http.StatusInternalServerError, Message: "Failed to write response body."}
-		}
-	} else {
-		w.WriteHeader(http.StatusNoContent)
-	}
-	return nil
-}
-
-func addUserToTeamInDatabase(user *auth.User, team *auth.Team) error {
-	if err := team.AddUser(user); err != nil {
-		return &errors.HTTP{Code: http.StatusConflict, Message: err.Error()}
-	}
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return conn.Teams().UpdateId(team.Name, team)
-}
-
-func addUserToTeamInGandalf(user *auth.User, t *auth.Team) error {
-	gURL := repository.ServerURL()
-	alwdApps, err := t.AllowedApps()
-	if err != nil {
-		return fmt.Errorf("Failed to obtain allowed apps to grant: %s", err)
-	}
-	if err := (&gandalf.Client{Endpoint: gURL}).GrantAccess(alwdApps, []string{user.Email}); err != nil {
-		return fmt.Errorf("Failed to grant access to git repositories: %s", err)
-	}
-	return nil
-}
-
-func addUserToTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	teamName := r.URL.Query().Get(":team")
-	email := r.URL.Query().Get(":user")
-	u, err := t.User()
-	if err != nil {
-		return err
-	}
-	rec.Log(u.Email, "add-user-to-team", "team="+teamName, "user="+email)
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	team, err := auth.GetTeam(teamName)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: "Team not found"}
-	}
-	if !team.ContainsUser(u) {
-		msg := fmt.Sprintf("You are not authorized to add new users to the team %s", team.Name)
-		return &errors.HTTP{Code: http.StatusUnauthorized, Message: msg}
-	}
-	user, err := auth.GetUserByEmail(email)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: "User not found"}
-	}
-	actions := []*action.Action{
-		&addUserToTeamInGandalfAction,
-		&addUserToTeamInDatabaseAction,
-	}
-	pipeline := action.NewPipeline(actions...)
-	return pipeline.Execute(user, team)
-}
-
-func removeUserFromTeamInDatabase(u *auth.User, team *auth.Team) error {
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err = team.RemoveUser(u); err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
-	}
-	return conn.Teams().UpdateId(team.Name, team)
-}
-
-func removeUserFromTeamInGandalf(u *auth.User, team *auth.Team) error {
-	gURL := repository.ServerURL()
-	teamApps, err := team.AllowedApps()
-	if err != nil {
-		return err
-	}
-	userApps, err := u.AllowedApps()
-	if err != nil {
-		return err
-	}
-	appsToRemove := make([]string, 0, len(teamApps))
-	for _, teamApp := range teamApps {
-		found := false
-		for _, userApp := range userApps {
-			if userApp == teamApp {
-				found = true
-				break
+	for _, team := range teams {
+		teamCtx := permission.Context(permission.CtxTeam, team.Name)
+		var parent *permission.PermissionScheme
+		for _, p := range permsForTeam {
+			if parent != nil && parent.IsParent(p) {
+				continue
+			}
+			if permission.CheckFromPermList(perms, p, teamCtx) {
+				parent = p
+				teamsMap[team.Name] = append(teamsMap[team.Name], p.FullName())
 			}
 		}
-		if !found {
-			appsToRemove = append(appsToRemove, teamApp)
-		}
 	}
-	client := gandalf.Client{Endpoint: gURL}
-	if err := client.RevokeAccess(appsToRemove, []string{u.Email}); err != nil {
-		return fmt.Errorf("Failed to revoke access from git repositories: %s", err)
+	if len(teamsMap) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return nil
 	}
-	return nil
-}
-
-func removeUserFromTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	email := r.URL.Query().Get(":user")
-	teamName := r.URL.Query().Get(":team")
-	u, err := t.User()
-	if err != nil {
-		return err
-	}
-	rec.Log(u.Email, "remove-user-from-team", "team="+teamName, "user="+email)
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	team, err := auth.GetTeam(teamName)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: "Team not found"}
-	}
-	if !team.ContainsUser(u) {
-		msg := fmt.Sprintf("You are not authorized to remove a member from the team %s", team.Name)
-		return &errors.HTTP{Code: http.StatusUnauthorized, Message: msg}
-	}
-	if len(team.Users) == 1 {
-		msg := "You can not remove this user from this team, because it is the last user within the team, and a team can not be orphaned"
-		return &errors.HTTP{Code: http.StatusForbidden, Message: msg}
-	}
-	user, err := auth.GetUserByEmail(email)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
-	}
-	err = removeUserFromTeamInDatabase(user, team)
-	if err != nil {
-		return err
-	}
-	return removeUserFromTeamInGandalf(user, team)
-}
-
-func getTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	teamName := r.URL.Query().Get(":name")
-	user, err := t.User()
-	if err != nil {
-		return err
-	}
-	rec.Log(user.Email, "get-team", teamName)
-	team, err := auth.GetTeam(teamName)
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusNotFound, Message: "Team not found"}
-	}
-	if !team.ContainsUser(user) {
-		return &errors.HTTP{Code: http.StatusForbidden, Message: "User is not member of this team"}
+	var result []map[string]interface{}
+	for name, permissions := range teamsMap {
+		result = append(result, map[string]interface{}{
+			"name":        name,
+			"permissions": permissions,
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(team)
+	return json.NewEncoder(w).Encode(result)
 }
 
-func getKeyFromBody(b io.Reader) (string, error) {
-	var body map[string]string
-	err := json.NewDecoder(b).Decode(&body)
-	if err != nil {
-		return "", &errors.HTTP{Code: http.StatusBadRequest, Message: "Invalid JSON"}
+// title: add key
+// path: /users/keys
+// method: POST
+// consume: application/x-www-form-urlencoded
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   409: Key already exists
+func addKeyToUser(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	key := repository.Key{
+		Body: r.FormValue("key"),
+		Name: r.FormValue("name"),
 	}
-	key, ok := body["key"]
-	if !ok || key == "" {
-		return "", &errors.HTTP{Code: http.StatusBadRequest, Message: "Missing key"}
+	var force bool
+	if r.FormValue("force") == "true" {
+		force = true
 	}
-	return key, nil
-}
-
-func addKeyInDatabase(key *auth.Key, u *auth.User) error {
-	u.AddKey(*key)
-	return u.Update()
-}
-
-func addKeyInGandalf(key *auth.Key, u *auth.User) error {
-	return u.AddKeyGandalf(key)
-}
-
-// AddKeyToUser adds a key to a user.
-//
-// This function is just an http wrapper around addKeyToUser. The latter function
-// exists to be used in other places in the package without the http stuff (request and
-// response).
-func addKeyToUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	content, err := getKeyFromBody(r.Body)
+	allowed := permission.Check(t, permission.PermUserUpdateKeyAdd,
+		permission.Context(permission.CtxUser, t.GetUserName()),
+	)
+	if !allowed {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     userTarget(t.GetUserName()),
+		Kind:       permission.PermUserUpdateKeyAdd,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, t.GetUserName())),
+	})
 	if err != nil {
 		return err
+	}
+	defer func() { evt.Done(err) }()
+	if key.Body == "" {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: "Missing key content"}
 	}
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
-	rec.Log(u.Email, "add-key", content)
-	key := auth.Key{Content: content}
-	if u.HasKey(key) {
-		return &errors.HTTP{Code: http.StatusConflict, Message: "User already has this key"}
+	err = u.AddKey(key, force)
+	if err == auth.ErrKeyDisabled || err == repository.ErrUserNotFound {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
 	}
-	actions := []*action.Action{
-		&addKeyInGandalfAction,
-		&addKeyInDatabaseAction,
+	if err == repository.ErrKeyAlreadyExists {
+		return &errors.HTTP{Code: http.StatusConflict, Message: err.Error()}
 	}
-	pipeline := action.NewPipeline(actions...)
-	return pipeline.Execute(&key, u)
+	return err
 }
 
-func removeKeyFromDatabase(key *auth.Key, u *auth.User) error {
-	conn, err := db.Conn()
+// title: remove key
+// path: /users/keys/{key}
+// method: DELETE
+// responses:
+//   200: Ok
+//   400: Invalid data
+//   401: Unauthorized
+//   404: Not found
+func removeKeyFromUser(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	r.ParseForm()
+	key := repository.Key{
+		Name: r.URL.Query().Get(":key"),
+	}
+	if key.Name == "" {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: "Either the content or the name of the key must be provided"}
+	}
+	allowed := permission.Check(t, permission.PermUserUpdateKeyRemove,
+		permission.Context(permission.CtxUser, t.GetUserName()),
+	)
+	if !allowed {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     userTarget(t.GetUserName()),
+		Kind:       permission.PermUserUpdateKeyRemove,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, t.GetUserName())),
+	})
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	u.RemoveKey(*key)
-	return conn.Users().Update(bson.M{"email": u.Email}, u)
-}
-
-func removeKeyFromGandalf(key *auth.Key, u *auth.User) error {
-	gURL := repository.ServerURL()
-	if err := (&gandalf.Client{Endpoint: gURL}).RemoveKey(u.Email, key.Name); err != nil {
-		return fmt.Errorf("Failed to remove the key from git server: %s", err)
-	}
-	return nil
-}
-
-// RemoveKeyFromUser removes a key from a user.
-//
-// This function is just an http wrapper around removeKeyFromUser. The latter function
-// exists to be used in other places in the package without the http stuff (request and
-// response).
-func removeKeyFromUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	content, err := getKeyFromBody(r.Body)
-	if err != nil {
-		return err
-	}
+	defer func() { evt.Done(err) }()
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
-	rec.Log(u.Email, "remove-key", content)
-	key, index := u.FindKey(auth.Key{Content: content})
-	if index < 0 {
+	err = u.RemoveKey(key)
+	if err == auth.ErrKeyDisabled {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
+	}
+	if err == repository.ErrKeyNotFound {
 		return &errors.HTTP{Code: http.StatusNotFound, Message: "User does not have this key"}
 	}
-	err = removeKeyFromGandalf(&key, u)
-	if err != nil {
-		return err
-	}
-	return removeKeyFromDatabase(&key, u)
+	return err
 }
 
-// listKeys list user's keys
+// title: list keys
+// path: /users/keys
+// method: GET
+// produce: application/json
+// responses:
+//   200: OK
+//   400: Invalid data
+//   401: Unauthorized
 func listKeys(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
 	keys, err := u.ListKeys()
+	if err == auth.ErrKeyDisabled {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
+	}
 	if err != nil {
 		return err
 	}
-	b, err := json.Marshal(keys)
-	if err != nil {
-		return fmt.Errorf("Failed to marshal keys into json: %s", err)
-	}
-	n, err := w.Write(b)
-	if err != nil {
-		return err
-	}
-	if n != len(b) {
-		return &errors.HTTP{Code: http.StatusInternalServerError, Message: "Failed to write response body."}
-	}
-	return nil
+	w.Header().Add("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(keys)
 }
 
-// removeUser removes the user from the database and from gandalf server
-//
-// If the user is the only one in a team an error will be returned.
-func removeUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	u, err := t.User()
+// title: remove user
+// path: /users
+// method: DELETE
+// responses:
+//   200: User removed
+//   401: Unauthorized
+//   404: Not found
+func removeUser(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	r.ParseForm()
+	email := r.URL.Query().Get("user")
+	if email == "" {
+		email = t.GetUserName()
+	}
+	allowed := permission.Check(t, permission.PermUserDelete,
+		permission.Context(permission.CtxUser, email),
+	)
+	if !allowed {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     userTarget(email),
+		Kind:       permission.PermUserDelete,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, email)),
+	})
 	if err != nil {
 		return err
 	}
-	gURL := repository.ServerURL()
-	c := gandalf.Client{Endpoint: gURL}
-	alwdApps, err := u.AllowedApps()
+	defer func() { evt.Done(err) }()
+	u, err := auth.GetUserByEmail(email)
+	if err != nil {
+		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
+	}
+	appNames, err := deployableApps(u, make(map[string]*permission.Role))
 	if err != nil {
 		return err
 	}
-	if err := c.RevokeAccess(alwdApps, []string{u.Email}); err != nil {
-		log.Errorf("Failed to revoke access in Gandalf: %s", err)
-		return fmt.Errorf("Failed to revoke acess from git repositories: %s", err)
+	manager := repository.Manager()
+	for _, name := range appNames {
+		manager.RevokeAccess(name, u.Email)
 	}
-	teams, err := u.Teams()
-	if err != nil {
-		return err
+	if err := manager.RemoveUser(u.Email); err != nil {
+		log.Errorf("Failed to remove user from repository manager: %s", err)
 	}
-	conn, err := db.Conn()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	for _, team := range teams {
-		if len(team.Users) < 2 {
-			msg := fmt.Sprintf(`This user is the last member of the team "%s", so it cannot be removed.
-
-Please remove the team, then remove the user.`, team.Name)
-			return &errors.HTTP{Code: http.StatusForbidden, Message: msg}
-		}
-		err = team.RemoveUser(u)
-		if err != nil {
-			return err
-		}
-		// this can be done without the loop
-		err = conn.Teams().Update(bson.M{"_id": team.Name}, team)
-		if err != nil {
-			return err
-		}
-	}
-	rec.Log(u.Email, "remove-user")
-	if err := c.RemoveUser(u.Email); err != nil {
-		log.Errorf("Failed to remove user from gandalf: %s", err)
-		return fmt.Errorf("Failed to remove the user from the git server: %s", err)
-	}
-	return app.AuthScheme.Remove(t)
-}
-
-type jToken struct {
-	Client string `json:"client"`
-	Export bool   `json:"export"`
-}
-
-func generateAppToken(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	var body jToken
-	defer r.Body.Close()
-	err := json.NewDecoder(r.Body).Decode(&body)
-	if err != nil {
-		return err
-	}
-	if body.Client == "" {
-		return &errors.HTTP{
-			Code:    http.StatusBadRequest,
-			Message: "Missing client name in JSON body",
-		}
-	}
-	token, err := app.AuthScheme.AppLogin(body.Client)
-	if err != nil {
-		return err
-	}
-	if body.Export {
-		if a, err := app.GetByName(body.Client); err == nil {
-			envs := []bind.EnvVar{
-				{
-					Name:   "TSURU_APP_TOKEN",
-					Value:  token.GetValue(),
-					Public: false,
-				},
-			}
-			a.SetEnvs(envs, false)
-		}
-	}
-	return json.NewEncoder(w).Encode(token)
+	return app.AuthScheme.Remove(u)
 }
 
 type schemeData struct {
@@ -609,11 +637,258 @@ type schemeData struct {
 	Data auth.SchemeInfo `json:"data"`
 }
 
+// title: get auth scheme
+// path: /auth/scheme
+// method: GET
+// produce: application/json
+// responses:
+//   200: OK
 func authScheme(w http.ResponseWriter, r *http.Request) error {
 	info, err := app.AuthScheme.Info()
 	if err != nil {
 		return err
 	}
 	data := schemeData{Name: app.AuthScheme.Name(), Data: info}
+	w.Header().Add("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(data)
+}
+
+// title: regenerate token
+// path: /users/api-key
+// method: POST
+// produce: application/json
+// responses:
+//   200: OK
+//   401: Unauthorized
+//   404: User not found
+func regenerateAPIToken(w http.ResponseWriter, r *http.Request, t auth.Token) (err error) {
+	r.ParseForm()
+	email := r.URL.Query().Get("user")
+	if email == "" {
+		email = t.GetUserName()
+	}
+	allowed := permission.Check(t, permission.PermUserUpdateToken,
+		permission.Context(permission.CtxUser, email),
+	)
+	if !allowed {
+		return permission.ErrUnauthorized
+	}
+	evt, err := event.New(&event.Opts{
+		Target:     userTarget(email),
+		Kind:       permission.PermUserUpdateToken,
+		Owner:      t,
+		CustomData: event.FormToCustomData(r.Form),
+		Allowed:    event.Allowed(permission.PermUserReadEvents, permission.Context(permission.CtxUser, email)),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { evt.Done(err) }()
+	u, err := auth.GetUserByEmail(email)
+	if err != nil {
+		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
+	}
+	apiKey, err := u.RegenerateAPIKey()
+	if err != nil {
+		return err
+	}
+	w.Header().Add("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(apiKey)
+}
+
+// title: show token
+// path: /users/api-key
+// method: GET
+// produce: application/json
+// responses:
+//   200: OK
+//   401: Unauthorized
+//   404: User not found
+func showAPIToken(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	u, err := t.User()
+	if err != nil {
+		return err
+	}
+	email := r.URL.Query().Get("user")
+	if email != "" {
+		if !permission.Check(t, permission.PermUserUpdateToken) {
+			return permission.ErrUnauthorized
+		}
+		u, err = auth.GetUserByEmail(email)
+		if err != nil {
+			return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
+		}
+	}
+	apiKey, err := u.ShowAPIKey()
+	if err != nil {
+		return err
+	}
+	w.Header().Add("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(apiKey)
+}
+
+type rolePermissionData struct {
+	Name         string
+	ContextType  string
+	ContextValue string
+}
+
+type apiUser struct {
+	Email       string
+	Roles       []rolePermissionData
+	Permissions []rolePermissionData
+}
+
+func createAPIUser(perms []permission.Permission, user *auth.User, roleMap map[string]*permission.Role, includeAll bool) (*apiUser, error) {
+	var permData []rolePermissionData
+	roleData := make([]rolePermissionData, 0, len(user.Roles))
+	if roleMap == nil {
+		roleMap = make(map[string]*permission.Role)
+	}
+	allGlobal := true
+	for _, userRole := range user.Roles {
+		role := roleMap[userRole.Name]
+		if role == nil {
+			r, err := permission.FindRole(userRole.Name)
+			if err != nil {
+				return nil, err
+			}
+			role = &r
+			roleMap[userRole.Name] = role
+		}
+		allPermsMatch := true
+		permissions := role.PermissionsFor(userRole.ContextValue)
+		if len(permissions) == 0 && !includeAll {
+			continue
+		}
+		rolePerms := make([]rolePermissionData, len(permissions))
+		for i, p := range permissions {
+			if perms != nil && allPermsMatch && !permission.CheckFromPermList(perms, p.Scheme, p.Context) {
+				allPermsMatch = false
+				break
+			}
+			rolePerms[i] = rolePermissionData{
+				Name:         p.Scheme.FullName(),
+				ContextType:  string(p.Context.CtxType),
+				ContextValue: p.Context.Value,
+			}
+		}
+		if !allPermsMatch {
+			continue
+		}
+		roleData = append(roleData, rolePermissionData{
+			Name:         userRole.Name,
+			ContextType:  string(role.ContextType),
+			ContextValue: userRole.ContextValue,
+		})
+		permData = append(permData, rolePerms...)
+		if role.ContextType != permission.CtxGlobal {
+			allGlobal = false
+		}
+	}
+	if !includeAll && allGlobal {
+		return nil, nil
+	}
+	return &apiUser{
+		Email:       user.Email,
+		Roles:       roleData,
+		Permissions: permData,
+	}, nil
+}
+
+// title: user list
+// path: /users
+// method: GET
+// produce: application/json
+// responses:
+//   200: OK
+//   401: Unauthorized
+func listUsers(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	userEmail := r.URL.Query().Get("userEmail")
+	roleName := r.URL.Query().Get("role")
+	contextValue := r.URL.Query().Get("context")
+	users, err := auth.ListUsers()
+	if err != nil {
+		return err
+	}
+	apiUsers := make([]apiUser, 0, len(users))
+	roleMap := make(map[string]*permission.Role)
+	includeAll := permission.Check(t, permission.PermUserUpdate)
+	perms, err := t.Permissions()
+	if err != nil {
+		return err
+	}
+	for _, user := range users {
+		usrData, err := createAPIUser(perms, &user, roleMap, includeAll)
+		if err != nil {
+			return err
+		}
+		if usrData == nil {
+			continue
+		}
+		if userEmail == "" && roleName == "" {
+			apiUsers = append(apiUsers, *usrData)
+		}
+		if userEmail != "" && usrData.Email == userEmail {
+			apiUsers = append(apiUsers, *usrData)
+		}
+		if roleName != "" {
+			for _, role := range usrData.Roles {
+				if role.Name == roleName {
+					if contextValue != "" && role.ContextValue == contextValue {
+						apiUsers = append(apiUsers, *usrData)
+						break
+					}
+					if contextValue == "" {
+						apiUsers = append(apiUsers, *usrData)
+						break
+					}
+				}
+			}
+		}
+	}
+	if len(apiUsers) == 0 {
+		if contextValue != "" {
+			return &errors.HTTP{Code: http.StatusNotFound, Message: "Wrong context being passed."}
+		}
+		user, err := t.User()
+		if err != nil {
+			return err
+		}
+		perm, err := user.Permissions()
+		if err != nil {
+			return err
+		}
+		userData, err := createAPIUser(perm, user, nil, true)
+		if err != nil {
+			return err
+		}
+		apiUsers = append(apiUsers, *userData)
+	}
+	w.Header().Add("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(apiUsers)
+}
+
+// title: user info
+// path: /users/info
+// method: GET
+// produce: application/json
+// responses:
+//   200: OK
+//   401: Unauthorized
+func userInfo(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	user, err := t.User()
+	if err != nil {
+		return err
+	}
+	perms, err := t.Permissions()
+	if err != nil {
+		return err
+	}
+	userData, err := createAPIUser(perms, user, nil, true)
+	if err != nil {
+		return err
+	}
+	w.Header().Add("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(userData)
 }

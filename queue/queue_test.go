@@ -1,52 +1,59 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package queue
 
 import (
-	"github.com/tsuru/config"
-	"launchpad.net/gocheck"
+	"context"
+	"io/ioutil"
 	"testing"
+	"time"
+
+	"github.com/tsuru/config"
+	"github.com/tsuru/monsterqueue"
+	"github.com/tsuru/tsuru/api/shutdown"
+	"gopkg.in/check.v1"
 )
 
 func Test(t *testing.T) {
-	gocheck.TestingT(t)
+	check.TestingT(t)
 }
 
 type S struct{}
 
-var _ = gocheck.Suite(&S{})
+var _ = check.Suite(&S{})
 
-func (s *S) TestFactory(c *gocheck.C) {
-	config.Set("queue", "redis")
-	defer config.Unset("queue")
-	f, err := Factory()
-	c.Assert(err, gocheck.IsNil)
-	_, ok := f.(*redismqQFactory)
-	c.Assert(ok, gocheck.Equals, true)
+func (s *S) SetUpTest(c *check.C) {
+	config.Set("queue:mongo-database", "test-queue")
+	ResetQueue()
 }
 
-func (s *S) TestFactoryConfigUndefined(c *gocheck.C) {
-	f, err := Factory()
-	c.Assert(err, gocheck.IsNil)
-	_, ok := f.(*redismqQFactory)
-	c.Assert(ok, gocheck.Equals, true)
+type testTask struct {
+	callCount int
 }
 
-func (s *S) TestFactoryConfigUnknown(c *gocheck.C) {
-	config.Set("queue", "unknown")
-	defer config.Unset("queue")
-	f, err := Factory()
-	c.Assert(f, gocheck.IsNil)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err.Error(), gocheck.Equals, `Queue "unknown" is not known.`)
+func (t *testTask) Run(j monsterqueue.Job) {
+	t.callCount++
+	j.Success("result")
 }
 
-func (s *S) TestRegister(c *gocheck.C) {
-	config.Set("queue", "unregistered")
-	defer config.Unset("queue")
-	Register("unregistered", &redismqQFactory{})
-	_, err := Factory()
-	c.Assert(err, gocheck.IsNil)
+func (t *testTask) Name() string {
+	return "test-task"
+}
+
+func (s *S) TestQueue(c *check.C) {
+	q, err := Queue()
+	c.Assert(err, check.IsNil)
+	task := &testTask{}
+	err = q.RegisterTask(task)
+	c.Assert(err, check.IsNil)
+	j, err := q.EnqueueWait(task.Name(), nil, time.Minute)
+	c.Assert(err, check.IsNil)
+	result, err := j.Result()
+	c.Assert(err, check.IsNil)
+	c.Assert(result, check.Equals, "result")
+	c.Assert(queueData.instance, check.NotNil)
+	shutdown.Do(context.Background(), ioutil.Discard)
+	c.Assert(queueData.instance, check.IsNil)
 }

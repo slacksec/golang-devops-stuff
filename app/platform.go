@@ -1,128 +1,142 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package app
 
 import (
-	"errors"
-	"fmt"
+	"strconv"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/builder"
 	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/provision"
-	"gopkg.in/mgo.v2"
+	tsuruErrors "github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/storage"
+	appTypes "github.com/tsuru/tsuru/types/app"
+	"github.com/tsuru/tsuru/validation"
 	"gopkg.in/mgo.v2/bson"
-	"io"
 )
 
-type Platform struct {
-	Name string `bson:"_id"`
+func PlatformService() appTypes.PlatformService {
+	dbDriver, err := storage.GetCurrentDbDriver()
+	if err != nil {
+		dbDriver, err = storage.GetDefaultDbDriver()
+		if err != nil {
+			return nil
+		}
+	}
+	return dbDriver.PlatformService
+}
+
+func validatePlatform(p appTypes.Platform) error {
+	if p.Name == "" {
+		return appTypes.ErrPlatformNameMissing
+	}
+	if !validation.ValidateName(p.Name) {
+		return appTypes.ErrInvalidPlatformName
+	}
+	return nil
 }
 
 // Platforms returns the list of available platforms.
-func Platforms() ([]Platform, error) {
-	var platforms []Platform
-	conn, err := db.Conn()
-	if err != nil {
-		return nil, err
+func Platforms(enabledOnly bool) ([]appTypes.Platform, error) {
+	if enabledOnly {
+		return PlatformService().FindEnabled()
 	}
-	err = conn.Platforms().Find(nil).All(&platforms)
-	return platforms, err
+	return PlatformService().FindAll()
 }
 
-// PlatformAdd add a new platform to tsuru
-func PlatformAdd(name string, args map[string]string, w io.Writer) error {
-	var (
-		provisioner provision.ExtensibleProvisioner
-		ok          bool
-	)
-	if provisioner, ok = Provisioner.(provision.ExtensibleProvisioner); !ok {
-		return errors.New("Provisioner is not extensible")
+// PlatformAdd adds a new platform to tsuru
+func PlatformAdd(opts builder.PlatformOptions) error {
+	p := appTypes.Platform{Name: opts.Name}
+	if err := validatePlatform(p); err != nil {
+		return err
 	}
-	if name == "" {
-		return errors.New("Platform name is required.")
-	}
-	p := Platform{Name: name}
-	conn, err := db.Conn()
+	err := PlatformService().Insert(p)
 	if err != nil {
 		return err
 	}
-	err = conn.Platforms().Insert(p)
+	err = builder.PlatformAdd(opts)
 	if err != nil {
-		if mgo.IsDup(err) {
-			return DuplicatePlatformError{}
-		}
-		return err
-	}
-	err = provisioner.PlatformAdd(name, args, w)
-	if err != nil {
-		db_err := conn.Platforms().RemoveId(p.Name)
-		if db_err != nil {
-			return fmt.Errorf("Caused by: %s and %s", err.Error(), db_err.Error())
+		dbErr := PlatformService().Delete(p)
+		if dbErr != nil {
+			return tsuruErrors.NewMultiError(
+				errors.Wrapf(dbErr, "unable to rollback platform add"),
+				errors.Wrapf(err, "original platform add error"),
+			)
 		}
 		return err
 	}
 	return nil
 }
 
-type DuplicatePlatformError struct{}
-
-func (DuplicatePlatformError) Error() string {
-	return "Duplicate platform"
-}
-
-func PlatformUpdate(name string, args map[string]string, w io.Writer) error {
-	var (
-		provisioner provision.ExtensibleProvisioner
-		platform    Platform
-		ok          bool
-	)
-	if provisioner, ok = Provisioner.(provision.ExtensibleProvisioner); !ok {
-		return errors.New("Provisioner is not extensible")
-	}
-	if name == "" {
-		return errors.New("Platform name is required.")
+func PlatformUpdate(opts builder.PlatformOptions) error {
+	if opts.Name == "" {
+		return appTypes.ErrPlatformNameMissing
 	}
 	conn, err := db.Conn()
 	if err != nil {
 		return err
 	}
-	err = conn.Platforms().Find(bson.M{"_id": name}).One(&platform)
+	defer conn.Close()
+	_, err = PlatformService().FindByName(opts.Name)
 	if err != nil {
-		if err == mgo.ErrNotFound {
-			return errors.New("Platform doesn't exist.")
+		return err
+	}
+	if opts.Args["dockerfile"] != "" || opts.Input != nil {
+		err = builder.PlatformUpdate(opts)
+		if err != nil {
+			return err
 		}
-		return err
+		var apps []App
+		err = conn.Apps().Find(bson.M{"framework": opts.Name}).All(&apps)
+		if err != nil {
+			return err
+		}
+		for _, app := range apps {
+			app.SetUpdatePlatform(true)
+		}
 	}
-	err = provisioner.PlatformUpdate(name, args, w)
-	if err != nil {
-		return err
-	}
-	var apps []App
-	err = conn.Apps().Find(bson.M{"framework": name}).All(&apps)
-	if err != nil {
-		return err
-	}
-	for _, app := range apps {
-		app.SetUpdatePlatform(true)
+	if opts.Args["disabled"] != "" {
+		disableBool, err := strconv.ParseBool(opts.Args["disabled"])
+		if err != nil {
+			return err
+		}
+		return PlatformService().Update(appTypes.Platform{Name: opts.Name, Disabled: disableBool})
 	}
 	return nil
 }
 
-func getPlatform(name string) (*Platform, error) {
-	var p Platform
+func PlatformRemove(name string) error {
+	if name == "" {
+		return appTypes.ErrPlatformNameMissing
+	}
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	apps, _ := conn.Apps().Find(bson.M{"framework": name}).Count()
+	if apps > 0 {
+		return appTypes.ErrDeletePlatformWithApps
+	}
+	err = builder.PlatformRemove(name)
+	if err != nil {
+		log.Errorf("Failed to remove platform: %s", err)
+	}
+	return PlatformService().Delete(appTypes.Platform{Name: name})
+}
+
+func GetPlatform(name string) (*appTypes.Platform, error) {
 	conn, err := db.Conn()
 	if err != nil {
 		return nil, err
 	}
-	err = conn.Platforms().Find(bson.M{"_id": name}).One(&p)
+	defer conn.Close()
+	p, err := PlatformService().FindByName(name)
 	if err != nil {
-		return nil, InvalidPlatformError{}
+		return nil, appTypes.ErrInvalidPlatform
 	}
-	return &p, nil
-}
-
-type InvalidPlatformError struct{}
-
-func (InvalidPlatformError) Error() string {
-	return "Invalid platform"
+	return p, nil
 }

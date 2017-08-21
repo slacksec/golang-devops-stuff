@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,79 +6,107 @@ package service
 
 import (
 	"encoding/json"
-	stderrors "errors"
+	"io"
+	"strconv"
+	"strings"
+
+	"github.com/pkg/errors"
 	"github.com/tsuru/tsuru/action"
 	"github.com/tsuru/tsuru/app/bind"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/log"
-	"github.com/tsuru/tsuru/rec"
+	"github.com/tsuru/tsuru/validation"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	"io"
-	"net/http"
-	"regexp"
 )
 
 var (
-	ErrServiceInstanceNotFound   = stderrors.New("service instance not found")
-	ErrInvalidInstanceName       = stderrors.New("invalid service instance name")
-	ErrInstanceNameAlreadyExists = stderrors.New("instance name already exists.")
-	ErrAccessNotAllowed          = stderrors.New("user does not have access to this service instance")
-	ErrMultipleTeams             = stderrors.New("user is member of multiple teams, please specify the team that owns the service instance")
-
-	instanceNameRegexp = regexp.MustCompile(`^[A-Za-z][-a-zA-Z0-9_]+$`)
+	ErrServiceInstanceNotFound   = errors.New("service instance not found")
+	ErrInvalidInstanceName       = errors.New("invalid service instance name")
+	ErrInstanceNameAlreadyExists = errors.New("instance name already exists.")
+	ErrAccessNotAllowed          = errors.New("user does not have access to this service instance")
+	ErrTeamMandatory             = errors.New("please specify the team that owns the service instance")
+	ErrAppAlreadyBound           = errors.New("app is already bound to this service instance")
+	ErrAppNotBound               = errors.New("app is not bound to this service instance")
+	ErrUnitNotBound              = errors.New("unit is not bound to this service instance")
+	ErrServiceInstanceBound      = errors.New("This service instance is bound to at least one app. Unbind them before removing it")
 )
 
 type ServiceInstance struct {
 	Name        string
+	Id          int
 	ServiceName string `bson:"service_name"`
 	PlanName    string `bson:"plan_name"`
 	Apps        []string
+	BoundUnits  []Unit `bson:"bound_units"`
 	Teams       []string
 	TeamOwner   string
+	Description string
+	Tags        []string
+}
+
+type Unit struct {
+	ID, IP string
+}
+
+func (bu Unit) GetID() string {
+	return bu.ID
+}
+
+func (bu Unit) GetIp() string {
+	return bu.IP
 }
 
 // DeleteInstance deletes the service instance from the database.
-func DeleteInstance(si *ServiceInstance) error {
+func DeleteInstance(si *ServiceInstance, requestID string) error {
 	if len(si.Apps) > 0 {
-		msg := "This service instance is bound to at least one app. Unbind them before removing it"
-		return stderrors.New(msg)
+		return ErrServiceInstanceBound
 	}
 	endpoint, err := si.Service().getClient("production")
 	if err == nil {
-		endpoint.Destroy(si)
+		endpoint.Destroy(si, requestID)
 	}
 	conn, err := db.Conn()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	return conn.ServiceInstances().Remove(bson.M{"name": si.Name})
+	return conn.ServiceInstances().Remove(bson.M{"name": si.Name, "service_name": si.ServiceName})
+}
+
+func (si *ServiceInstance) GetIdentifier() string {
+	if si.Id != 0 {
+		return strconv.Itoa(si.Id)
+	}
+	return si.Name
 }
 
 // MarshalJSON marshals the ServiceName in json format.
 func (si *ServiceInstance) MarshalJSON() ([]byte, error) {
-	info, err := si.Info()
+	info, err := si.Info("")
 	if err != nil {
 		info = nil
 	}
 	data := map[string]interface{}{
+		"Id":          si.Id,
 		"Name":        si.Name,
 		"Teams":       si.Teams,
+		"PlanName":    si.PlanName,
 		"Apps":        si.Apps,
 		"ServiceName": si.ServiceName,
 		"Info":        info,
+		"TeamOwner":   si.TeamOwner,
 	}
 	return json.Marshal(&data)
 }
 
-func (si *ServiceInstance) Info() (map[string]string, error) {
+func (si *ServiceInstance) Info(requestID string) (map[string]string, error) {
 	endpoint, err := si.Service().getClient("production")
 	if err != nil {
-		return nil, stderrors.New("endpoint does not exists")
+		return nil, errors.New("endpoint does not exists")
 	}
-	result, err := endpoint.Info(si)
+	result, err := endpoint.Info(si, requestID)
 	if err != nil {
 		return nil, err
 	}
@@ -110,15 +138,6 @@ func (si *ServiceInstance) Service() *Service {
 	return &s
 }
 
-func (si *ServiceInstance) AddApp(appName string) error {
-	index := si.FindApp(appName)
-	if index > -1 {
-		return stderrors.New("This instance already has this app.")
-	}
-	si.Apps = append(si.Apps, appName)
-	return nil
-}
-
 func (si *ServiceInstance) FindApp(appName string) int {
 	index := -1
 	for i, name := range si.Apps {
@@ -130,102 +149,214 @@ func (si *ServiceInstance) FindApp(appName string) int {
 	return index
 }
 
-func (si *ServiceInstance) RemoveApp(appName string) error {
-	index := si.FindApp(appName)
-	if index < 0 {
-		return stderrors.New("This app is not bound to this service instance.")
-	}
-	copy(si.Apps[index:], si.Apps[index+1:])
-	si.Apps = si.Apps[:len(si.Apps)-1]
-	return nil
-}
-
-func (si *ServiceInstance) update() error {
+// Update changes informations of the service instance.
+func (si *ServiceInstance) Update(updateData ServiceInstance) error {
 	conn, err := db.Conn()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	return conn.ServiceInstances().Update(bson.M{"name": si.Name}, si)
+	tags := processTags(updateData.Tags)
+	if tags == nil {
+		updateData.Tags = si.Tags
+	} else {
+		updateData.Tags = tags
+	}
+	return conn.ServiceInstances().Update(
+		bson.M{"name": si.Name, "service_name": si.ServiceName},
+		bson.M{
+			"$set": bson.M{
+				"description": updateData.Description,
+				"tags":        updateData.Tags,
+				"teamowner":   updateData.TeamOwner,
+			},
+			"$addToSet": bson.M{
+				"teams": updateData.TeamOwner,
+			},
+		},
+	)
+}
+
+func (si *ServiceInstance) updateData(update bson.M) error {
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return conn.ServiceInstances().Update(bson.M{"name": si.Name, "service_name": si.ServiceName}, update)
 }
 
 // BindApp makes the bind between the service instance and an app.
-func (si *ServiceInstance) BindApp(app bind.App) error {
+func (si *ServiceInstance) BindApp(app bind.App, shouldRestart bool, writer io.Writer) error {
+	args := bindPipelineArgs{
+		serviceInstance: si,
+		app:             app,
+		writer:          writer,
+		shouldRestart:   shouldRestart,
+	}
 	actions := []*action.Action{
-		&addAppToServiceInstance,
-		&setEnvironVariablesToApp,
+		bindAppDBAction,
+		bindAppEndpointAction,
+		setBoundEnvsAction,
+		bindUnitsAction,
 	}
 	pipeline := action.NewPipeline(actions...)
-	return pipeline.Execute(app, *si)
+	return pipeline.Execute(&args)
 }
 
 // BindUnit makes the bind between the binder and an unit.
-func (si *ServiceInstance) BindUnit(app bind.App, unit bind.Unit) (map[string]string, error) {
+func (si *ServiceInstance) BindUnit(app bind.App, unit bind.Unit) error {
 	endpoint, err := si.Service().getClient("production")
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return endpoint.Bind(si, app, unit)
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	updateOp := bson.M{
+		"$addToSet": bson.M{
+			"bound_units": bson.D([]bson.DocElem{
+				{Name: "id", Value: unit.GetID()},
+				{Name: "ip", Value: unit.GetIp()},
+			}),
+		},
+	}
+	err = conn.ServiceInstances().Update(bson.M{"name": si.Name, "service_name": si.ServiceName, "bound_units.id": bson.M{"$ne": unit.GetID()}}, updateOp)
+	if err != nil {
+		if err == mgo.ErrNotFound {
+			return nil
+		}
+		return err
+	}
+	err = endpoint.BindUnit(si, app, unit)
+	if err != nil {
+		updateOp = bson.M{
+			"$pull": bson.M{
+				"bound_units": bson.D([]bson.DocElem{
+					{Name: "id", Value: unit.GetID()},
+					{Name: "ip", Value: unit.GetIp()},
+				}),
+			},
+		}
+		rollbackErr := si.updateData(updateOp)
+		if rollbackErr != nil {
+			log.Errorf("[bind unit] could not remove stil unbound unit from db after failure: %s", rollbackErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // UnbindApp makes the unbind between the service instance and an app.
-func (si *ServiceInstance) UnbindApp(app bind.App) error {
-	err := si.RemoveApp(app.GetName())
-	if err != nil {
-		return &errors.HTTP{Code: http.StatusPreconditionFailed, Message: "This app is not bound to this service instance."}
+func (si *ServiceInstance) UnbindApp(app bind.App, shouldRestart bool, writer io.Writer) error {
+	if si.FindApp(app.GetName()) == -1 {
+		return ErrAppNotBound
 	}
-	err = si.update()
-	if err != nil {
-		return err
+	args := bindPipelineArgs{
+		serviceInstance: si,
+		app:             app,
+		writer:          writer,
+		shouldRestart:   shouldRestart,
 	}
-	for _, unit := range app.GetUnits() {
-		go func(unit bind.Unit) {
-			si.UnbindUnit(unit)
-		}(unit)
+	actions := []*action.Action{
+		&unbindUnits,
+		&unbindAppDB,
+		&unbindAppEndpoint,
+		&removeBoundEnvs,
 	}
-	var envVars []string
-	for k := range app.InstanceEnv(si.Name) {
-		envVars = append(envVars, k)
-	}
-	return app.UnsetEnvs(envVars, false)
+	pipeline := action.NewPipeline(actions...)
+	return pipeline.Execute(&args)
 }
 
 // UnbindUnit makes the unbind between the service instance and an unit.
-func (si *ServiceInstance) UnbindUnit(unit bind.Unit) error {
+func (si *ServiceInstance) UnbindUnit(app bind.App, unit bind.Unit) error {
 	endpoint, err := si.Service().getClient("production")
 	if err != nil {
 		return err
 	}
-	return endpoint.Unbind(si, unit)
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	updateOp := bson.M{
+		"$pull": bson.M{
+			"bound_units": bson.D([]bson.DocElem{
+				{Name: "id", Value: unit.GetID()},
+				{Name: "ip", Value: unit.GetIp()},
+			}),
+		},
+	}
+	err = conn.ServiceInstances().Update(bson.M{"name": si.Name, "service_name": si.ServiceName, "bound_units.id": unit.GetID()}, updateOp)
+	if err != nil {
+		if err == mgo.ErrNotFound {
+			return ErrUnitNotBound
+		}
+		return err
+	}
+	err = endpoint.UnbindUnit(si, app, unit)
+	if err != nil {
+		updateOp = bson.M{
+			"$addToSet": bson.M{
+				"bound_units": bson.D([]bson.DocElem{
+					{Name: "id", Value: unit.GetID()},
+					{Name: "ip", Value: unit.GetIp()},
+				}),
+			},
+		}
+		rollbackErr := si.updateData(updateOp)
+		if rollbackErr != nil {
+			log.Errorf("[unbind unit] could not add bound unit back to db after failure: %s", rollbackErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // Status returns the service instance status.
-func (si *ServiceInstance) Status() (string, error) {
+func (si *ServiceInstance) Status(requestID string) (string, error) {
 	endpoint, err := si.Service().getClient("production")
 	if err != nil {
 		return "", err
 	}
-	return endpoint.Status(si)
+	return endpoint.Status(si, requestID)
 }
 
-func genericServiceInstancesFilter(services interface{}, teams []string) (q, f bson.M) {
-	f = bson.M{"name": 1, "service_name": 1, "apps": 1}
-	q = bson.M{}
+func (si *ServiceInstance) Grant(teamName string) error {
+	team, err := auth.GetTeam(teamName)
+	if err != nil {
+		return err
+	}
+	return si.updateData(bson.M{"$push": bson.M{"teams": team.Name}})
+}
+
+func (si *ServiceInstance) Revoke(teamName string) error {
+	team, err := auth.GetTeam(teamName)
+	if err != nil {
+		return err
+	}
+	return si.updateData(bson.M{"$pull": bson.M{"teams": team.Name}})
+}
+
+func genericServiceInstancesFilter(services interface{}, teams []string) bson.M {
+	query := bson.M{}
 	if len(teams) != 0 {
-		q["teams"] = bson.M{"$in": teams}
+		query["teams"] = bson.M{"$in": teams}
 	}
 	if v, ok := services.([]Service); ok {
 		names := GetServicesNames(v)
-		q["service_name"] = bson.M{"$in": names}
+		query["service_name"] = bson.M{"$in": names}
 	}
 	if v, ok := services.(Service); ok {
-		q["service_name"] = v.Name
+		query["service_name"] = v.Name
 	}
-	return
+	return query
 }
 
-func validateServiceInstanceName(name string) error {
-	if !instanceNameRegexp.MatchString(name) {
+func validateServiceInstanceName(service string, instance string) error {
+	if !validation.ValidateName(instance) {
 		return ErrInvalidInstanceName
 	}
 	conn, err := db.Conn()
@@ -233,49 +364,31 @@ func validateServiceInstanceName(name string) error {
 		return nil
 	}
 	defer conn.Close()
-	length, err := conn.ServiceInstances().Find(bson.M{"name": name}).Count()
+	query := bson.M{"name": instance, "service_name": service}
+	length, err := conn.ServiceInstances().Find(query).Count()
+	if err != nil {
+		return err
+	}
 	if length > 0 {
 		return ErrInstanceNameAlreadyExists
 	}
 	return nil
 }
 
-func CreateServiceInstance(instance ServiceInstance, service *Service, user *auth.User) error {
-	err := validateServiceInstanceName(instance.Name)
+func CreateServiceInstance(instance ServiceInstance, service *Service, user *auth.User, requestID string) error {
+	err := validateServiceInstanceName(service.Name, instance.Name)
 	if err != nil {
 		return err
 	}
 	instance.ServiceName = service.Name
-	teams, err := user.Teams()
-	if err != nil {
-		return err
-	}
-	instance.Teams = make([]string, 0, len(teams))
-	for _, team := range teams {
-		if service.HasTeam(&team) || !service.IsRestricted {
-			instance.Teams = append(instance.Teams, team.Name)
-		}
-	}
 	if instance.TeamOwner == "" {
-		if len(instance.Teams) > 1 {
-			return ErrMultipleTeams
-		}
-		instance.TeamOwner = instance.Teams[0]
-	} else {
-		var found bool
-		for _, team := range instance.Teams {
-			if instance.TeamOwner == team {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return auth.ErrTeamNotFound
-		}
+		return ErrTeamMandatory
 	}
+	instance.Teams = []string{instance.TeamOwner}
+	instance.Tags = processTags(instance.Tags)
 	actions := []*action.Action{&createServiceInstance, &insertServiceInstance}
 	pipeline := action.NewPipeline(actions...)
-	return pipeline.Execute(*service, instance, user.Email)
+	return pipeline.Execute(*service, instance, user.Email, requestID)
 }
 
 func GetServiceInstancesByServices(services []Service) ([]ServiceInstance, error) {
@@ -285,55 +398,93 @@ func GetServiceInstancesByServices(services []Service) ([]ServiceInstance, error
 		return nil, err
 	}
 	defer conn.Close()
-	q, _ := genericServiceInstancesFilter(services, []string{})
-	f := bson.M{"name": 1, "service_name": 1}
-	err = conn.ServiceInstances().Find(q).Select(f).All(&instances)
+	query := genericServiceInstancesFilter(services, []string{})
+	f := bson.M{"name": 1, "service_name": 1, "tags": 1}
+	err = conn.ServiceInstances().Find(query).Select(f).All(&instances)
 	return instances, err
 }
 
-func GetServiceInstancesByServicesAndTeams(services []Service, u *auth.User) ([]ServiceInstance, error) {
+func GetServicesInstancesByTeamsAndNames(teams []string, names []string, appName, serviceName string) ([]ServiceInstance, error) {
+	filter := bson.M{}
+	if teams != nil || names != nil {
+		filter = bson.M{
+			"$or": []bson.M{
+				{"teams": bson.M{"$in": teams}},
+				{"name": bson.M{"$in": names}},
+			},
+		}
+	}
+	if appName != "" {
+		filter["apps"] = appName
+	}
+	if serviceName != "" {
+		filter["service_name"] = serviceName
+	}
+	conn, err := db.Conn()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
 	var instances []ServiceInstance
-	teams, err := u.Teams()
-	if err != nil {
-		return nil, err
-	}
-	if len(teams) == 0 {
-		return nil, nil
-	}
-	conn, err := db.Conn()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	q, f := genericServiceInstancesFilter(services, auth.GetTeamsNames(teams))
-	err = conn.ServiceInstances().Find(q).Select(f).All(&instances)
+	err = conn.ServiceInstances().Find(filter).All(&instances)
 	return instances, err
 }
 
-func GetServiceInstance(name string, u *auth.User) (*ServiceInstance, error) {
+func GetServiceInstance(serviceName string, instanceName string) (*ServiceInstance, error) {
 	conn, err := db.Conn()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	rec.Log(u.Email, "get-service-instance", name)
 	var instance ServiceInstance
-	err = conn.ServiceInstances().Find(bson.M{"name": name}).One(&instance)
+	err = conn.ServiceInstances().Find(bson.M{"name": instanceName, "service_name": serviceName}).One(&instance)
 	if err != nil {
 		return nil, ErrServiceInstanceNotFound
-	}
-	if !auth.CheckUserAccess(instance.Teams, u) {
-		return nil, ErrAccessNotAllowed
 	}
 	return &instance, nil
 }
 
-// Proxy is a proxy between tsuru and the service.
-// This method allow customized service methods.
-func Proxy(si *ServiceInstance, method, path string, body io.ReadCloser) (*http.Response, error) {
-	endpoint, err := si.Service().getClient("production")
+func GetServiceInstancesBoundToApp(appName string) ([]ServiceInstance, error) {
+	conn, err := db.Conn()
 	if err != nil {
 		return nil, err
 	}
-	return endpoint.Proxy(method, path, body)
+	defer conn.Close()
+	var instances []ServiceInstance
+	q := bson.M{"apps": bson.M{"$in": []string{appName}}}
+	err = conn.ServiceInstances().Find(q).All(&instances)
+	if err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
+func processTags(tags []string) []string {
+	if tags == nil {
+		return nil
+	}
+	processedTags := []string{}
+	usedTags := make(map[string]bool)
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if len(tag) > 0 && !usedTags[tag] {
+			processedTags = append(processedTags, tag)
+			usedTags[tag] = true
+		}
+	}
+	return processedTags
+}
+
+func RenameServiceInstanceTeam(oldName, newName string) error {
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	bulk := conn.ServiceInstances().Bulk()
+	bulk.UpdateAll(bson.M{"teamowner": oldName}, bson.M{"$set": bson.M{"teamowner": newName}})
+	bulk.UpdateAll(bson.M{"teams": oldName}, bson.M{"$push": bson.M{"teams": newName}})
+	bulk.UpdateAll(bson.M{"teams": oldName}, bson.M{"$pull": bson.M{"teams": oldName}})
+	_, err = bulk.Run()
+	return err
 }

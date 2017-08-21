@@ -1,10 +1,12 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+
 package log
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 )
@@ -16,8 +18,15 @@ var (
 )
 
 func NewFileLogger(fileName string, debug bool) Logger {
-	file, _ := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-	logger := log.New(file, "", log.LstdFlags)
+	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+	if err != nil {
+		panic(err)
+	}
+	return NewWriterLogger(file, debug)
+}
+
+func NewWriterLogger(writer io.Writer, debug bool) Logger {
+	logger := log.New(writer, "", log.LstdFlags)
 	return &fileLogger{logger: logger, debug: debug}
 }
 
