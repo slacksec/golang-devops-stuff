@@ -1,10 +1,19 @@
 package access_log_test
 
 import (
-	. "github.com/cloudfoundry/gorouter/access_log"
-	"github.com/cloudfoundry/gorouter/route"
-	"github.com/cloudfoundry/gorouter/test_util"
-	"github.com/cloudfoundry/loggregatorlib/logmessage"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+
+	. "code.cloudfoundry.org/gorouter/access_log"
+	"code.cloudfoundry.org/gorouter/access_log/schema"
+	"code.cloudfoundry.org/gorouter/config"
+	"code.cloudfoundry.org/gorouter/logger"
+	"code.cloudfoundry.org/gorouter/route"
+	"code.cloudfoundry.org/gorouter/test_util"
+	"code.cloudfoundry.org/routing-api/models"
+	"github.com/cloudfoundry/dropsonde/log_sender/fake"
+	"github.com/cloudfoundry/dropsonde/logs"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -14,132 +23,193 @@ import (
 	"time"
 )
 
-type mockEmitter struct {
-	emitted bool
-	appId   string
-	message string
-	done    chan bool
-}
-
-func (m *mockEmitter) Emit(appid, message string) {
-	m.emitted = true
-	m.appId = appid
-	m.message = message
-	m.done <- true
-}
-
-func (m *mockEmitter) EmitError(appid, message string) {
-}
-
-func (m *mockEmitter) EmitLogMessage(l *logmessage.LogMessage) {
-}
-
-func NewMockEmitter() *mockEmitter {
-	return &mockEmitter{
-		emitted: false,
-		done:    make(chan bool, 1),
-	}
-}
-
 var _ = Describe("AccessLog", func() {
 
-	Context("with an emitter", func() {
-		It("a record is written", func() {
-			testEmitter := NewMockEmitter()
-			accessLogger := NewFileAndLoggregatorAccessLogger(nil, testEmitter)
-			go accessLogger.Run()
+	Describe("FileLogger", func() {
+		var (
+			logger logger.Logger
+		)
+		Context("with a dropsonde source instance", func() {
 
-			accessLogger.Log(*CreateAccessLogRecord())
-			Eventually(testEmitter.done).Should(Receive())
-			Ω(testEmitter.emitted).Should(BeTrue())
-			Ω(testEmitter.appId).To(Equal("my_awesome_id"))
-			Ω(testEmitter.message).To(MatchRegexp("^.*foo.bar.*\n"))
+			BeforeEach(func() {
+				logger = test_util.NewTestZapLogger("test")
+			})
 
-			accessLogger.Stop()
+			It("logs to dropsonde", func() {
+
+				fakeLogSender := fake.NewFakeLogSender()
+				logs.Initialize(fakeLogSender)
+				accessLogger := NewFileAndLoggregatorAccessLogger(logger, "42")
+				go accessLogger.Run()
+
+				accessLogger.Log(*CreateAccessLogRecord())
+
+				Eventually(fakeLogSender.GetLogs).Should(HaveLen(1))
+				Expect(fakeLogSender.GetLogs()[0].AppId).To(Equal("my_awesome_id"))
+				Expect(fakeLogSender.GetLogs()[0].Message).To(MatchRegexp("^.*foo.bar.*\n"))
+				Expect(fakeLogSender.GetLogs()[0].SourceType).To(Equal("RTR"))
+				Expect(fakeLogSender.GetLogs()[0].SourceInstance).To(Equal("42"))
+				Expect(fakeLogSender.GetLogs()[0].MessageType).To(Equal("OUT"))
+
+				accessLogger.Stop()
+			})
+
+			It("a record with no app id is not logged to dropsonde", func() {
+
+				fakeLogSender := fake.NewFakeLogSender()
+				logs.Initialize(fakeLogSender)
+
+				accessLogger := NewFileAndLoggregatorAccessLogger(logger, "43")
+
+				routeEndpoint := route.NewEndpoint("", "127.0.0.1", 4567, "", "", nil, -1, "", models.ModificationTag{}, "", false)
+
+				accessLogRecord := CreateAccessLogRecord()
+				accessLogRecord.RouteEndpoint = routeEndpoint
+				accessLogger.Log(*accessLogRecord)
+				go accessLogger.Run()
+
+				Consistently(fakeLogSender.GetLogs).Should(HaveLen(0))
+
+				accessLogger.Stop()
+			})
+
 		})
 
-		It("a record with no app id is not written", func() {
-			testEmitter := NewMockEmitter()
-			accessLogger := NewFileAndLoggregatorAccessLogger(nil, testEmitter)
+		Context("created with access log file", func() {
+			It("writes to the log file and Stdout", func() {
+				var fakeAccessFile = new(test_util.FakeFile)
+				fname := filepath.Join(os.TempDir(), "stdout")
+				oldStdout := os.Stdout
+				tempStdout, _ := os.Create(fname)
+				defer tempStdout.Close()
+				os.Stdout = tempStdout
+				accessLogger := NewFileAndLoggregatorAccessLogger(logger, "", fakeAccessFile, os.Stdout)
 
-			routeEndpoint := route.NewEndpoint("", "127.0.0.1", 4567, "", nil)
+				go accessLogger.Run()
+				accessLogger.Log(*CreateAccessLogRecord())
 
-			accessLogRecord := CreateAccessLogRecord()
-			accessLogRecord.RouteEndpoint = routeEndpoint
-			accessLogger.Log(*accessLogRecord)
-			go accessLogger.Run()
+				os.Stdout = oldStdout
+				var stdoutPayload []byte
+				Eventually(func() int {
+					stdoutPayload, _ = ioutil.ReadFile(fname)
+					return len(stdoutPayload)
+				}).ShouldNot(Equal(0))
+				Expect(string(stdoutPayload)).To(MatchRegexp("^.*foo.bar.*\n"))
 
-			Consistently(testEmitter.done).ShouldNot(Receive())
+				var payload []byte
+				Eventually(func() int {
+					n, _ := fakeAccessFile.Read(&payload)
+					return n
+				}).ShouldNot(Equal(0))
+				Expect(string(payload)).To(MatchRegexp("^.*foo.bar.*\n"))
 
-			accessLogger.Stop()
+				accessLogger.Stop()
+			})
+		})
+
+		Measure("Log write speed", func(b Benchmarker) {
+			w := nullWriter{}
+
+			b.Time("writeTime", func() {
+				for i := 0; i < 500; i++ {
+					r := CreateAccessLogRecord()
+					r.WriteTo(w)
+					r.WriteTo(w)
+				}
+			})
+		}, 500)
+	})
+
+	Describe("FileLogger", func() {
+		var (
+			logger logger.Logger
+			cfg    *config.Config
+		)
+
+		BeforeEach(func() {
+			logger = test_util.NewTestZapLogger("test")
+
+			cfg = config.DefaultConfig()
+		})
+
+		It("creates null access loger if no access log and loggregator is disabled", func() {
+			Expect(CreateRunningAccessLogger(logger, cfg)).To(BeAssignableToTypeOf(&NullAccessLogger{}))
+		})
+
+		It("creates an access log when loggegrator is enabled", func() {
+			cfg.Logging.LoggregatorEnabled = true
+			cfg.AccessLog.File = ""
+
+			accessLogger, _ := CreateRunningAccessLogger(logger, cfg)
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).FileWriter()).To(BeNil())
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).WriterCount()).To(Equal(0))
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).DropsondeSourceInstance()).To(Equal("0"))
+		})
+
+		It("creates an access log if an access log is specified", func() {
+			cfg.AccessLog.File = "/dev/null"
+
+			accessLogger, _ := CreateRunningAccessLogger(logger, cfg)
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).FileWriter()).ToNot(BeNil())
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).DropsondeSourceInstance()).To(BeEmpty())
+		})
+
+		It("creates an AccessLogger if both access log and loggregator is enabled", func() {
+			cfg.Logging.LoggregatorEnabled = true
+			cfg.AccessLog.File = "/dev/null"
+
+			accessLogger, _ := CreateRunningAccessLogger(logger, cfg)
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).FileWriter()).ToNot(BeNil())
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).WriterCount()).To(Equal(1))
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).DropsondeSourceInstance()).ToNot(BeEmpty())
+		})
+
+		It("should have two writers configured if access log file and enable_streaming are enabled", func() {
+			cfg.Logging.LoggregatorEnabled = true
+			cfg.AccessLog.File = "/dev/null"
+			cfg.AccessLog.EnableStreaming = true
+
+			accessLogger, _ := CreateRunningAccessLogger(logger, cfg)
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).FileWriter()).ToNot(BeNil())
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).WriterCount()).To(Equal(2))
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).DropsondeSourceInstance()).ToNot(BeEmpty())
+		})
+
+		It("should have one writer configured if access log file set but enable_streaming is disabled", func() {
+			cfg.Logging.LoggregatorEnabled = true
+			cfg.AccessLog.File = "/dev/null"
+			cfg.AccessLog.EnableStreaming = false
+
+			accessLogger, _ := CreateRunningAccessLogger(logger, cfg)
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).FileWriter()).ToNot(BeNil())
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).WriterCount()).To(Equal(1))
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).DropsondeSourceInstance()).ToNot(BeEmpty())
+		})
+
+		It("should have one writer configured if access log file not set but enable_streaming is enabled", func() {
+			cfg.Logging.LoggregatorEnabled = true
+			cfg.AccessLog.File = ""
+			cfg.AccessLog.EnableStreaming = true
+
+			accessLogger, _ := CreateRunningAccessLogger(logger, cfg)
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).FileWriter()).ToNot(BeNil())
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).WriterCount()).To(Equal(1))
+			Expect(accessLogger.(*FileAndLoggregatorAccessLogger).DropsondeSourceInstance()).ToNot(BeEmpty())
+		})
+
+		It("reports an error if the access log location is invalid", func() {
+			cfg.AccessLog.File = "/this\\is/illegal"
+
+			a, err := CreateRunningAccessLogger(logger, cfg)
+			Expect(err).To(HaveOccurred())
+			Expect(a).To(BeNil())
 		})
 
 	})
 
-	Context("with a file", func() {
-		It("writes to the log file", func() {
-			var fakeFile = new(test_util.FakeFile)
-
-			accessLogger := NewFileAndLoggregatorAccessLogger(fakeFile, nil)
-			go accessLogger.Run()
-			accessLogger.Log(*CreateAccessLogRecord())
-
-			var payload []byte
-			Eventually(func() int {
-				n, _ := fakeFile.Read(&payload)
-				return n
-			}).ShouldNot(Equal(0))
-			Ω(string(payload)).To(MatchRegexp("^.*foo.bar.*\n"))
-
-			accessLogger.Stop()
-		})
-	})
-
-	Context("with valid hostnames", func() {
-		It("creates an emitter", func() {
-			e, err := NewEmitter("localhost:9843", "secret", 42)
-			Ω(err).ToNot(HaveOccurred())
-			Ω(e).ToNot(BeNil())
-
-			e, err = NewEmitter("10.10.16.14:9843", "secret", 42)
-			Ω(err).ToNot(HaveOccurred())
-			Ω(e).ToNot(BeNil())
-		})
-	})
-
-	Context("when invalid host:port pairs are provided", func() {
-		It("does not create an emitter", func() {
-			e, err := NewEmitter("this_is_not_a_url", "secret", 42)
-			Ω(err).To(HaveOccurred())
-			Ω(e).To(BeNil())
-
-			e, err = NewEmitter("localhost", "secret", 42)
-			Ω(err).To(HaveOccurred())
-			Ω(e).To(BeNil())
-
-			e, err = NewEmitter("10.10.16.14", "secret", 42)
-			Ω(err).To(HaveOccurred())
-			Ω(e).To(BeNil())
-
-			e, err = NewEmitter("", "secret", 42)
-			Ω(err).To(HaveOccurred())
-			Ω(e).To(BeNil())
-		})
-	})
-
-	Measure("Log write speed", func(b Benchmarker) {
-		r := CreateAccessLogRecord()
-		w := nullWriter{}
-
-		b.Time("writeTime", func() {
-			for i := 0; i < 100; i++ {
-				r.WriteTo(w)
-			}
-		})
-	}, 100)
 })
 
-func CreateAccessLogRecord() *AccessLogRecord {
+func CreateAccessLogRecord() *schema.AccessLogRecord {
 	u, err := url.Parse("http://foo.bar:1234/quz?wat")
 	if err != nil {
 		panic(err)
@@ -161,9 +231,9 @@ func CreateAccessLogRecord() *AccessLogRecord {
 		StatusCode: http.StatusOK,
 	}
 
-	b := route.NewEndpoint("my_awesome_id", "127.0.0.1", 4567, "", nil)
+	b := route.NewEndpoint("my_awesome_id", "127.0.0.1", 4567, "", "", nil, -1, "", models.ModificationTag{}, "", false)
 
-	r := AccessLogRecord{
+	r := schema.AccessLogRecord{
 		Request:       req,
 		StatusCode:    res.StatusCode,
 		RouteEndpoint: b,

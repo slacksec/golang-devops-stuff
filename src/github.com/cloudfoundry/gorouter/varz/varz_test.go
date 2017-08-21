@@ -1,11 +1,14 @@
 package varz_test
 
 import (
-	"github.com/cloudfoundry/gorouter/config"
-	"github.com/cloudfoundry/gorouter/registry"
-	"github.com/cloudfoundry/gorouter/route"
-	. "github.com/cloudfoundry/gorouter/varz"
-	"github.com/cloudfoundry/yagnats/fakeyagnats"
+	"code.cloudfoundry.org/gorouter/config"
+	"code.cloudfoundry.org/gorouter/logger"
+	"code.cloudfoundry.org/gorouter/metrics/fakes"
+	"code.cloudfoundry.org/gorouter/registry"
+	"code.cloudfoundry.org/gorouter/route"
+	"code.cloudfoundry.org/gorouter/test_util"
+	. "code.cloudfoundry.org/gorouter/varz"
+	"code.cloudfoundry.org/routing-api/models"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
@@ -18,9 +21,11 @@ import (
 var _ = Describe("Varz", func() {
 	var Varz Varz
 	var Registry *registry.RouteRegistry
+	var logger logger.Logger
 
 	BeforeEach(func() {
-		Registry = registry.NewRouteRegistry(config.DefaultConfig(), fakeyagnats.New())
+		logger = test_util.NewTestZapLogger("test")
+		Registry = registry.NewRouteRegistry(logger, config.DefaultConfig(), new(fakes.FakeRouteRegistryReporter))
 		Varz = NewVarz(Registry)
 	})
 
@@ -47,15 +52,15 @@ var _ = Describe("Varz", func() {
 		}
 
 		b, e := json.Marshal(v)
-		Ω(e).ShouldNot(HaveOccurred())
+		Expect(e).ToNot(HaveOccurred())
 
 		d := make(map[string]interface{})
 		e = json.Unmarshal(b, &d)
-		Ω(e).ShouldNot(HaveOccurred())
+		Expect(e).ToNot(HaveOccurred())
 
 		for _, k := range members {
 			_, ok := d[k]
-			Ω(ok).Should(BeTrue(), k)
+			Expect(ok).To(BeTrue(), k)
 		}
 	})
 
@@ -65,51 +70,46 @@ var _ = Describe("Varz", func() {
 		time.Sleep(10 * time.Millisecond)
 
 		timeSince := findValue(Varz, "ms_since_last_registry_update").(float64)
-		Ω(timeSince).Should(BeNumerically("<", 1000))
-		Ω(timeSince).Should(BeNumerically(">=", 10))
+		Expect(timeSince).To(BeNumerically("<", 1000))
+		Expect(timeSince).To(BeNumerically(">=", 10))
 	})
 
 	It("has urls", func() {
-		Ω(findValue(Varz, "urls")).To(Equal(float64(0)))
+		Expect(findValue(Varz, "urls")).To(Equal(float64(0)))
 
-		var fooReg = route.NewEndpoint("12345", "192.168.1.1", 1234, "", map[string]string{})
+		var fooReg = route.NewEndpoint("12345", "192.168.1.1", 1234, "", "", map[string]string{}, -1, "", models.ModificationTag{}, "", false)
 
 		// Add a route
 		Registry.Register("foo.vcap.me", fooReg)
 		Registry.Register("fooo.vcap.me", fooReg)
 
-		Ω(findValue(Varz, "urls")).To(Equal(float64(2)))
+		Expect(findValue(Varz, "urls")).To(Equal(float64(2)))
 	})
 
 	It("updates bad requests", func() {
-		r := http.Request{}
+		Varz.CaptureBadRequest()
+		Expect(findValue(Varz, "bad_requests")).To(Equal(float64(1)))
 
-		Varz.CaptureBadRequest(&r)
-		Ω(findValue(Varz, "bad_requests")).To(Equal(float64(1)))
-
-		Varz.CaptureBadRequest(&r)
-		Ω(findValue(Varz, "bad_requests")).To(Equal(float64(2)))
+		Varz.CaptureBadRequest()
+		Expect(findValue(Varz, "bad_requests")).To(Equal(float64(2)))
 	})
 
 	It("updates bad gateways", func() {
-		r := &http.Request{}
+		Varz.CaptureBadGateway()
+		Expect(findValue(Varz, "bad_gateways")).To(Equal(float64(1)))
 
-		Varz.CaptureBadGateway(r)
-		Ω(findValue(Varz, "bad_gateways")).To(Equal(float64(1)))
-
-		Varz.CaptureBadGateway(r)
-		Ω(findValue(Varz, "bad_gateways")).To(Equal(float64(2)))
+		Varz.CaptureBadGateway()
+		Expect(findValue(Varz, "bad_gateways")).To(Equal(float64(2)))
 	})
 
 	It("updates requests", func() {
 		b := &route.Endpoint{}
-		r := http.Request{}
 
-		Varz.CaptureRoutingRequest(b, &r)
-		Ω(findValue(Varz, "requests")).To(Equal(float64(1)))
+		Varz.CaptureRoutingRequest(b)
+		Expect(findValue(Varz, "requests")).To(Equal(float64(1)))
 
-		Varz.CaptureRoutingRequest(b, &r)
-		Ω(findValue(Varz, "requests")).To(Equal(float64(2)))
+		Varz.CaptureRoutingRequest(b)
+		Expect(findValue(Varz, "requests")).To(Equal(float64(2)))
 	})
 
 	It("updates requests with tags", func() {
@@ -125,13 +125,10 @@ var _ = Describe("Varz", func() {
 			},
 		}
 
-		r1 := http.Request{}
-		r2 := http.Request{}
+		Varz.CaptureRoutingRequest(b1)
+		Varz.CaptureRoutingRequest(b2)
 
-		Varz.CaptureRoutingRequest(b1, &r1)
-		Varz.CaptureRoutingRequest(b2, &r2)
-
-		Ω(findValue(Varz, "tags", "component", "cc", "requests")).To(Equal(float64(2)))
+		Expect(findValue(Varz, "tags", "component", "cc", "requests")).To(Equal(float64(2)))
 	})
 
 	It("updates responses", func() {
@@ -139,20 +136,16 @@ var _ = Describe("Varz", func() {
 		var t time.Time
 		var d time.Duration
 
-		r1 := &http.Response{
-			StatusCode: http.StatusOK,
-		}
+		r1 := http.StatusOK
 
-		r2 := &http.Response{
-			StatusCode: http.StatusNotFound,
-		}
+		r2 := http.StatusNotFound
 
-		Varz.CaptureRoutingResponse(b, r1, t, d)
-		Varz.CaptureRoutingResponse(b, r2, t, d)
-		Varz.CaptureRoutingResponse(b, r2, t, d)
+		Varz.CaptureRoutingResponseLatency(b, r1, t, d)
+		Varz.CaptureRoutingResponseLatency(b, r2, t, d)
+		Varz.CaptureRoutingResponseLatency(b, r2, t, d)
 
-		Ω(findValue(Varz, "responses_2xx")).To(Equal(float64(1)))
-		Ω(findValue(Varz, "responses_4xx")).To(Equal(float64(2)))
+		Expect(findValue(Varz, "responses_2xx")).To(Equal(float64(1)))
+		Expect(findValue(Varz, "responses_4xx")).To(Equal(float64(2)))
 	})
 
 	It("update responses with tags", func() {
@@ -171,20 +164,16 @@ var _ = Describe("Varz", func() {
 			},
 		}
 
-		r1 := &http.Response{
-			StatusCode: http.StatusOK,
-		}
+		r1 := http.StatusOK
 
-		r2 := &http.Response{
-			StatusCode: http.StatusNotFound,
-		}
+		r2 := http.StatusNotFound
 
-		Varz.CaptureRoutingResponse(b1, r1, t, d)
-		Varz.CaptureRoutingResponse(b2, r2, t, d)
-		Varz.CaptureRoutingResponse(b2, r2, t, d)
+		Varz.CaptureRoutingResponseLatency(b1, r1, t, d)
+		Varz.CaptureRoutingResponseLatency(b2, r2, t, d)
+		Varz.CaptureRoutingResponseLatency(b2, r2, t, d)
 
-		Ω(findValue(Varz, "tags", "component", "cc", "responses_2xx")).To(Equal(float64(1)))
-		Ω(findValue(Varz, "tags", "component", "cc", "responses_4xx")).To(Equal(float64(2)))
+		Expect(findValue(Varz, "tags", "component", "cc", "responses_2xx")).To(Equal(float64(1)))
+		Expect(findValue(Varz, "tags", "component", "cc", "responses_4xx")).To(Equal(float64(2)))
 	})
 
 	It("updates response latency", func() {
@@ -192,17 +181,15 @@ var _ = Describe("Varz", func() {
 		var startedAt = time.Now()
 		var duration = 1 * time.Millisecond
 
-		response := &http.Response{
-			StatusCode: http.StatusOK,
-		}
+		statusCode := http.StatusOK
 
-		Varz.CaptureRoutingResponse(routeEndpoint, response, startedAt, duration)
+		Varz.CaptureRoutingResponseLatency(routeEndpoint, statusCode, startedAt, duration)
 
-		Ω(findValue(Varz, "latency", "50").(float64)).To(Equal(float64(duration) / float64(time.Second)))
-		Ω(findValue(Varz, "latency", "75").(float64)).To(Equal(float64(duration) / float64(time.Second)))
-		Ω(findValue(Varz, "latency", "90").(float64)).To(Equal(float64(duration) / float64(time.Second)))
-		Ω(findValue(Varz, "latency", "95").(float64)).To(Equal(float64(duration) / float64(time.Second)))
-		Ω(findValue(Varz, "latency", "99").(float64)).To(Equal(float64(duration) / float64(time.Second)))
+		Expect(findValue(Varz, "latency", "50").(float64)).To(Equal(float64(duration) / float64(time.Second)))
+		Expect(findValue(Varz, "latency", "75").(float64)).To(Equal(float64(duration) / float64(time.Second)))
+		Expect(findValue(Varz, "latency", "90").(float64)).To(Equal(float64(duration) / float64(time.Second)))
+		Expect(findValue(Varz, "latency", "95").(float64)).To(Equal(float64(duration) / float64(time.Second)))
+		Expect(findValue(Varz, "latency", "99").(float64)).To(Equal(float64(duration) / float64(time.Second)))
 	})
 })
 
@@ -219,17 +206,17 @@ func findValue(varz Varz, x ...string) interface{} {
 	var ok bool
 
 	b, err := json.Marshal(varz)
-	Ω(err).ShouldNot(HaveOccurred())
+	Expect(err).ToNot(HaveOccurred())
 
 	y := make(map[string]interface{})
 	err = json.Unmarshal(b, &y)
-	Ω(err).ShouldNot(HaveOccurred())
+	Expect(err).ToNot(HaveOccurred())
 	z = y
 
 	for _, e := range x {
 		u := z.(map[string]interface{})
 		z, ok = u[e]
-		Ω(ok).Should(BeTrue(), fmt.Sprintf("no key: %s", e))
+		Expect(ok).To(BeTrue(), fmt.Sprintf("no key: %s", e))
 	}
 
 	return z

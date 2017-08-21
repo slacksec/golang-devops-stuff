@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -9,84 +10,119 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudfoundry-incubator/dropsonde/autowire"
-	"github.com/cloudfoundry/gorouter/access_log"
-	router_http "github.com/cloudfoundry/gorouter/common/http"
-	"github.com/cloudfoundry/gorouter/route"
-	steno "github.com/cloudfoundry/gosteno"
+	"code.cloudfoundry.org/gorouter/access_log"
+	router_http "code.cloudfoundry.org/gorouter/common/http"
+	"code.cloudfoundry.org/gorouter/config"
+	"code.cloudfoundry.org/gorouter/handlers"
+	"code.cloudfoundry.org/gorouter/logger"
+	"code.cloudfoundry.org/gorouter/metrics"
+	"code.cloudfoundry.org/gorouter/proxy/handler"
+	"code.cloudfoundry.org/gorouter/proxy/round_tripper"
+	"code.cloudfoundry.org/gorouter/proxy/utils"
+	"code.cloudfoundry.org/gorouter/registry"
+	"code.cloudfoundry.org/gorouter/route"
+	"code.cloudfoundry.org/gorouter/routeservice"
+	"github.com/uber-go/zap"
+	"github.com/urfave/negroni"
 )
 
 const (
 	VcapCookieId    = "__VCAP_ID__"
 	StickyCookieKey = "JSESSIONID"
-	retries         = 3
 )
-
-var noEndpointsAvailable = errors.New("No endpoints available")
-
-type LookupRegistry interface {
-	Lookup(uri route.Uri) *route.Pool
-}
-
-type AfterRoundTrip func(rsp *http.Response, endpoint *route.Endpoint, err error)
-
-type ProxyReporter interface {
-	CaptureBadRequest(req *http.Request)
-	CaptureBadGateway(req *http.Request)
-	CaptureRoutingRequest(b *route.Endpoint, req *http.Request)
-	CaptureRoutingResponse(b *route.Endpoint, res *http.Response, t time.Time, d time.Duration)
-}
 
 type Proxy interface {
 	ServeHTTP(responseWriter http.ResponseWriter, request *http.Request)
-	Wait()
-}
-
-type ProxyArgs struct {
-	EndpointTimeout time.Duration
-	Ip              string
-	TraceKey        string
-	Registry        LookupRegistry
-	Reporter        ProxyReporter
-	AccessLogger    access_log.AccessLogger
 }
 
 type proxy struct {
-	ip           string
-	traceKey     string
-	logger       *steno.Logger
-	registry     LookupRegistry
-	reporter     ProxyReporter
-	accessLogger access_log.AccessLogger
-	transport    *http.Transport
-
-	waitgroup *sync.WaitGroup
+	ip                       string
+	traceKey                 string
+	logger                   logger.Logger
+	reporter                 metrics.CombinedReporter
+	accessLogger             access_log.AccessLogger
+	secureCookies            bool
+	heartbeatOK              *int32
+	routeServiceConfig       *routeservice.RouteServiceConfig
+	healthCheckUserAgent     string
+	forceForwardedProtoHttps bool
+	defaultLoadBalance       string
+	bufferPool               httputil.BufferPool
 }
 
-func NewProxy(args ProxyArgs) Proxy {
-	return &proxy{
-		accessLogger: args.AccessLogger,
-		traceKey:     args.TraceKey,
-		ip:           args.Ip,
-		logger:       steno.NewLogger("router.proxy"),
-		registry:     args.Registry,
-		reporter:     args.Reporter,
-		transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				conn, err := net.DialTimeout(network, addr, 5*time.Second)
-				if err != nil {
-					return conn, err
-				}
-				if args.EndpointTimeout > 0 {
-					err = conn.SetDeadline(time.Now().Add(args.EndpointTimeout))
-				}
-				return conn, err
-			},
-			DisableKeepAlives:     true,
-			ResponseHeaderTimeout: args.EndpointTimeout,
-		},
-		waitgroup: &sync.WaitGroup{},
+func NewProxy(
+	logger logger.Logger,
+	accessLogger access_log.AccessLogger,
+	c *config.Config,
+	registry registry.Registry,
+	reporter metrics.CombinedReporter,
+	routeServiceConfig *routeservice.RouteServiceConfig,
+	tlsConfig *tls.Config,
+	heartbeatOK *int32,
+) Proxy {
+
+	p := &proxy{
+		accessLogger:             accessLogger,
+		traceKey:                 c.TraceKey,
+		ip:                       c.Ip,
+		logger:                   logger,
+		reporter:                 reporter,
+		secureCookies:            c.SecureCookies,
+		heartbeatOK:              heartbeatOK, // 1->true, 0->false
+		routeServiceConfig:       routeServiceConfig,
+		healthCheckUserAgent:     c.HealthCheckUserAgent,
+		forceForwardedProtoHttps: c.ForceForwardedProtoHttps,
+		defaultLoadBalance:       c.LoadBalance,
+		bufferPool:               NewBufferPool(),
 	}
+
+	httpTransport := &http.Transport{
+		Dial: func(network, addr string) (net.Conn, error) {
+			conn, err := net.DialTimeout(network, addr, 5*time.Second)
+			if err != nil {
+				return conn, err
+			}
+			if c.EndpointTimeout > 0 {
+				err = conn.SetDeadline(time.Now().Add(c.EndpointTimeout))
+			}
+			return conn, err
+		},
+		DisableKeepAlives:   c.DisableKeepAlives,
+		MaxIdleConns:        c.MaxIdleConns,
+		IdleConnTimeout:     90 * time.Second, // setting the value to golang default transport
+		MaxIdleConnsPerHost: c.MaxIdleConnsPerHost,
+		DisableCompression:  true,
+		TLSClientConfig:     tlsConfig,
+	}
+
+	rproxy := &httputil.ReverseProxy{
+		Director:       p.setupProxyRequest,
+		Transport:      p.proxyRoundTripper(httpTransport, c.Port),
+		FlushInterval:  50 * time.Millisecond,
+		BufferPool:     p.bufferPool,
+		ModifyResponse: p.modifyResponse,
+	}
+
+	zipkinHandler := handlers.NewZipkin(c.Tracing.EnableZipkin, c.ExtraHeadersToLog, logger)
+	n := negroni.New()
+	n.Use(handlers.NewRequestInfo())
+	n.Use(handlers.NewProxyWriter(logger))
+	n.Use(handlers.NewsetVcapRequestIdHeader(logger))
+	if c.ForwardedClientCert != config.ALWAYS_FORWARD {
+		n.Use(handlers.NewClientCert(c.ForwardedClientCert))
+	}
+	n.Use(handlers.NewAccessLog(accessLogger, zipkinHandler.HeadersToLog(), logger))
+	n.Use(handlers.NewReporter(reporter, logger))
+
+	n.Use(handlers.NewProxyHealthcheck(c.HealthCheckUserAgent, p.heartbeatOK, logger))
+	n.Use(zipkinHandler)
+	n.Use(handlers.NewProtocolCheck(logger))
+	n.Use(handlers.NewLookup(registry, reporter, logger, c.Backends.MaxConns))
+	n.Use(handlers.NewRouteService(routeServiceConfig, logger, registry))
+	n.Use(p)
+	n.UseHandler(rproxy)
+
+	return n
 }
 
 func hostWithoutPort(req *http.Request) string {
@@ -101,201 +137,98 @@ func hostWithoutPort(req *http.Request) string {
 	return host
 }
 
-func (p *proxy) Wait() {
-	p.waitgroup.Wait()
+func (p *proxy) proxyRoundTripper(transport round_tripper.ProxyRoundTripper, port uint16) round_tripper.ProxyRoundTripper {
+	return round_tripper.NewProxyRoundTripper(
+		round_tripper.NewDropsondeRoundTripper(transport),
+		p.logger, p.traceKey, p.ip, p.defaultLoadBalance,
+		p.reporter, p.secureCookies,
+		port,
+	)
 }
 
-func (p *proxy) getStickySession(request *http.Request) string {
-	// Try choosing a backend using sticky session
-	if _, err := request.Cookie(StickyCookieKey); err == nil {
-		if sticky, err := request.Cookie(VcapCookieId); err == nil {
-			return sticky.Value
-		}
-	}
-	return ""
+type bufferPool struct {
+	pool *sync.Pool
 }
 
-func (p *proxy) lookup(request *http.Request) *route.Pool {
-	uri := route.Uri(hostWithoutPort(request))
-	// Choose backend using host alone
-	return p.registry.Lookup(uri)
+func NewBufferPool() httputil.BufferPool {
+	return &bufferPool{
+		pool: new(sync.Pool),
+	}
 }
 
-func (p *proxy) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
-	startedAt := time.Now()
+func (b *bufferPool) Get() []byte {
+	buf := b.pool.Get()
+	if buf == nil {
+		return make([]byte, 8192)
+	}
+	return buf.([]byte)
+}
 
-	accessLog := access_log.AccessLogRecord{
-		Request:   request,
-		StartedAt: startedAt,
+func (b *bufferPool) Put(buf []byte) {
+	b.pool.Put(buf)
+}
+
+func (p *proxy) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request, next http.HandlerFunc) {
+	proxyWriter := responseWriter.(utils.ProxyResponseWriter)
+
+	reqInfo, err := handlers.ContextRequestInfo(request)
+	if err != nil {
+		p.logger.Fatal("request-info-err", zap.Error(err))
+	}
+	handler := handler.NewRequestHandler(request, proxyWriter, p.reporter, p.logger)
+
+	if reqInfo.RoutePool == nil {
+		p.logger.Fatal("request-info-err", zap.Error(errors.New("failed-to-access-RoutePool")))
 	}
 
-	handler := NewRequestHandler(request, responseWriter, p.reporter, &accessLog)
-
-	p.waitgroup.Add(1)
-
-	defer func() {
-		p.accessLogger.Log(accessLog)
-		p.waitgroup.Done()
-	}()
-
-	if !isProtocolSupported(request) {
-		handler.HandleUnsupportedProtocol()
-		return
-	}
-
-	if isLoadBalancerHeartbeat(request) {
-		handler.HandleHeartbeat()
-		return
-	}
-
-	routePool := p.lookup(request)
-	if routePool == nil {
-		p.reporter.CaptureBadRequest(request)
-		handler.HandleMissingRoute()
-		return
-	}
-
-	stickyEndpointId := p.getStickySession(request)
+	stickyEndpointId := getStickySession(request)
 	iter := &wrappedIterator{
-		nested: routePool.Endpoints(stickyEndpointId),
+		nested: reqInfo.RoutePool.Endpoints(p.defaultLoadBalance, stickyEndpointId),
 
 		afterNext: func(endpoint *route.Endpoint) {
 			if endpoint != nil {
-				handler.logger.Set("RouteEndpoint", endpoint.ToLogData())
-				accessLog.RouteEndpoint = endpoint
-				p.reporter.CaptureRoutingRequest(endpoint, request)
+				reqInfo.RouteEndpoint = endpoint
+				p.reporter.CaptureRoutingRequest(endpoint)
 			}
 		},
 	}
 
-	if isTcpUpgrade(request) {
+	if handlers.IsTcpUpgrade(request) {
 		handler.HandleTcpRequest(iter)
 		return
 	}
 
-	if isWebSocketUpgrade(request) {
+	if handlers.IsWebSocketUpgrade(request) {
 		handler.HandleWebSocketRequest(iter)
 		return
 	}
 
-	proxyWriter := newProxyResponseWriter(responseWriter)
-	roundTripper := &proxyRoundTripper{
-		transport: p.transport,
-		iter:      iter,
-		handler:   &handler,
-
-		after: func(rsp *http.Response, endpoint *route.Endpoint, err error) {
-			accessLog.FirstByteAt = time.Now()
-			if rsp != nil {
-				accessLog.StatusCode = rsp.StatusCode
-			}
-
-			// disable keep-alives -- not needed with Go 1.3
-			responseWriter.Header().Set("Connection", "close")
-
-			if p.traceKey != "" && request.Header.Get(router_http.VcapTraceHeader) == p.traceKey {
-				setTraceHeaders(responseWriter, p.ip, endpoint.CanonicalAddr())
-			}
-
-			latency := time.Since(startedAt)
-
-			p.reporter.CaptureRoutingResponse(endpoint, rsp, startedAt, latency)
-
-			if err != nil {
-				p.reporter.CaptureBadGateway(request)
-				handler.HandleBadGateway(err)
-				proxyWriter.Done()
-				return
-			}
-
-			if endpoint.PrivateInstanceId != "" {
-				setupStickySession(responseWriter, rsp, endpoint)
-			}
-		},
-	}
-	proxyTransport := autowire.InstrumentedRoundTripper(roundTripper)
-
-	p.newReverseProxy(proxyTransport, request).ServeHTTP(proxyWriter, request)
-
-	accessLog.FinishedAt = time.Now()
-	accessLog.BodyBytesSent = int64(proxyWriter.Size())
+	next(responseWriter, request)
 }
 
-func (p *proxy) newReverseProxy(proxyTransport http.RoundTripper, req *http.Request) http.Handler {
-	rproxy := &httputil.ReverseProxy{
-		Director: func(request *http.Request) {
-			request.URL.Scheme = "http"
-			request.URL.Host = req.Host
-			request.URL.Opaque = req.URL.Path
-			request.URL.RawQuery = req.URL.RawQuery
-
-			setRequestXRequestStart(req)
-			setRequestXVcapRequestId(req, nil)
-		},
-		Transport:     proxyTransport,
-		FlushInterval: 50 * time.Millisecond,
+func (p *proxy) setupProxyRequest(target *http.Request) {
+	if p.forceForwardedProtoHttps {
+		target.Header.Set("X-Forwarded-Proto", "https")
+	} else if target.Header.Get("X-Forwarded-Proto") == "" {
+		scheme := "http"
+		if target.TLS != nil {
+			scheme = "https"
+		}
+		target.Header.Set("X-Forwarded-Proto", scheme)
 	}
 
-	return rproxy
+	target.URL.Scheme = "http"
+	target.URL.Host = target.Host
+	target.URL.Opaque = target.RequestURI
+	target.URL.RawQuery = ""
+	target.URL.ForceQuery = false
+
+	handler.SetRequestXRequestStart(target)
+	target.Header.Del(router_http.CfAppInstance)
 }
 
-type proxyRoundTripper struct {
-	transport http.RoundTripper
-	after     AfterRoundTrip
-	iter      route.EndpointIterator
-	handler   *RequestHandler
-
-	response *http.Response
-	err      error
-}
-
-func (p *proxyRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	var err error
-	var res *http.Response
-	var endpoint *route.Endpoint
-	retry := 0
-	for {
-		endpoint = p.iter.Next()
-
-		if endpoint == nil {
-			p.handler.reporter.CaptureBadGateway(request)
-			err = noEndpointsAvailable
-			p.handler.HandleBadGateway(err)
-			return nil, err
-		}
-
-		request.URL.Host = endpoint.CanonicalAddr()
-		request.Header.Set("X-CF-ApplicationID", endpoint.ApplicationId)
-		setRequestXCfInstanceId(request, endpoint)
-
-		res, err = p.transport.RoundTrip(request)
-		if err == nil {
-			break
-		}
-
-		if ne, netErr := err.(*net.OpError); !netErr || ne.Op != "dial" {
-			break
-		}
-
-		p.iter.EndpointFailed()
-
-		p.handler.Logger().Set("Error", err.Error())
-		p.handler.Logger().Warnf("proxy.endpoint.failed")
-
-		retry++
-		if retry == retries {
-			break
-		}
-	}
-
-	if p.after != nil {
-		p.after(res, endpoint, err)
-	}
-
-	p.response = res
-	p.err = err
-
-	return res, err
+func (p *proxy) modifyResponse(backendResp *http.Response) error {
+	return nil
 }
 
 type wrappedIterator struct {
@@ -314,55 +247,19 @@ func (i *wrappedIterator) Next() *route.Endpoint {
 func (i *wrappedIterator) EndpointFailed() {
 	i.nested.EndpointFailed()
 }
+func (i *wrappedIterator) PreRequest(e *route.Endpoint) {
+	i.nested.PreRequest(e)
+}
+func (i *wrappedIterator) PostRequest(e *route.Endpoint) {
+	i.nested.PostRequest(e)
+}
 
-func setupStickySession(responseWriter http.ResponseWriter, response *http.Response, endpoint *route.Endpoint) {
-	for _, v := range response.Cookies() {
-		if v.Name == StickyCookieKey {
-			cookie := &http.Cookie{
-				Name:  VcapCookieId,
-				Value: endpoint.PrivateInstanceId,
-				Path:  "/",
-
-				HttpOnly: true,
-			}
-
-			http.SetCookie(responseWriter, cookie)
-			return
+func getStickySession(request *http.Request) string {
+	// Try choosing a backend using sticky session
+	if _, err := request.Cookie(StickyCookieKey); err == nil {
+		if sticky, err := request.Cookie(VcapCookieId); err == nil {
+			return sticky.Value
 		}
 	}
-}
-
-func isProtocolSupported(request *http.Request) bool {
-	return request.ProtoMajor == 1 && (request.ProtoMinor == 0 || request.ProtoMinor == 1)
-}
-
-func isLoadBalancerHeartbeat(request *http.Request) bool {
-	return request.UserAgent() == "HTTP-Monitor/1.1"
-}
-
-func isWebSocketUpgrade(request *http.Request) bool {
-	// websocket should be case insensitive per RFC6455 4.2.1
-	return strings.ToLower(upgradeHeader(request)) == "websocket"
-}
-
-func isTcpUpgrade(request *http.Request) bool {
-	return upgradeHeader(request) == "tcp"
-}
-
-func upgradeHeader(request *http.Request) string {
-	// handle multiple Connection field-values, either in a comma-separated string or multiple field-headers
-	for _, v := range request.Header[http.CanonicalHeaderKey("Connection")] {
-		// upgrade should be case insensitive per RFC6455 4.2.1
-		if strings.Contains(strings.ToLower(v), "upgrade") {
-			return request.Header.Get("Upgrade")
-		}
-	}
-
 	return ""
-}
-
-func setTraceHeaders(responseWriter http.ResponseWriter, routerIp, addr string) {
-	responseWriter.Header().Set(router_http.VcapRouterHeader, routerIp)
-	responseWriter.Header().Set(router_http.VcapBackendHeader, addr)
-	responseWriter.Header().Set(router_http.CfRouteEndpointHeader, addr)
 }
