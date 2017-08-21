@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012-2014
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -19,26 +19,29 @@ package tcp
 import (
 	"crypto/tls"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	. "github.com/mozilla-services/heka/pipeline"
 	"net"
 	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
+	. "github.com/mozilla-services/heka/pipeline"
 )
 
 // Output plugin that sends messages via TCP using the Heka protocol.
 type TcpOutput struct {
 	processMessageCount int64
+	dropMessageCount    int64
+	keepAliveDuration   time.Duration
 	conf                *TcpOutputConfig
 	address             string
 	localAddress        net.Addr
 	connection          net.Conn
 	name                string
 	reportLock          sync.Mutex
-	bufferedOut         *BufferedOutput
 	or                  OutputRunner
+	pConfig             *PipelineConfig
 }
 
 // ConfigStruct for TcpOutput plugin.
@@ -58,17 +61,31 @@ type TcpOutputConfig struct {
 	KeepAlive bool `toml:"keep_alive"`
 	// Integer indicating seconds between keep alives.
 	KeepAlivePeriod int `toml:"keep_alive_period"`
+	// Number of successfully processed messages to re-establish the TCP
+	// connection after.  Defaults to 0 (never)
+	ReconnectAfter int64 `toml:"reconnect_after"`
 	// Specifies whether or not Heka's stream framing wil be applied to the
 	// output. We do some magic to default to true if ProtobufEncoder is used,
 	// false otherwise.
 	UseFraming *bool `toml:"use_framing"`
+	// Defaults to true for TcpOutput.
+	UseBuffering *bool `toml:"use_buffering"`
+	Buffering    QueueBufferConfig
 }
 
 func (t *TcpOutput) ConfigStruct() interface{} {
+	b := true
+	queueConfig := QueueBufferConfig{
+		CursorUpdateCount: 50,
+		MaxBufferSize:     0,
+		MaxFileSize:       128 * 1024 * 1024,
+		FullAction:        "shutdown",
+	}
 	return &TcpOutputConfig{
-		Address:        "localhost:9125",
-		TickerInterval: uint(300),
-		Encoder:        "ProtobufEncoder",
+		Address:      "localhost:9125",
+		Encoder:      "ProtobufEncoder",
+		UseBuffering: &b,
+		Buffering:    queueConfig,
 	}
 }
 
@@ -90,7 +107,76 @@ func (t *TcpOutput) Init(config interface{}) (err error) {
 		t.localAddress, err = net.ResolveTCPAddr("tcp", t.conf.LocalAddress)
 	}
 
+	if t.conf.KeepAlivePeriod != 0 {
+		t.keepAliveDuration = time.Duration(t.conf.KeepAlivePeriod) * time.Second
+	}
+
 	return
+}
+
+func (t *TcpOutput) Prepare(or OutputRunner, h PluginHelper) (err error) {
+	if t.conf.UseFraming == nil {
+		// Nothing was specified, we'll default to framing IFF ProtobufEncoder
+		// is being used.
+		if _, ok := or.Encoder().(*ProtobufEncoder); ok {
+			or.SetUseFraming(true)
+		}
+	}
+
+	t.pConfig = h.PipelineConfig()
+	t.or = or
+
+	return nil
+}
+
+func (t *TcpOutput) cleanupConn() {
+	if t.connection != nil {
+		t.connection.Close()
+		t.connection = nil
+	}
+}
+
+func (t *TcpOutput) CleanUp() {
+	t.cleanupConn()
+}
+
+func (t *TcpOutput) ProcessMessage(pack *PipelinePack) (err error) {
+	if t.connection == nil {
+		if err = t.connect(); err != nil {
+			// Explicitly set t.connection to nil because Go, see
+			// http://golang.org/doc/faq#nil_error.
+			t.connection = nil
+			return NewRetryMessageError("can't connect: %s", err)
+		}
+	}
+
+	var (
+		n      int
+		record []byte
+	)
+
+	if record, err = t.or.Encode(pack); err != nil {
+		atomic.AddInt64(&t.dropMessageCount, 1)
+		return fmt.Errorf("can't encode: %s", err)
+	}
+
+	if n, err = t.connection.Write(record); err != nil {
+		t.cleanupConn()
+		err = NewRetryMessageError("writing to %s: %s", t.address, err)
+	} else if n != len(record) {
+		t.cleanupConn()
+		err = NewRetryMessageError("truncated output to: %s", t.address)
+	} else {
+		atomic.AddInt64(&t.processMessageCount, 1)
+		t.or.UpdateCursor(pack.QueueCursor)
+		if t.conf.ReconnectAfter > 0 &&
+			atomic.LoadInt64(&t.processMessageCount)%t.conf.ReconnectAfter == 0 {
+
+			t.cleanupConn()
+		}
+	}
+
+	return err
 }
 
 func (t *TcpOutput) connect() (err error) {
@@ -108,114 +194,18 @@ func (t *TcpOutput) connect() (err error) {
 	} else {
 		t.connection, err = dialer.Dial("tcp", t.address)
 	}
-	if t.conf.KeepAlive {
+	if err == nil && t.conf.KeepAlive {
 		tcpConn, ok := t.connection.(*net.TCPConn)
 		if !ok {
 			t.or.LogError(fmt.Errorf("KeepAlive only supported for TCP Connections."))
 		} else {
 			tcpConn.SetKeepAlive(t.conf.KeepAlive)
-			tcpConn.SetKeepAlivePeriod(time.Duration(t.conf.KeepAlivePeriod) * time.Second)
+			if t.keepAliveDuration != 0 {
+				tcpConn.SetKeepAlivePeriod(t.keepAliveDuration)
+			}
 		}
 	}
 	return
-}
-
-func (t *TcpOutput) SendRecord(record []byte) (err error) {
-	var n int
-	if t.connection == nil {
-		if err = t.connect(); err != nil {
-			// Explicitly set t.connection to nil because Go, see
-			// http://golang.org/doc/faq#nil_error.
-			t.connection = nil
-			return
-		}
-	}
-
-	cleanupConn := func() {
-		if t.connection != nil {
-			t.connection.Close()
-			t.connection = nil
-		}
-	}
-
-	if n, err = t.connection.Write(record); err != nil {
-		cleanupConn()
-		err = fmt.Errorf("writing to %s: %s", t.address, err)
-	} else if n != len(record) {
-		cleanupConn()
-		err = fmt.Errorf("truncated output to: %s", t.address)
-	}
-
-	return
-}
-
-func (t *TcpOutput) Run(or OutputRunner, h PluginHelper) (err error) {
-	var (
-		ok          = true
-		pack        *PipelinePack
-		inChan      = or.InChan()
-		ticker      = or.Ticker()
-		outputExit  = make(chan error)
-		outputError = make(chan error, 5)
-		stopChan    = make(chan bool, 1)
-	)
-
-	if t.conf.UseFraming == nil {
-		// Nothing was specified, we'll default to framing IFF ProtobufEncoder
-		// is being used.
-		if _, ok := or.Encoder().(*ProtobufEncoder); ok {
-			or.SetUseFraming(true)
-		}
-	}
-	t.or = or
-
-	defer func() {
-		if t.connection != nil {
-			t.connection.Close()
-			t.connection = nil
-		}
-	}()
-
-	t.bufferedOut, err = NewBufferedOutput("output_queue", t.name, or)
-	if err != nil {
-		return
-	}
-	t.bufferedOut.Start(t, outputError, outputExit, stopChan)
-
-	for ok {
-		select {
-		case e := <-outputError:
-			or.LogError(e)
-
-		case pack, ok = <-inChan:
-			if !ok {
-				stopChan <- true
-				<-outputExit
-				break
-			}
-			atomic.AddInt64(&t.processMessageCount, 1)
-			if err = t.bufferedOut.QueueRecord(pack); err != nil {
-				or.LogError(err)
-			}
-			pack.Recycle()
-
-		case <-ticker:
-			if err = t.bufferedOut.RollQueue(); err != nil {
-				return
-			}
-
-		case err = <-outputExit:
-			ok = false
-		}
-	}
-
-	return
-}
-
-func init() {
-	RegisterPlugin("TcpOutput", func() interface{} {
-		return new(TcpOutput)
-	})
 }
 
 // Satisfies the `pipeline.ReportingPlugin` interface to provide plugin state
@@ -226,6 +216,14 @@ func (t *TcpOutput) ReportMsg(msg *message.Message) error {
 
 	message.NewInt64Field(msg, "ProcessMessageCount",
 		atomic.LoadInt64(&t.processMessageCount), "count")
-	t.bufferedOut.ReportMsg(msg)
+	message.NewInt64Field(msg, "DropMessageCount",
+		atomic.LoadInt64(&t.dropMessageCount), "count")
+
 	return nil
+}
+
+func init() {
+	RegisterPlugin("TcpOutput", func() interface{} {
+		return new(TcpOutput)
+	})
 }

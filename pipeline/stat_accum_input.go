@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -17,14 +17,15 @@ package pipeline
 
 import (
 	"bytes"
-	"code.google.com/p/go-uuid/uuid"
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
 	"math"
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/mozilla-services/heka/message"
+	"github.com/pborman/uuid"
 )
 
 // Represents a single stat value in the format expected by the StatAccumInput.
@@ -47,11 +48,12 @@ type StatAccumInput struct {
 	statChan chan Stat
 	counters map[string]int
 	timers   map[string][]float64
-	gauges   map[string]int
+	gauges   map[string]float64
 	pConfig  *PipelineConfig
 	config   *StatAccumInputConfig
 	ir       InputRunner
 	tickChan <-chan time.Time
+	inChan   chan *PipelinePack
 	stopChan chan bool
 }
 
@@ -91,7 +93,7 @@ type StatAccumInputConfig struct {
 
 	// Don't emit values for inactive stats instead of sending 0 or in the case
 	// of gauges, sending the previous value. Defaults to false
-	DeleteIdleStats	bool	`toml:"delete_idle_stats"`
+	DeleteIdleStats bool `toml:"delete_idle_stats"`
 }
 
 func (sm *StatAccumInput) ConfigStruct() interface{} {
@@ -110,14 +112,25 @@ func (sm *StatAccumInput) ConfigStruct() interface{} {
 	}
 }
 
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (sm *StatAccumInput) SetPipelineConfig(pConfig *PipelineConfig) {
+	sm.pConfig = pConfig
+}
+
 func (sm *StatAccumInput) Init(config interface{}) error {
 	sm.counters = make(map[string]int)
 	sm.timers = make(map[string][]float64)
-	sm.gauges = make(map[string]int)
-	sm.statChan = make(chan Stat, Globals().PoolSize)
+	sm.gauges = make(map[string]float64)
+	sm.statChan = make(chan Stat, sm.pConfig.Globals.PoolSize)
 	sm.stopChan = make(chan bool, 1)
 
 	sm.config = config.(*StatAccumInputConfig)
+	if sm.config.TickerInterval == 0 {
+		return errors.New(
+			"TickerInterval must be greater than 0.",
+		)
+	}
 	if !sm.config.EmitInPayload && !sm.config.EmitInFields {
 		return errors.New(
 			"One of either `EmitInPayload` or `EmitInFields` must be set to true.",
@@ -131,12 +144,11 @@ func (sm *StatAccumInput) Run(ir InputRunner, h PluginHelper) (err error) {
 	var (
 		stat       Stat
 		floatValue float64
-		intValue   int
 	)
 
-	sm.pConfig = h.PipelineConfig()
 	sm.ir = ir
-	sm.tickChan = sm.ir.Ticker()
+	sm.inChan = ir.InChan()
+	sm.tickChan = ir.Ticker()
 	ok := true
 	for ok {
 		select {
@@ -152,8 +164,8 @@ func (sm *StatAccumInput) Run(ir InputRunner, h PluginHelper) (err error) {
 				floatValue, _ = strconv.ParseFloat(stat.Value, 64)
 				sm.timers[stat.Bucket] = append(sm.timers[stat.Bucket], floatValue)
 			case "g":
-				intValue, _ = strconv.Atoi(stat.Value)
-				sm.gauges[stat.Bucket] = intValue
+				floatValue, _ = strconv.ParseFloat(stat.Value, 64)
+				sm.gauges[stat.Bucket] = floatValue
 			default:
 				floatValue, _ = strconv.ParseFloat(stat.Value, 32)
 				sm.counters[stat.Bucket] += int(float32(floatValue) * (1 / stat.Sampling))
@@ -195,7 +207,7 @@ func (sm *StatAccumInput) Flush() {
 	now := time.Now().UTC()
 	nowUnix := now.Unix()
 	buffer := bytes.NewBufferString("")
-	pack := <-sm.ir.InChan()
+	pack := <-sm.inChan
 
 	rootNs := NewRootNamespace()
 
@@ -242,7 +254,7 @@ func (sm *StatAccumInput) Flush() {
 		numStats++
 	}
 	for key, gauge := range sm.gauges {
-		globalNs.Namespace(sm.config.GaugePrefix).Emit(key, int64(gauge))
+		globalNs.Namespace(sm.config.GaugePrefix).Emit(key, float64(gauge))
 		if sm.config.DeleteIdleStats {
 			delete(sm.gauges, key)
 		}
@@ -318,6 +330,7 @@ func (sm *StatAccumInput) Flush() {
 		globalNs.Namespace(sm.config.StatsdPrefix).Emit("numStats", numStats)
 	}
 
+	pack.Message.SetLogger(sm.ir.Name())
 	pack.Message.SetType(sm.config.MessageType)
 	pack.Message.SetTimestamp(now.UnixNano())
 	pack.Message.SetUuid(uuid.NewRandom())

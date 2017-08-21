@@ -4,11 +4,12 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2014
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
 #   Ben Bangert (bbangert@mozilla.com)
+#   Rob Miller (rmiller@mozilla.com)
 #
 # ***** END LICENSE BLOCK *****/
 
@@ -16,71 +17,100 @@ package pipeline
 
 import (
 	"fmt"
-	"log"
+	"sync"
 	"time"
 )
 
-// Diagnostic object for packet tracking
+// Diagnostic object for packet tracking.
 type PacketTracking struct {
-	// Records last accessed time
+	// Last accessed time.
 	LastAccess time.Time
 
-	// Records the plugins the packet has been handed to
+	// Plugins the packet has been handed to.
 	lastPlugins []PluginRunner
+
+	// RWMutex to gate attribute access.
+	rwmutex sync.RWMutex
 }
 
-// Create a new blank PacketTracking
+// NewPacketTracking creates a new blank PacketTracking.
 func NewPacketTracking() *PacketTracking {
-	return &PacketTracking{time.Now(), make([]PluginRunner, 0, 8)}
+	return &PacketTracking{
+		LastAccess:  time.Now(),
+		lastPlugins: make([]PluginRunner, 0, 8),
+	}
 }
 
-// Stamps a packet with the tracking data for the plugin its handed to,
-// clearing any existing stamps
+// Stamp stamps a packet with the tracking data for the plugin its handed to,
+// clearing any existing stamps.
 func (p *PacketTracking) Stamp(pluginRunner PluginRunner) {
+	p.rwmutex.Lock()
 	p.lastPlugins = p.lastPlugins[:0]
 	p.lastPlugins = append(p.lastPlugins, pluginRunner)
 	p.LastAccess = time.Now()
+	p.rwmutex.Unlock()
 }
 
-// Adds a stamp to the packet
+// AddStamp adds a stamp to the packet as having been handed to the specified
+// plugin.
 func (p *PacketTracking) AddStamp(pluginRunner PluginRunner) {
+	p.rwmutex.Lock()
 	p.lastPlugins = append(p.lastPlugins, pluginRunner)
 	p.LastAccess = time.Now()
+	p.rwmutex.Unlock()
 }
 
-// Resets the packet stamping
+// Reset resets the packet stamping metadata.
 func (p *PacketTracking) Reset() {
+	p.rwmutex.Lock()
 	p.lastPlugins = p.lastPlugins[:0]
 	p.LastAccess = time.Now()
+	p.rwmutex.Unlock()
 }
 
-// Returns the names of the plugins that have last accessed the packet
+// PluginNames returns the names of the plugins that have last accessed the
+// packet.
 func (p *PacketTracking) PluginNames() (names []string) {
 	names = make([]string, 0, 4)
+	p.rwmutex.RLock()
 	for _, pr := range p.lastPlugins {
 		names = append(names, pr.Name())
 	}
+	p.rwmutex.RUnlock()
 	return
 }
 
-// Returns the names of the plugin runners that last access the packet
+// Runners returns the names of the plugin runners that last accessed the
+// packet. The returned slice object is owned by the caller, but the
+// underlying array and the contained PluginRunners are not thread safe and
+// should NOT be mutated.
 func (p *PacketTracking) Runners() (runners []PluginRunner) {
-	return p.lastPlugins
+	p.rwmutex.RLock()
+	runners = p.lastPlugins
+	p.rwmutex.RUnlock()
+	return runners
 }
 
 // A diagnostic tracker that can track pipeline packs and do accounting
 // to determine possible leaks
 type DiagnosticTracker struct {
-	// Track all the packs that have been created
+	// Track all the packs that have been created.
 	packs []*PipelinePack
 
-	// Identify the name of the recycle channel it monitors packs for
+	// Identify the name of the recycle channel it monitors packs for.
 	ChannelName string
+
+	// Pipeline configuration globals.
+	globals *GlobalConfigStruct
 }
 
 // Create and return a new diagnostic tracker
-func NewDiagnosticTracker(channelName string) *DiagnosticTracker {
-	return &DiagnosticTracker{make([]*PipelinePack, 0, 50), channelName}
+func NewDiagnosticTracker(channelName string, globals *GlobalConfigStruct) *DiagnosticTracker {
+	return &DiagnosticTracker{
+		packs:       make([]*PipelinePack, 0, 50),
+		ChannelName: channelName,
+		globals:     globals,
+	}
 }
 
 // Add a pipeline pack for monitoring
@@ -97,8 +127,9 @@ func (d *DiagnosticTracker) Run() {
 		count          int
 		runner         PluginRunner
 	)
-	g := Globals()
+	g := d.globals
 	idleMax := g.MaxPackIdle
+	idleMaxSecs := int(idleMax.Seconds())
 	probablePacks := make([]*PipelinePack, 0, len(d.packs))
 	ticker := time.NewTicker(time.Duration(30) * time.Second)
 	for {
@@ -107,7 +138,7 @@ func (d *DiagnosticTracker) Run() {
 		pluginCounts = make(map[PluginRunner]int)
 
 		// Locate all the packs that have not been touched in idleMax duration
-		// that are not recycled
+		// that are not recycled.
 		earliestAccess = time.Now().Add(-idleMax)
 		for _, pack = range d.packs {
 			if len(pack.diagnostics.lastPlugins) == 0 {
@@ -121,17 +152,19 @@ func (d *DiagnosticTracker) Run() {
 			}
 		}
 
-		// Drop a warning about how many packs have been idle
+		// Drop a warning about how many packs have been idle.
 		if len(probablePacks) > 0 {
-			g.LogMessage("Diagnostics", fmt.Sprintf("%d packs have been idle more than %d seconds.",
-				d.ChannelName, len(probablePacks), idleMax))
-			g.LogMessage("Diagnostics", fmt.Sprintf("(%s) Plugin names and quantities found on idle packs:",
-				d.ChannelName))
+			g.LogMessage("Diagnostics",
+				fmt.Sprintf("%d packs have been idle more than %d seconds.",
+					len(probablePacks), idleMaxSecs))
+			g.LogMessage("Diagnostics",
+				fmt.Sprintf("(%s) Plugin names and quantities found on idle packs:",
+					d.ChannelName))
 			for runner, count = range pluginCounts {
 				runner.SetLeakCount(count)
 				g.LogMessage("Diagnostics", fmt.Sprintf("\t%s: %d", runner.Name(), count))
 			}
-			log.Println("")
+			LogInfo.Println("")
 		}
 	}
 }

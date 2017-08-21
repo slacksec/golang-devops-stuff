@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,18 +16,19 @@
 package process
 
 import (
-	"code.google.com/p/gomock/gomock"
-	. "github.com/mozilla-services/heka/pipeline"
-	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
-	"github.com/mozilla-services/heka/pipelinemock"
-	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
-	gs "github.com/rafrombrc/gospec/src/gospec"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
+
+	. "github.com/mozilla-services/heka/pipeline"
+	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
+	"github.com/mozilla-services/heka/pipelinemock"
+	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
+	"github.com/rafrombrc/gomock/gomock"
+	gs "github.com/rafrombrc/gospec/src/gospec"
 )
 
 func ProcessDirectoryInputSpec(c gs.Context) {
@@ -36,35 +37,31 @@ func ProcessDirectoryInputSpec(c gs.Context) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	config := NewPipelineConfig(nil)
+	pConfig := NewPipelineConfig(nil)
 	ith := new(plugins_ts.InputTestHelper)
 	ith.Msg = pipeline_ts.GetTestMessage()
-	ith.Pack = NewPipelinePack(config.InputRecycleChan())
+	ith.Pack = NewPipelinePack(pConfig.InputRecycleChan())
 
 	// set up mock helper, decoder set, and packSupply channel
 	ith.MockHelper = pipelinemock.NewMockPluginHelper(ctrl)
 	ith.MockInputRunner = pipelinemock.NewMockInputRunner(ctrl)
-	ith.Decoder = pipelinemock.NewMockDecoderRunner(ctrl)
+	ith.MockDeliverer = pipelinemock.NewMockDeliverer(ctrl)
+	ith.MockSplitterRunner = pipelinemock.NewMockSplitterRunner(ctrl)
 	ith.PackSupply = make(chan *PipelinePack, 1)
 
 	ith.PackSupply <- ith.Pack
-	//ith.MockInputRunner.EXPECT().InChan().Return(ith.PackSupply).AnyTimes()
 
-	ith.DecodeChan = make(chan *PipelinePack)
-	//mockDecoderRunner := ith.Decoder.(*pipelinemock.MockDecoderRunner)
-	//mockDecoderRunner.EXPECT().InChan().Return(ith.DecodeChan).AnyTimes()
+	err := pConfig.RegisterDefault("NullSplitter")
+	c.Assume(err, gs.IsNil)
 
 	c.Specify("A ProcessDirectoryInput", func() {
 		pdiInput := ProcessDirectoryInput{}
-		//ith.MockInputRunner.EXPECT().Name().Return("logger").AnyTimes()
-		// Ignore all messages
-		//ith.MockInputRunner.EXPECT().LogMessage(gomock.Any()).AnyTimes()
+		pdiInput.SetPipelineConfig(pConfig)
 
 		config := pdiInput.ConfigStruct().(*ProcessDirectoryInputConfig)
 		workingDir, err := os.Getwd()
 		c.Assume(err, gs.IsNil)
 		config.ProcessDir = filepath.Join(workingDir, "testsupport", "processes")
-		pConfig := NewPipelineConfig(nil)
 
 		// `Ticker` is the last thing called during the setup part of the
 		// input's `Run` method, so it triggers a waitgroup that tests can
@@ -113,7 +110,6 @@ func ProcessDirectoryInputSpec(c gs.Context) {
 		err = pdiInput.Init(config)
 		c.Expect(err, gs.IsNil)
 
-		ith.MockHelper.EXPECT().PipelineConfig().Times(4).Return(pConfig)
 		for _, p := range paths {
 			expectLogMessage("Added: " + p)
 		}
@@ -121,6 +117,15 @@ func ProcessDirectoryInputSpec(c gs.Context) {
 		defer func() {
 			pdiInput.Stop()
 			for _, entry := range pdiInput.inputs {
+				// Make sure we don't try to tear down the ProcessInputs before
+				// they've even finished initializing.
+				for {
+					pInput := entry.ir.Input().(*ProcessInput)
+					if pInput.stopChan != nil {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
 				entry.ir.Input().Stop()
 			}
 		}()
@@ -159,7 +164,6 @@ func ProcessDirectoryInputSpec(c gs.Context) {
 			}()
 
 			// Set up expectations and trigger process dir reload.
-			ith.MockHelper.EXPECT().PipelineConfig().Return(pConfig)
 			expectLogMessage("Added: " + newPath)
 			tickChan <- time.Now()
 			loaded.Wait()
@@ -179,7 +183,6 @@ func ProcessDirectoryInputSpec(c gs.Context) {
 			}()
 
 			// Set up expectations and trigger process dir reload.
-			ith.MockHelper.EXPECT().PipelineConfig().Return(pConfig)
 			expectLogMessage("Removed: " + paths[3])
 			tickChan <- time.Now()
 			loaded.Wait()
@@ -194,7 +197,6 @@ func ProcessDirectoryInputSpec(c gs.Context) {
 			defer copyFile(paths[1], paths[3])
 
 			// Set up expectations and trigger process dir reload.
-			ith.MockHelper.EXPECT().PipelineConfig().Return(pConfig).AnyTimes()
 			expectLogMessage("Removed: " + paths[3])
 			expectLogMessage("Added: " + paths[3])
 			tickChan <- time.Now()

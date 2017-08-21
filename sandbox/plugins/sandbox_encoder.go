@@ -17,17 +17,18 @@ package plugins
 import (
 	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/client"
-	"github.com/mozilla-services/heka/message"
-	"github.com/mozilla-services/heka/pipeline"
-	"github.com/mozilla-services/heka/sandbox"
-	"github.com/mozilla-services/heka/sandbox/lua"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mozilla-services/heka/client"
+	"github.com/mozilla-services/heka/message"
+	"github.com/mozilla-services/heka/pipeline"
+	"github.com/mozilla-services/heka/sandbox"
+	"github.com/mozilla-services/heka/sandbox/lua"
 )
 
 type SandboxEncoder struct {
@@ -46,6 +47,7 @@ type SandboxEncoder struct {
 	output                 []byte
 	injected               bool
 	cEncoder               *client.ProtobufEncoder
+	pConfig                *pipeline.PipelineConfig
 }
 
 // This duplicates most of the SandboxConfig just so we can add a single
@@ -61,11 +63,18 @@ type SandboxEncoderConfig struct {
 	OutputLimit      uint   `toml:"output_limit"`
 	Profile          bool
 	Config           map[string]interface{}
+	PluginType       string
+}
+
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (s *SandboxEncoder) SetPipelineConfig(pConfig *pipeline.PipelineConfig) {
+	s.pConfig = pConfig
 }
 
 func (s *SandboxEncoder) ConfigStruct() interface{} {
 	return &SandboxEncoderConfig{
-		ModuleDirectory:  pipeline.PrependShareDir("lua_modules"),
+		ModuleDirectory:  s.pConfig.Globals.PrependShareDir("lua_modules"),
 		MemoryLimit:      8 * 1024 * 1024,
 		InstructionLimit: 1e6,
 		OutputLimit:      63 * 1024,
@@ -91,9 +100,11 @@ func (s *SandboxEncoder) Init(config interface{}) (err error) {
 		OutputLimit:      conf.OutputLimit,
 		Profile:          conf.Profile,
 		Config:           conf.Config,
+		PluginType:       "encoder",
 	}
-	s.sbc.ScriptFilename = pipeline.PrependShareDir(s.sbc.ScriptFilename)
-	s.sampleDenominator = pipeline.Globals().SampleDenominator
+	globals := s.pConfig.Globals
+	s.sbc.ScriptFilename = globals.PrependShareDir(s.sbc.ScriptFilename)
+	s.sampleDenominator = globals.SampleDenominator
 
 	s.tz = time.UTC
 	if tz, ok := s.sbc.Config["tz"]; ok {
@@ -102,7 +113,7 @@ func (s *SandboxEncoder) Init(config interface{}) (err error) {
 		}
 	}
 
-	dataDir := pipeline.PrependBaseDir(sandbox.DATA_DIR)
+	dataDir := globals.PrependBaseDir(sandbox.DATA_DIR)
 	if !fileExists(dataDir) {
 		if err = os.MkdirAll(dataDir, 0700); err != nil {
 			return
@@ -122,9 +133,9 @@ func (s *SandboxEncoder) Init(config interface{}) (err error) {
 
 	s.preservationFile = filepath.Join(dataDir, s.name+sandbox.DATA_EXT)
 	if s.sbc.PreserveData && fileExists(s.preservationFile) {
-		err = s.sb.Init(s.preservationFile, "encoder")
+		err = s.sb.Init(s.preservationFile)
 	} else {
-		err = s.sb.Init("", "encoder")
+		err = s.sb.Init("")
 	}
 	if err != nil {
 		return fmt.Errorf("Sandbox initialization failed: %s", err)
@@ -141,13 +152,16 @@ func (s *SandboxEncoder) Init(config interface{}) (err error) {
 }
 
 func (s *SandboxEncoder) Stop() {
+	s.reportLock.Lock()
 	if s.sb != nil {
 		if s.sbc.PreserveData {
 			s.sb.Destroy(s.preservationFile)
 		} else {
 			s.sb.Destroy("")
 		}
+		s.sb = nil
 	}
+	s.reportLock.Unlock()
 }
 
 func (s *SandboxEncoder) Encode(pack *pipeline.PipelinePack) (output []byte, err error) {
@@ -163,7 +177,8 @@ func (s *SandboxEncoder) Encode(pack *pipeline.PipelinePack) (output []byte, err
 		startTime = time.Now()
 	}
 	cowpack := new(pipeline.PipelinePack)
-	cowpack.Message = pack.Message
+	cowpack.Message = pack.Message   // the actual copy will happen if write_message is called
+	cowpack.MsgBytes = pack.MsgBytes // no copying is necessary since we don't change it
 	retval := s.sb.ProcessMessage(cowpack)
 	if retval == 0 && !s.injected {
 		// `inject_message` was never called, protobuf encode the copy on write
@@ -186,9 +201,13 @@ func (s *SandboxEncoder) Encode(pack *pipeline.PipelinePack) (output []byte, err
 		err = fmt.Errorf("FATAL: %s", s.sb.LastError())
 		return
 	}
+	if retval == -2 {
+		// Encoder has nothing to return.
+		return nil, nil
+	}
 	if retval < 0 {
 		atomic.AddInt64(&s.processMessageFailures, 1)
-		err = errors.New("Failed serializing.")
+		err = fmt.Errorf("Failed serializing: %s", s.sb.LastError())
 		return
 	}
 	return s.output, nil
@@ -197,11 +216,12 @@ func (s *SandboxEncoder) Encode(pack *pipeline.PipelinePack) (output []byte, err
 // Satisfies the `pipeline.ReportingPlugin` interface to provide sandbox state
 // information to the Heka report and dashboard.
 func (s *SandboxEncoder) ReportMsg(msg *message.Message) error {
+	s.reportLock.Lock()
+	defer s.reportLock.Unlock()
+
 	if s.sb == nil {
 		return fmt.Errorf("Encoder is not running")
 	}
-	s.reportLock.Lock()
-	defer s.reportLock.Unlock()
 
 	message.NewIntField(msg, "Memory", int(s.sb.Usage(sandbox.TYPE_MEMORY,
 		sandbox.STAT_CURRENT)), "B")

@@ -73,7 +73,7 @@ We start with the highest directory to start scanning for files under, in
 this case ``/var/log``. Then the files under that directory (recursively
 searching in sub-directories) are matched against the ``file_match``.
 
-The ``log_directory`` should be the most specific directory of files to
+The ``log_directory`` must exist and should be the most specific directory of files to
 match to prevent excessive file scanning to locate the
 ``file_match``'s.
 
@@ -112,7 +112,7 @@ Single Sequential (Rotating) Logfile
 
 What happens if you have a log structure like this?
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/access.log
     /var/log/nginx/access.log.1
@@ -121,7 +121,7 @@ What happens if you have a log structure like this?
 
 Or perhaps like this?
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/2014/08/1.access.log
     /var/log/nginx/2014/08/2.access.log
@@ -130,7 +130,7 @@ Or perhaps like this?
 
 Or a combination of them?
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/2014/08/access.log
     /var/log/nginx/2014/08/access.log.1
@@ -206,7 +206,7 @@ above and consider it a multiple sequential source.
 
 Example directory layout:
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/frank.com/2014/08/access.log
     /var/log/nginx/frank.com/2014/08/access.log.1
@@ -232,7 +232,7 @@ Configuration for this case:
     [accesslogs]
     type = "LogstreamerInput"
     log_directory = "/var/log/nginx"
-    file_match = '(?P<DomainName>[^/]+/(?P<Year>\d+)/(?P<Month>\d+)/access\.log\.?(?P<Seq>\d*)'
+    file_match = '(?P<DomainName>[^/]+)/(?P<Year>\d+)/(?P<Month>\d+)/access\.log\.?(?P<Seq>\d*)'
     priority = ["Year", "Month", "^Seq"]
     differentiator = ["nginx-", "DomainName", "-access"]
 
@@ -266,7 +266,7 @@ indicate to the LogstreamerInput that a default mapping should be used:
 
 If the last example above looked like this:
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/frank.com/2014/Sep/access.log
     /var/log/nginx/frank.com/2014/Oct/access.log.1
@@ -284,7 +284,7 @@ Using the default mappings would provide us a simple configuration:
     [accesslogs]
     type = "LogstreamerInput"
     log_directory = "/var/log/nginx"
-    file_match = '(?P<Domain>[^/]+/(?P<Year>\d+)/(?P<MonthName>\s+)/access\.log\.?(?P<Seq>\d*)'
+    file_match = '(?P<Domain>[^/]+)/(?P<Year>\d+)/(?P<MonthName>\s+)/access\.log\.?(?P<Seq>\d*)'
     priority = ["Year", "MonthName", "^Seq"]
     differentiator = ["nginx-", "Domain", "-access"]
 
@@ -299,7 +299,7 @@ What if your logfiles (for reasons we won't speculate about) happened
 to use Pharsi month names but Spanish day names such that it looked
 like this?
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/sally.com/2014/Hadukannas/lunes/access.log
     /var/log/nginx/sally.com/2014/Turmar/miercoles/access.log
@@ -355,7 +355,7 @@ In the examples above, the years and months were embedded in the file
 path as directory names, but what if the date was embedded into the
 filenames themselves, with a file naming schema like so?
 
-.. code-block:: txt
+.. code-block:: bash
 
     /var/log/nginx/sally.com/access.log
     /var/log/nginx/sally.com/access-20140803.log

@@ -23,16 +23,8 @@ Config:
 
 Field interpolation:
 
-    Data from the current message can be interpolated into any of the string
-    arguments listed above. A `%{}` enclosed field name will be replaced by
-    the field value from the current message. Supported default field names
-    are "Type", "Hostname", "Pid", "UUID", "Logger", "EnvVersion", and
-    "Severity". Any other values will be checked against the defined dynamic
-    message fields. If no field matches, then a `C strftime
-    <http://man7.org/linux/man-pages/man3/strftime.3.html>`_ (on non-Windows
-    platforms) or `C89 strftime <http://msdn.microsoft.com/en-
-    us/library/fe06s4ak.aspx>`_ (on Windows) time substitution will be
-    attempted.
+    All of the string config settings listed above support :ref:`message field
+    interpolation<sandbox_msg_interpolate_module>`.
 
 *Example Heka Configuration*
 
@@ -52,8 +44,11 @@ Field interpolation:
 
 *Example Output*
 
-{"index":{"_index":"mylogger-2014.06.05","_type":"mytype-host.domain.com"}}
-{"json":"data","extracted":"from","message":"payload"}
+.. code-block:: json
+
+    {"index":{"_index":"mylogger-2014.06.05","_type":"mytype-host.domain.com"}}
+    {"json":"data","extracted":"from","message":"payload"}
+
 --]]
 
 require "string"
@@ -69,8 +64,16 @@ function process_message()
     if ts_from_message then
         ns = read_message("Timestamp")
     end
+
     local idx_json = elasticsearch.bulkapi_index_json(index, type_name, id, ns)
-    add_to_payload(idx_json, "\n", read_message("Payload"))
+    local payload  = read_message("Payload")
+
+    add_to_payload(idx_json, "\n", payload)
+    -- ES bulk api expects newline at the end of the payload.
+    if not string.match(payload, "\n$") then
+        add_to_payload("\n")
+    end
+
     inject_payload()
     return 0
 end

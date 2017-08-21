@@ -1,6 +1,9 @@
+.. _config_payloadregex_decoder:
 
-PayloadRegexDecoder
-===================
+Payload Regex Decoder
+=====================
+
+Plugin Name: **PayloadRegexDecoder**
 
 Decoder plugin that accepts messages of a specified form and generates new
 outgoing messages from extracted data, effectively transforming one message
@@ -45,7 +48,11 @@ Config:
     A formatting string instructing hekad how to turn a time string into the
     actual time representation used internally. Example timestamp layouts can
     be seen in `Go's time documentation <http://golang.org/pkg/time/#pkg-
-    constants>`_.
+    constants>`_. In addition to the Go time formatting, special
+    `timestamp_layout` values of "Epoch", "EpochMilli", "EpochMicro", and
+    "EpochNano" are supported for Unix style timestamps represented in
+    seconds, milliseconds, microseconds, and nanoseconds since the Epoch,
+    respectively.
 - timestamp_location (string):
     Time zone in which the timestamps in the text are presumed to be in.
     Should be a location name corresponding to a file in the IANA Time Zone
@@ -53,7 +60,9 @@ Config:
     `time.LoadLocation()` function (see
     http://golang.org/pkg/time/#LoadLocation). Defaults to "UTC". Not required
     if valid time zone info is embedded in every parsed timestamp, since those
-    can be parsed as specified in the `timestamp_layout`.
+    can be parsed as specified in the `timestamp_layout`. This setting will
+    have no impact if one of the supported "Epoch*" values is used as the
+    `timestamp_layout` setting.
 - log_errors (bool):
     .. versionadded:: 0.5
 

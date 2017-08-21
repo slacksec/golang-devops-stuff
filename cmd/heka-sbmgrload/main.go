@@ -20,17 +20,18 @@ Heka Sandbox Manager Load Test
 package main
 
 import (
-	"code.google.com/p/go-uuid/uuid"
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"os"
+	"time"
+
 	"github.com/bbangert/toml"
 	"github.com/mozilla-services/heka/client"
 	"github.com/mozilla-services/heka/message"
+	"github.com/mozilla-services/heka/pipeline"
 	"github.com/mozilla-services/heka/plugins/tcp"
-	"log"
-	"os"
-	"time"
+	"github.com/pborman/uuid"
 )
 
 type SbmgrConfig struct {
@@ -73,7 +74,7 @@ function timer_event(ns)
     lastTime = ns
     rate = msgsSent / (elapsedTime / 1e9)
     rates[#rates+1] = rate
-    inject_payload("txt", "", string.format("Got %d messages. %0.2f msg/sec", count, rate))
+    inject_payload("txt", "rate", string.format("Got %d messages. %0.2f msg/sec", count, rate))
 
     local samples = #rates
     if samples == 10 then -- generate a summary every 10 samples
@@ -84,7 +85,7 @@ function timer_event(ns)
         for i, val in ipairs(rates) do
             sum = sum + val
 	     end
-        inject_payload("txt", "", string.format("AGG Sum. Min: %0.2f Max: %0.2f Mean: %0.2f", min, max, sum/samples))
+        inject_payload("txt", "summary", string.format("AGG Sum. Min: %0.2f Max: %0.2f Mean: %0.2f", min, max, sum/samples))
         rates = {}
     end
 end
@@ -100,7 +101,7 @@ preserve_data = true
 
 	var config SbmgrConfig
 	if _, err := toml.DecodeFile(*configFile, &config); err != nil {
-		log.Printf("Error decoding config file: %s", err)
+		client.LogError.Printf("Error decoding config file: %s", err)
 		return
 	}
 	var sender *client.NetworkSender
@@ -109,14 +110,14 @@ preserve_data = true
 		var goTlsConfig *tls.Config
 		goTlsConfig, err = tcp.CreateGoTlsConfig(&config.Tls)
 		if err != nil {
-			log.Fatalf("Error creating TLS config: %s\n", err)
+			client.LogError.Fatalf("Error creating TLS config: %s\n", err)
 		}
 		sender, err = client.NewTlsSender("tcp", config.IpAddress, goTlsConfig)
 	} else {
 		sender, err = client.NewNetworkSender("tcp", config.IpAddress)
 	}
 	if err != nil {
-		log.Fatalf("Error creating sender: %s\n", err.Error())
+		client.LogError.Fatalf("Error creating sender: %s\n", err.Error())
 	}
 	encoder := client.NewProtobufEncoder(&config.Signer)
 	manager := client.NewClient(sender, encoder)
@@ -127,7 +128,7 @@ preserve_data = true
 		for i := 0; i < *numItems; i++ {
 			conf := fmt.Sprintf(confFmt, i)
 			msg := &message.Message{}
-			msg.SetLogger("heka-sbmgrload")
+			msg.SetLogger(pipeline.HEKA_DAEMON)
 			msg.SetType("heka.control.sandbox")
 			msg.SetTimestamp(time.Now().UnixNano())
 			msg.SetUuid(uuid.NewRandom())
@@ -139,12 +140,13 @@ preserve_data = true
 			msg.AddField(f1)
 			err = manager.SendMessage(msg)
 			if err != nil {
-				log.Printf("Error sending message: %s\n", err.Error())
+				client.LogError.Printf("Error sending message: %s\n", err.Error())
 			}
 		}
 	case "unload":
 		for i := 0; i < *numItems; i++ {
 			msg := &message.Message{}
+			msg.SetLogger(pipeline.HEKA_DAEMON)
 			msg.SetType("heka.control.sandbox")
 			msg.SetTimestamp(time.Now().UnixNano())
 			msg.SetUuid(uuid.NewRandom())
@@ -155,12 +157,12 @@ preserve_data = true
 			msg.AddField(f1)
 			err = manager.SendMessage(msg)
 			if err != nil {
-				log.Printf("Error sending message: %s\n", err.Error())
+				client.LogError.Printf("Error sending message: %s\n", err.Error())
 			}
 		}
 
 	default:
-		log.Printf("Invalid action: %s\n", *action)
+		client.LogError.Printf("Invalid action: %s\n", *action)
 	}
 
 }

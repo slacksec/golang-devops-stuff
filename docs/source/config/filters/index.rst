@@ -24,104 +24,46 @@ initialization code.
     Frequency (in seconds) that a timer event will be sent to the filter.
     Defaults to not sending timer events.
 
-.. _config_circular_buffer_delta_agg_filter:
+.. versionadded:: 0.7
 
-Circular Buffer Delta Aggregator
-================================
+- can_exit (bool, optional)
+    Whether or not this plugin can exit without causing Heka to shutdown.
+    Defaults to false for non-sandbox filters, and true for sandbox filters.
 
-.. versionadded:: 0.5
+.. versionadded:: 0.10
 
-.. include:: /../../sandbox/lua/filters/cbufd_aggregator.lua
-   :start-after: --[[
-   :end-before: --]]
+- use_buffering (bool, optional)
+    If true, all messages delivered to this filter will be buffered to disk
+    before delivery, preventing back pressure and allowing retries in cases of
+    message processing failure. Defaults to false, unless otherwise specified
+    by the individual filter's documentation.
+- buffering (QueueBufferConfig, optional)
+    A sub-section that specifies the settings to be used for the buffering
+    behavior. This will only have any impact if `use_buffering` is set to
+    true. See :ref:`buffering`.
 
-.. _config_circular_buffer_delta_agg_by_host:
+Available Filter Plugins
+========================
 
-CBuf Delta Aggregator By Hostname
-=================================
+.. toctree::
+   :maxdepth: 1
 
-.. versionadded:: 0.5
-
-.. include:: /../../sandbox/lua/filters/cbufd_host_aggregator.lua
-   :start-after: --[[
-   :end-before: --]]
-
-.. _config_counter_filter:
-
-.. include:: /config/filters/counter.rst
-
-.. _config_frequent_items_filter:
-
-Frequent Items
-==============
-
-.. versionadded:: 0.5
-
-.. include:: /../../sandbox/lua/filters/frequent_items.lua
-   :start-after: --[[
-   :end-before: --]]
-
-.. _config_memstat_filter:
-
-Heka Memory Statistics
-======================
-
-.. versionadded:: 0.6
-
-.. include:: /../../sandbox/lua/filters/heka_memstat.lua
-   :start-after: --[[
-   :end-before: --]]
-
-.. _config_message_schema_filter:
-
-Heka Message Schema
-===================
-
-.. versionadded:: 0.5
-
-.. include:: /../../sandbox/lua/filters/heka_message_schema.lua
-   :start-after: --[[
-   :end-before: --]]
-
-.. _config_http_status_graph_filter:
-
-HTTP Status Graph
-=================
-
-.. versionadded:: 0.5
-
-.. include:: /../../sandbox/lua/filters/http_status.lua
-   :start-after: --[[
-   :end-before: --]]
-
-.. _config_mysql_slow_query_filter:
-
-MySQL Slow Query
-================
-
-.. versionadded:: 0.6
-
-.. include:: /../../sandbox/lua/filters/mysql_slow_query.lua
-   :start-after: --[[
-   :end-before: --]]
-
-.. _config_stat_filter:
-.. include:: /config/filters/stat.rst
-
-.. _config_sandbox_filter:
-.. include:: /config/filters/sandbox.rst
-
-.. _config_sandbox_manager_filter:
-.. include:: /config/filters/sandboxmanager.rst
-
-.. _config_unique_items_filter:
-
-Unique Items
-============
-
-.. versionadded:: 0.6
-
-.. include:: /../../sandbox/lua/filters/unique_items.lua
-   :start-after: --[[
-   :end-before: --]]
-
+   cbuf_delta
+   cbuf_delta_by_host
+   counter
+   cpu_stats
+   disk_stats
+   frequent_items
+   heka_memstat
+   http_status
+   influx_batch
+   load_avg
+   mem_stats
+   message_failures
+   message_schema
+   mysql_slow_query
+   sandbox
+   sandboxmanager
+   stat
+   stats_graph
+   unique_items

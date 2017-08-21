@@ -22,7 +22,7 @@ Config:
     filename = "lua_filters/heka_message_schema.lua"
     ticker_interval = 60
     preserve_data = false
-    message_matcher = "Logger =~ /^Sync/"
+    message_matcher = "Logger != 'SyncMessageSchema' && Logger =~ /^Sync/"
 
 *Example Output*
 
@@ -82,7 +82,7 @@ function process_message ()
     local v = get_table(t, read_message("EnvVersion"))
 
     while true do
-        typ, name, value, representation, count = read_next_field()
+        local typ, name, value, representation, count = read_next_field()
         if not typ then break end
 
         if v[name] then

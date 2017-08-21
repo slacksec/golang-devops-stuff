@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012-2014
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,19 +16,19 @@
 package tcp
 
 import (
-	"code.google.com/p/gomock/gomock"
-	"code.google.com/p/goprotobuf/proto"
+	"io/ioutil"
+	"net"
+	"os"
+	"sync/atomic"
+	"time"
+
+	"github.com/gogo/protobuf/proto"
 	. "github.com/mozilla-services/heka/pipeline"
 	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
 	"github.com/mozilla-services/heka/plugins"
 	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
+	"github.com/rafrombrc/gomock/gomock"
 	gs "github.com/rafrombrc/gospec/src/gospec"
-	"io/ioutil"
-	"net"
-	"os"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 func TcpOutputSpec(c gs.Context) {
@@ -41,15 +41,13 @@ func TcpOutputSpec(c gs.Context) {
 		tmpErr = os.RemoveAll(tmpDir)
 		c.Expect(tmpErr, gs.Equals, nil)
 	}()
-	pConfig := NewPipelineConfig(nil)
+	globals := DefaultGlobals()
+	globals.BaseDir = tmpDir
+
+	pConfig := NewPipelineConfig(globals)
+	pConfig.RegisterDefault("HekaFramingSplitter")
 
 	c.Specify("TcpOutput", func() {
-		origBaseDir := Globals().BaseDir
-		Globals().BaseDir = tmpDir
-		defer func() {
-			Globals().BaseDir = origBaseDir
-		}()
-
 		tcpOutput := new(TcpOutput)
 		tcpOutput.SetName("test")
 		config := tcpOutput.ConfigStruct().(*TcpOutputConfig)
@@ -57,44 +55,34 @@ func TcpOutputSpec(c gs.Context) {
 
 		tickChan := make(chan time.Time)
 		oth := plugins_ts.NewOutputTestHelper(ctrl)
-		oth.MockOutputRunner.EXPECT().Ticker().Return(tickChan)
+		oth.MockOutputRunner.EXPECT().Ticker().Return(tickChan).AnyTimes()
 		encoder := new(ProtobufEncoder)
+		encoder.SetPipelineConfig(pConfig)
 		encoder.Init(nil)
-
-		var wg sync.WaitGroup
-		inChan := make(chan *PipelinePack, 1)
 
 		msg := pipeline_ts.GetTestMessage()
 		pack := NewPipelinePack(pConfig.InputRecycleChan())
 		pack.Message = msg
-		pack.Decoded = true
+		pack.QueueCursor = "queuecursor"
 
 		outStr := "Write me out to the network"
 		newpack := NewPipelinePack(nil)
 		newpack.Message = msg
-		newpack.Decoded = true
 		newpack.Message.SetPayload(outStr)
 		matchBytes, err := proto.Marshal(newpack.Message)
-		c.Expect(err, gs.IsNil)
+		c.Assume(err, gs.IsNil)
+		pack.MsgBytes = matchBytes
+		newpack.MsgBytes = matchBytes
 
-		inChanCall := oth.MockOutputRunner.EXPECT().InChan().AnyTimes()
-		inChanCall.Return(inChan)
+		oth.MockHelper.EXPECT().PipelineConfig().Return(pConfig)
 
 		c.Specify("doesn't use framing w/o ProtobufEncoder", func() {
 			encoder := new(plugins.PayloadEncoder)
 			oth.MockOutputRunner.EXPECT().Encoder().Return(encoder)
 			err := tcpOutput.Init(config)
 			c.Assume(err, gs.IsNil)
-
-			wg.Add(1)
-			go func() {
-				err = tcpOutput.Run(oth.MockOutputRunner, oth.MockHelper)
-				c.Expect(err, gs.IsNil)
-				wg.Done()
-			}()
-
-			close(inChan)
-			wg.Wait()
+			err = tcpOutput.Prepare(oth.MockOutputRunner, oth.MockHelper)
+			c.Expect(err, gs.IsNil)
 			// We should fail if SetUseFraming is called since we didn't
 			// EXPECT it.
 		})
@@ -104,16 +92,8 @@ func TcpOutputSpec(c gs.Context) {
 			config.UseFraming = &useFraming
 			err := tcpOutput.Init(config)
 			c.Assume(err, gs.IsNil)
-
-			wg.Add(1)
-			go func() {
-				err = tcpOutput.Run(oth.MockOutputRunner, oth.MockHelper)
-				c.Expect(err, gs.IsNil)
-				wg.Done()
-			}()
-
-			close(inChan)
-			wg.Wait()
+			err = tcpOutput.Prepare(oth.MockOutputRunner, oth.MockHelper)
+			c.Expect(err, gs.IsNil)
 			// We should fail if SetUseFraming is called since we didn't
 			// EXPECT it.
 		})
@@ -146,29 +126,26 @@ func TcpOutputSpec(c gs.Context) {
 
 			oth.MockOutputRunner.EXPECT().Encoder().Return(encoder)
 			oth.MockOutputRunner.EXPECT().SetUseFraming(true)
+			err = tcpOutput.Prepare(oth.MockOutputRunner, oth.MockHelper)
+			c.Assume(err, gs.IsNil)
+
 			oth.MockOutputRunner.EXPECT().Encode(pack).Return(encoder.Encode(pack))
-			oth.MockOutputRunner.EXPECT().UsesFraming().Return(false).AnyTimes()
+			oth.MockOutputRunner.EXPECT().UpdateCursor(pack.QueueCursor)
 
 			pack.Message.SetPayload(outStr)
-			wg.Add(1)
-			go func() {
-				err = tcpOutput.Run(oth.MockOutputRunner, oth.MockHelper)
-				c.Expect(err, gs.IsNil)
-				wg.Done()
-			}()
 
 			msgcount := atomic.LoadInt64(&tcpOutput.processMessageCount)
 			c.Expect(msgcount, gs.Equals, int64(0))
 
-			inChan <- pack
+			err = tcpOutput.ProcessMessage(pack)
+			c.Expect(err, gs.IsNil)
 			result = <-ch
 
 			msgcount = atomic.LoadInt64(&tcpOutput.processMessageCount)
 			c.Expect(msgcount, gs.Equals, int64(1))
 			c.Expect(result, gs.Equals, string(matchBytes))
 
-			close(inChan)
-			wg.Wait() // wait for output to finish shutting down
+			tcpOutput.CleanUp()
 		})
 
 		c.Specify("far end not initially listening", func() {
@@ -177,27 +154,21 @@ func TcpOutputSpec(c gs.Context) {
 			err := tcpOutput.Init(config)
 			c.Assume(err, gs.IsNil)
 
-			pack.Message.SetPayload(outStr)
 			oth.MockOutputRunner.EXPECT().Encoder().Return(encoder)
 			oth.MockOutputRunner.EXPECT().SetUseFraming(true)
-			oth.MockOutputRunner.EXPECT().Encode(pack).Return(encoder.Encode(pack))
-			oth.MockOutputRunner.EXPECT().UsesFraming().Return(false).AnyTimes()
+			err = tcpOutput.Prepare(oth.MockOutputRunner, oth.MockHelper)
+			c.Assume(err, gs.IsNil)
 
-			wg.Add(1)
-			go func() {
-				err = tcpOutput.Run(oth.MockOutputRunner, oth.MockHelper)
-				c.Expect(err, gs.IsNil)
-				wg.Done()
-			}()
+			pack.Message.SetPayload(outStr)
+
 			msgcount := atomic.LoadInt64(&tcpOutput.processMessageCount)
 			c.Expect(msgcount, gs.Equals, int64(0))
 
-			inChan <- pack
-
-			for x := 0; x < 5 && msgcount == 0; x++ {
-				msgcount = atomic.LoadInt64(&tcpOutput.processMessageCount)
-				time.Sleep(time.Duration(100) * time.Millisecond)
-			}
+			err = tcpOutput.ProcessMessage(pack)
+			_, ok := err.(RetryMessageError)
+			c.Expect(ok, gs.IsTrue)
+			msgcount = atomic.LoadInt64(&tcpOutput.processMessageCount)
+			c.Expect(msgcount, gs.Equals, int64(0))
 
 			// After the message is queued start the collector. However, we
 			// don't have a way guarantee a send attempt has already been made
@@ -208,6 +179,7 @@ func TcpOutputSpec(c gs.Context) {
 					ch <- err.Error()
 					return
 				}
+				ch <- "ready"
 				conn, err := ln.Accept()
 				if err != nil {
 					ch <- err.Error()
@@ -222,10 +194,99 @@ func TcpOutputSpec(c gs.Context) {
 			ch := make(chan string, 1) // don't block on put
 			go collectData(ch)
 			result := <-ch
-			c.Expect(result, gs.Equals, string(matchBytes))
 
-			close(inChan)
-			wg.Wait() // wait for output to finish shutting down
+			oth.MockOutputRunner.EXPECT().Encode(pack).Return(encoder.Encode(pack))
+			oth.MockOutputRunner.EXPECT().UpdateCursor(pack.QueueCursor)
+
+			err = tcpOutput.ProcessMessage(pack)
+			c.Expect(err, gs.IsNil)
+
+			result = <-ch
+			c.Expect(result, gs.Equals, string(matchBytes))
+			msgcount = atomic.LoadInt64(&tcpOutput.processMessageCount)
+			c.Expect(msgcount, gs.Equals, int64(1))
+
+			tcpOutput.CleanUp()
 		})
+
+		// c.Specify("Overload queue drops messages", func() {
+		// 	config.QueueFullAction = "drop"
+		// 	config.QueueMaxBufferSize = uint64(1)
+		// 	use_framing := false
+		// 	config.UseFraming = &use_framing
+		// 	oth.MockOutputRunner.EXPECT().Encode(pack).Return(encoder.Encode(pack))
+		// 	oth.MockOutputRunner.EXPECT().LogError(QueueIsFull)
+
+		// 	err := tcpOutput.Init(config)
+		// 	c.Expect(err, gs.IsNil)
+
+		// 	startOutput()
+
+		// 	inChan <- pack
+
+		// 	dropcount := atomic.LoadInt64(&tcpOutput.dropMessageCount)
+
+		// 	for x := 0; x < 5 && dropcount == 0; x++ {
+		// 		dropcount = atomic.LoadInt64(&tcpOutput.dropMessageCount)
+		// 		time.Sleep(time.Duration(100) * time.Millisecond)
+		// 	}
+
+		// 	c.Expect(dropcount, gs.Equals, int64(1))
+
+		// 	close(inChan)
+		// })
+
+		// c.Specify("Overload queue shutdowns Heka", func() {
+		// 	config.QueueFullAction = "shutdown"
+		// 	config.QueueMaxBufferSize = uint64(1)
+		// 	use_framing := false
+		// 	config.UseFraming = &use_framing
+
+		// 	oth.MockOutputRunner.EXPECT().Encode(pack).Return(encoder.Encode(pack))
+		// 	oth.MockOutputRunner.EXPECT().LogError(QueueIsFull)
+
+		// 	sigChan := globals.SigChan()
+
+		// 	err := tcpOutput.Init(config)
+		// 	c.Expect(err, gs.IsNil)
+
+		// 	startOutput()
+
+		// 	inChan <- pack
+		// 	shutdownSignal := <-sigChan
+		// 	c.Expect(shutdownSignal, gs.Equals, syscall.SIGINT)
+
+		// 	close(inChan)
+		// })
+
+		// c.Specify("Overload queue blocks processing until packet is sent", func() {
+		// 	config.QueueFullAction = "block"
+		// 	config.QueueMaxBufferSize = uint64(1)
+		// 	use_framing := false
+		// 	config.UseFraming = &use_framing
+
+		// 	oth.MockOutputRunner.EXPECT().Encode(pack).Return(encoder.Encode(pack)).AnyTimes()
+		// 	oth.MockOutputRunner.EXPECT().LogError(QueueIsFull)
+
+		// 	err := tcpOutput.Init(config)
+		// 	c.Expect(err, gs.IsNil)
+
+		// 	startOutput()
+
+		// 	inChan <- pack
+
+		// 	msgcount := atomic.LoadInt64(&tcpOutput.dropMessageCount)
+
+		// 	for x := 0; x < 5 && msgcount == 0; x++ {
+		// 		msgcount = atomic.LoadInt64(&tcpOutput.dropMessageCount)
+		// 		time.Sleep(time.Duration(100) * time.Millisecond)
+		// 	}
+
+		// 	c.Expect(atomic.LoadInt64(&tcpOutput.dropMessageCount), gs.Equals, int64(0))
+		// 	c.Expect(atomic.LoadInt64(&tcpOutput.processMessageCount), gs.Equals, int64(0))
+
+		// 	close(inChan)
+		// })
+
 	})
 }

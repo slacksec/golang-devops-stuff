@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -18,17 +18,18 @@ package process
 import (
 	"errors"
 	"fmt"
-	"github.com/bbangert/toml"
-	. "github.com/mozilla-services/heka/pipeline"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/bbangert/toml"
+	. "github.com/mozilla-services/heka/pipeline"
 )
 
 type ProcessEntry struct {
 	ir     InputRunner
+	maker  MutableMaker
 	config *ProcessInputConfig
 }
 
@@ -51,13 +52,21 @@ type ProcessDirectoryInput struct {
 	procDir   string
 	ir        InputRunner
 	h         PluginHelper
+	pConfig   *PipelineConfig
+}
+
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (pdi *ProcessDirectoryInput) SetPipelineConfig(pConfig *PipelineConfig) {
+	pdi.pConfig = pConfig
 }
 
 func (pdi *ProcessDirectoryInput) Init(config interface{}) (err error) {
 	conf := config.(*ProcessDirectoryInputConfig)
 	pdi.inputs = make(map[string]*ProcessEntry)
 	pdi.stopChan = make(chan bool)
-	pdi.procDir = filepath.Clean(PrependShareDir(conf.ProcessDir))
+	globals := pdi.pConfig.Globals
+	pdi.procDir = filepath.Clean(globals.PrependShareDir(conf.ProcessDir))
 	return
 }
 
@@ -110,10 +119,10 @@ func (pdi *ProcessDirectoryInput) loadInputs() (err error) {
 		return
 	}
 
-	// Remove any running inputs that are no longer specified.
+	// Remove any running inputs that are no longer specified
 	for name, entry := range pdi.inputs {
 		if _, ok := pdi.specified[name]; !ok {
-			pdi.h.PipelineConfig().RemoveInputRunner(entry.ir)
+			pdi.pConfig.RemoveInputRunner(entry.ir)
 			delete(pdi.inputs, name)
 			pdi.ir.LogMessage(fmt.Sprintf("Removed: %s", name))
 		}
@@ -122,20 +131,21 @@ func (pdi *ProcessDirectoryInput) loadInputs() (err error) {
 	// Iterate through the specified inputs and activate any that are new or
 	// have been modified.
 	for name, newEntry := range pdi.specified {
+
 		if runningEntry, ok := pdi.inputs[name]; ok {
 			if runningEntry.config.Equals(newEntry.config) {
 				// Nothing has changed, let this one keep running.
 				continue
 			}
 			// It has changed, stop the old one.
-			pdi.h.PipelineConfig().RemoveInputRunner(runningEntry.ir)
+			pdi.pConfig.RemoveInputRunner(runningEntry.ir)
 			pdi.ir.LogMessage(fmt.Sprintf("Removed: %s", name))
 			delete(pdi.inputs, name)
 		}
 
 		// Start up a new input.
-		if newEntry.ir, err = pdi.startInput(name, newEntry.config); err != nil {
-			pdi.ir.LogError(fmt.Errorf("Error creating input '%s': %s", name, err))
+		if err = pdi.pConfig.AddInputRunner(newEntry.ir); err != nil {
+			pdi.ir.LogError(fmt.Errorf("creating input '%s': %s", name, err))
 			continue
 		}
 		pdi.inputs[name] = newEntry
@@ -152,7 +162,7 @@ func (pdi *ProcessDirectoryInput) procDirWalkFunc(path string, info os.FileInfo,
 	err error) error {
 
 	if err != nil {
-		pdi.ir.LogError(fmt.Errorf("Error walking '%s': %s", path, err))
+		pdi.ir.LogError(fmt.Errorf("walking '%s': %s", path, err))
 		return nil
 	}
 	// info == nil => filepath doesn't actually exist.
@@ -170,81 +180,104 @@ func (pdi *ProcessDirectoryInput) procDirWalkFunc(path string, info os.FileInfo,
 	parentDir, timeInterval := filepath.Split(dir)
 	parentDir = strings.TrimSuffix(parentDir, string(os.PathSeparator))
 	if parentDir != pdi.procDir {
-		pdi.ir.LogError(fmt.Errorf("Invalid ProcessInput path: %s.", path))
+		pdi.ir.LogError(fmt.Errorf("invalid ProcessInput path: %s.", path))
 		return nil
 	}
 
 	// Extract and validate ticker interval from file path.
 	var tickInterval int
 	if tickInterval, err = strconv.Atoi(timeInterval); err != nil {
-		pdi.ir.LogError(fmt.Errorf("Ticker interval could not be parsed for '%s'.",
+		pdi.ir.LogError(fmt.Errorf("ticker interval could not be parsed for '%s'.",
 			path))
 		return nil
 	}
 	if tickInterval < 0 {
-		pdi.ir.LogError(fmt.Errorf("A negative ticker interval was parsed for '%s'.",
+		pdi.ir.LogError(fmt.Errorf("a negative ticker interval was parsed for '%s'.",
 			path))
 		return nil
 	}
 
 	// Things look good so far. Try to load the data into a config struct.
-	entry := new(ProcessEntry)
-	if entry.config, err = pdi.loadProcessFile(path); err != nil {
-		pdi.ir.LogError(fmt.Errorf("Error loading process file '%s': %s", path, err))
+	var entry *ProcessEntry
+	if entry, err = pdi.loadProcessFile(path); err != nil {
+		pdi.ir.LogError(fmt.Errorf("loading process file '%s': %s", path, err))
 		return nil
 	}
-	// Override the ticker interval and store the entry.
-	entry.config.TickerInterval = uint(tickInterval)
+
+	// Override the config settings we manage, make the runner, and store the
+	// entry.
+	prepConfig := func() (interface{}, error) {
+		config, err := entry.maker.OrigPrepConfig()
+		if err != nil {
+			return nil, err
+		}
+		processInputConfig := config.(*ProcessInputConfig)
+		processInputConfig.TickerInterval = uint(tickInterval)
+		return processInputConfig, nil
+	}
+	config, err := prepConfig()
+	if err != nil {
+		pdi.ir.LogError(fmt.Errorf("prepping config: %s", err.Error()))
+		return nil
+	}
+	entry.config = config.(*ProcessInputConfig)
+	entry.maker.SetPrepConfig(prepConfig)
+
+	runner, err := entry.maker.MakeRunner("")
+	if err != nil {
+		pdi.ir.LogError(fmt.Errorf("making runner: %s", err.Error()))
+		return nil
+	}
+
+	entry.ir = runner.(InputRunner)
+	entry.ir.SetTransient(true)
 	pdi.specified[path] = entry
 	return nil
 }
 
-func (pdi *ProcessDirectoryInput) loadProcessFile(path string) (config *ProcessInputConfig,
-	err error) {
-
+func (pdi *ProcessDirectoryInput) loadProcessFile(path string) (*ProcessEntry, error) {
+	var err error
 	unparsedConfig := make(map[string]toml.Primitive)
 	if _, err = toml.DecodeFile(path, &unparsedConfig); err != nil {
-		return
+		return nil, err
 	}
 	section, ok := unparsedConfig["ProcessInput"]
 	if !ok {
 		err = errors.New("No `ProcessInput` section.")
-		return
-	}
-	config = &ProcessInputConfig{
-		ParserType:  "token",
-		ParseStdout: true,
-		Trim:        true,
-	}
-	if err = toml.PrimitiveDecodeStrict(section, config, nil); err != nil {
 		return nil, err
 	}
-	return
-}
 
-func (pdi *ProcessDirectoryInput) startInput(name string, config *ProcessInputConfig) (
-	ir InputRunner, err error) {
-
-	input := new(ProcessInput)
-	input.SetName(name)
-	if err = input.Init(config); err != nil {
-		return
+	maker, err := NewPluginMaker("ProcessInput", pdi.pConfig, section)
+	if err != nil {
+		return nil, fmt.Errorf("can't create plugin maker: %s", err)
 	}
 
-	var pluginGlobals PluginGlobals
-	pluginGlobals.Retries = RetryOptions{
-		MaxDelay:   "30s",
-		Delay:      "250ms",
-		MaxRetries: -1,
+	mutMaker := maker.(MutableMaker)
+	mutMaker.SetName(path)
+
+	prepCommonTypedConfig := func() (interface{}, error) {
+		commonTypedConfig, err := mutMaker.OrigPrepCommonTypedConfig()
+		if err != nil {
+			return nil, err
+		}
+		commonInput := commonTypedConfig.(CommonInputConfig)
+		commonInput.Retries = RetryOptions{
+			MaxDelay:   "30s",
+			Delay:      "250ms",
+			MaxRetries: -1,
+		}
+		if commonInput.CanExit == nil {
+			b := true
+			commonInput.CanExit = &b
+		}
+		return commonInput, nil
 	}
-	pluginGlobals.Ticker = uint(config.TickerInterval)
-	tickLength := time.Duration(pluginGlobals.Ticker) * time.Second
-	ir = NewInputRunner(name, input, &pluginGlobals, true)
-	ir.SetTickLength(tickLength)
-	if err = pdi.h.PipelineConfig().AddInputRunner(ir, nil); err != nil {
-		return nil, err
+	mutMaker.SetPrepCommonTypedConfig(prepCommonTypedConfig)
+
+	entry := &ProcessEntry{
+		maker: mutMaker,
 	}
-	return
+	return entry, nil
 }
 
 func init() {

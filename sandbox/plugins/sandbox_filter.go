@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,12 +16,8 @@
 package plugins
 
 import (
-	"code.google.com/p/goprotobuf/proto"
+	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	"github.com/mozilla-services/heka/pipeline"
-	. "github.com/mozilla-services/heka/sandbox"
-	"github.com/mozilla-services/heka/sandbox/lua"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -29,6 +25,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gogo/protobuf/proto"
+	"github.com/mozilla-services/heka/message"
+	"github.com/mozilla-services/heka/pipeline"
+	. "github.com/mozilla-services/heka/sandbox"
+	"github.com/mozilla-services/heka/sandbox/lua"
 )
 
 func fileExists(path string) bool {
@@ -60,19 +62,22 @@ type SandboxFilter struct {
 	name                   string
 	sampleDenominator      int
 	manager                *SandboxManagerFilter
+	pConfig                *pipeline.PipelineConfig
+}
+
+// Heka will call this before calling any other methods to give us access to
+// the pipeline configuration.
+func (this *SandboxFilter) SetPipelineConfig(pConfig *pipeline.PipelineConfig) {
+	this.pConfig = pConfig
 }
 
 func (this *SandboxFilter) ConfigStruct() interface{} {
-	return NewSandboxConfig()
+	return NewSandboxConfig(this.pConfig.Globals)
 }
 
 func (this *SandboxFilter) SetName(name string) {
 	re := regexp.MustCompile("\\W")
 	this.name = re.ReplaceAllString(name, "_")
-}
-
-func (s *SandboxFilter) IsStoppable() {
-	return
 }
 
 // Determines the script type and creates interpreter
@@ -81,10 +86,12 @@ func (this *SandboxFilter) Init(config interface{}) (err error) {
 		return nil // no-op already initialized
 	}
 	this.sbc = config.(*SandboxConfig)
-	this.sbc.ScriptFilename = pipeline.PrependShareDir(this.sbc.ScriptFilename)
-	this.sampleDenominator = pipeline.Globals().SampleDenominator
+	globals := this.pConfig.Globals
+	this.sbc.ScriptFilename = globals.PrependShareDir(this.sbc.ScriptFilename)
+	this.sbc.PluginType = "filter"
+	this.sampleDenominator = globals.SampleDenominator
 
-	data_dir := pipeline.PrependBaseDir(DATA_DIR)
+	data_dir := globals.PrependBaseDir(DATA_DIR)
 	if !fileExists(data_dir) {
 		err = os.MkdirAll(data_dir, 0700)
 		if err != nil {
@@ -104,9 +111,9 @@ func (this *SandboxFilter) Init(config interface{}) (err error) {
 
 	this.preservationFile = filepath.Join(data_dir, this.name+DATA_EXT)
 	if this.sbc.PreserveData && fileExists(this.preservationFile) {
-		err = this.sb.Init(this.preservationFile, "filter")
+		err = this.sb.Init(this.preservationFile)
 	} else {
-		err = this.sb.Init("", "filter")
+		err = this.sb.Init("")
 	}
 
 	return
@@ -172,22 +179,32 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 		msgLoopCount   uint
 		injectionCount uint
 		startTime      time.Time
-		slowDuration   int64 = int64(pipeline.Globals().MaxMsgProcessDuration)
+		slowDuration   int64 = int64(this.pConfig.Globals.MaxMsgProcessDuration)
 		duration       int64
-		capacity       = cap(inChan) - 1
+		samplesNeeded  int64
 	)
 
+	if fr.UsesBuffering() {
+		samplesNeeded = int64(h.PipelineConfig().Globals.PluginChanSize) - 1
+	} else {
+		samplesNeeded = int64(cap(inChan)) - 1
+	}
+	// We assign to the return value of Run() for errors in the closure so that
+	// the plugin runner can determine what caused the SandboxFilter to return.
 	this.sb.InjectMessage(func(payload, payload_type, payload_name string) int {
 		if injectionCount == 0 {
-			fr.LogError(fmt.Errorf("exceeded InjectMessage count"))
-			return 1
+			err = pipeline.TerminatedError("exceeded InjectMessage count")
+			return 2
 		}
 		injectionCount--
-		pack := h.PipelinePack(msgLoopCount)
-		if pack == nil {
-			fr.LogError(fmt.Errorf("exceeded MaxMsgLoops = %d",
-				pipeline.Globals().MaxMsgLoops))
-			return 1
+		pack, e := h.PipelinePack(msgLoopCount)
+		if e != nil {
+			err = pipeline.TerminatedError(e.Error())
+			if e == pipeline.AbortError {
+				return 5
+			} else {
+				return 3
+			}
 		}
 		if len(payload_type) == 0 { // heka protobuf message
 			hostname := pack.Message.GetHostname()
@@ -210,7 +227,7 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 			pack.Message.AddField(pname)
 		}
 		if !fr.Inject(pack) {
-			return 1
+			return 4
 		}
 		atomic.AddInt64(&this.injectMessageCount, 1)
 		return 0
@@ -223,22 +240,18 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 				break
 			}
 			atomic.AddInt64(&this.processMessageCount, 1)
-			injectionCount = pipeline.Globals().MaxMsgProcessInject
+			injectionCount = this.pConfig.Globals.MaxMsgProcessInject
 			msgLoopCount = pack.MsgLoopCount
 
 			if this.manager != nil { // only check for backpressure on dynamic plugins
-				// reading a channel length is generally fast ~1ns
-				// we need to check the entire chain back to the router
-				backpressure = len(inChan) >= capacity ||
-					fr.MatchRunner().InChanLen() >= capacity ||
-					len(h.PipelineConfig().Router().InChan()) >= capacity
+				backpressure = fr.BackPressured()
 			}
 
 			// performing the timing is expensive ~40ns but if we are
 			// backpressured we need a decent sample set before triggering
 			// termination
 			if sample ||
-				(backpressure && this.processMessageSamples < int64(capacity)) ||
+				(backpressure && this.processMessageSamples < samplesNeeded) ||
 				this.sbc.Profile {
 				startTime = time.Now()
 				sample = true
@@ -252,7 +265,7 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 				if this.sbc.Profile {
 					this.profileMessageDuration = this.processMessageDuration
 					this.profileMessageSamples = this.processMessageSamples
-					if this.profileMessageSamples == int64(capacity)*10 {
+					if this.profileMessageSamples == samplesNeeded*10 {
 						this.sbc.Profile = false
 						// reset the normal sampling so it isn't heavily skewed by the profile values
 						// i.e. process messages fast during profiling and then switch to malicious code
@@ -263,7 +276,7 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 				this.reportLock.Unlock()
 			}
 			if retval <= 0 {
-				if backpressure && this.processMessageSamples >= int64(capacity) {
+				if backpressure && this.processMessageSamples >= samplesNeeded {
 					if this.processMessageDuration/this.processMessageSamples > slowDuration ||
 						fr.MatchRunner().GetAvgDuration() > slowDuration/5 {
 						terminated = true
@@ -272,15 +285,19 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 				}
 				if retval < 0 {
 					atomic.AddInt64(&this.processMessageFailures, 1)
+					em := this.sb.LastError()
+					if len(em) > 0 {
+						fr.LogError(errors.New(em))
+					}
 				}
 				sample = 0 == rand.Intn(this.sampleDenominator)
 			} else {
 				terminated = true
 			}
-			pack.Recycle()
+			pack.Recycle(nil)
 
 		case t := <-ticker:
-			injectionCount = pipeline.Globals().MaxMsgTimerInject
+			injectionCount = this.pConfig.Globals.MaxMsgTimerInject
 			startTime = time.Now()
 			if retval = this.sb.TimerEvent(t.UnixNano()); retval != 0 {
 				terminated = true
@@ -293,34 +310,45 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 		}
 
 		if terminated {
-			pack := h.PipelinePack(0)
+			pack, e := h.PipelinePack(0)
+			if e != nil {
+				err = pipeline.TerminatedError(e.Error())
+				break
+			}
 			pack.Message.SetType("heka.sandbox-terminated")
-			pack.Message.SetLogger(fr.Name())
+			pack.Message.SetLogger(pipeline.HEKA_DAEMON)
+			message.NewStringField(pack.Message, "plugin", fr.Name())
 			if blocking {
 				pack.Message.SetPayload("sandbox is running slowly and blocking the router")
 				// no lock on the ProcessMessage variables here because there are no active writers
-				message.NewInt64Field(pack.Message, "ProcessMessageCount", this.processMessageCount, "count")
-				message.NewInt64Field(pack.Message, "ProcessMessageFailures", this.processMessageFailures, "count")
-				message.NewInt64Field(pack.Message, "ProcessMessageSamples", this.processMessageSamples, "count")
+				message.NewInt64Field(pack.Message, "ProcessMessageCount", this.processMessageCount,
+					"count")
+				message.NewInt64Field(pack.Message, "ProcessMessageFailures", this.processMessageFailures,
+					"count")
+				message.NewInt64Field(pack.Message, "ProcessMessageSamples", this.processMessageSamples,
+					"count")
 				message.NewInt64Field(pack.Message, "ProcessMessageAvgDuration",
 					this.processMessageDuration/this.processMessageSamples, "ns")
-				message.NewInt64Field(pack.Message, "MatchAvgDuration", fr.MatchRunner().GetAvgDuration(), "ns")
+				message.NewInt64Field(pack.Message, "MatchAvgDuration", fr.MatchRunner().GetAvgDuration(),
+					"ns")
 				message.NewIntField(pack.Message, "FilterChanLength", len(inChan), "count")
-				message.NewIntField(pack.Message, "MatchChanLength", fr.MatchRunner().InChanLen(), "count")
-				message.NewIntField(pack.Message, "RouterChanLength", len(h.PipelineConfig().Router().InChan()), "count")
+				message.NewIntField(pack.Message, "MatchChanLength", fr.MatchRunner().InChanLen(),
+					"count")
+				message.NewIntField(pack.Message, "RouterChanLength",
+					len(this.pConfig.Router().InChan()), "count")
 			} else {
 				pack.Message.SetPayload(this.sb.LastError())
 			}
 			fr.Inject(pack)
+			err = pipeline.TerminatedError(this.sb.LastError())
 			break
 		}
 	}
 
-	if terminated {
-		go h.PipelineConfig().RemoveFilterRunner(fr.Name())
-		// recycle any messages until the matcher is torn down
-		for pack = range inChan {
-			pack.Recycle()
+	if !terminated && this.sbc.TimerEventOnShutdown {
+		injectionCount = this.pConfig.Globals.MaxMsgTimerInject
+		if retval = this.sb.TimerEvent(time.Now().UnixNano()); retval != 0 {
+			err = fmt.Errorf("FATAL: %s", this.sb.LastError())
 		}
 	}
 
@@ -328,13 +356,30 @@ func (this *SandboxFilter) Run(fr pipeline.FilterRunner, h pipeline.PluginHelper
 		this.manager.PluginExited()
 	}
 
-	this.reportLock.Lock()
-	if this.sbc.PreserveData {
-		err = this.sb.Destroy(this.preservationFile)
-	} else {
-		err = this.sb.Destroy("")
+	destroyErr := this.destroy()
+	if destroyErr != nil {
+		if err != nil {
+			fr.LogError(destroyErr)
+		} else {
+			err = destroyErr
+		}
 	}
-	this.sb = nil
+	return err
+}
+
+func (this *SandboxFilter) destroy() error {
+	this.reportLock.Lock()
+
+	var err error
+	if this.sb != nil {
+		if this.sbc.PreserveData {
+			err = this.sb.Destroy(this.preservationFile)
+		} else {
+			err = this.sb.Destroy("")
+		}
+
+		this.sb = nil
+	}
 	this.reportLock.Unlock()
-	return
+	return err
 }

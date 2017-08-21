@@ -4,27 +4,30 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2014
+# Portions created by the Initial Developer are Copyright (C) 2014-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
 #   Christian Vozar (christian@bellycard.com)
+#   Rob Miller (rmiller@mozilla.com)
+#   Anton Lindstrom (carlantonlindstrom@gmail.com)
 #
 # ***** END LICENSE BLOCK *****/
 
 package http
 
 import (
-	"code.google.com/p/go-uuid/uuid"
+	"crypto/tls"
+	"errors"
 	"fmt"
-	"github.com/mozilla-services/heka/message"
-	. "github.com/mozilla-services/heka/pipeline"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
-	"time"
+
+	"github.com/mozilla-services/heka/message"
+	. "github.com/mozilla-services/heka/pipeline"
+	. "github.com/mozilla-services/heka/plugins/tcp"
 )
 
 type HttpListenInput struct {
@@ -32,115 +35,200 @@ type HttpListenInput struct {
 	listener    net.Listener
 	stopChan    chan bool
 	ir          InputRunner
-	dRunner     DecoderRunner
-	pConfig     *PipelineConfig
-	decoderName string
+	server      *http.Server
+	starterFunc func(hli *HttpListenInput) error
+	hekaPid     int32
+	hostname    string
 }
 
 // HTTP Listen Input config struct
 type HttpListenInputConfig struct {
-	// TCP Address to listen to for SNS notifications.
-	// Defaults to "0.0.0.0:8325".
-	Address string
-	// Name of configured decoder instance used to decode the messages.
-	// Defaults to request body as payload.
-	Decoder string
+	// TCP Address to listen to for incoming requests.
+	// Defaults to "127.0.0.1:8325".
+	Address        string
+	Headers        http.Header
+	RequestHeaders []string `toml:"request_headers"`
+	AuthType       string   `toml:"auth_type"`
+	Username       string   `toml:"username"`
+	Password       string   `toml:"password"`
+	Key            string   `toml:"api_key"`
+	// Set to true if the TCP connection should be tunneled through TLS.
+	// Requires additional Tls config section.
+	UseTls bool `toml:"use_tls"`
+	// Subsection for TLS configuration.
+	Tls TlsConfig
 }
 
 func (hli *HttpListenInput) ConfigStruct() interface{} {
-	return &HttpListenInputConfig{
-		Address: "127.0.0.1:8325",
+	config := &HttpListenInputConfig{
+		Address:        "127.0.0.1:8325",
+		Headers:        make(http.Header),
+		RequestHeaders: []string{},
 	}
+	config.Tls = TlsConfig{PreferServerCiphers: true}
+	return config
 }
 
-func (hli *HttpListenInput) RequestHandler(w http.ResponseWriter, req *http.Request) {
-
-	body, err := ioutil.ReadAll(req.Body)
+func defaultStarter(hli *HttpListenInput) (err error) {
+	hli.listener, err = net.Listen("tcp", hli.conf.Address)
 	if err != nil {
-		fmt.Errorf("[HttpListenInput] Read HTTP request body fail: %s\n", err.Error())
-	}
-	req.Body.Close()
-
-	unEscapedBody, _ := url.QueryUnescape(string(body))
-
-	pack := <-hli.ir.InChan()
-	pack.Message.SetUuid(uuid.NewRandom())
-	pack.Message.SetTimestamp(time.Now().UnixNano())
-	pack.Message.SetType("heka.httpdata.request")
-	pack.Message.SetLogger(hli.ir.Name())
-	pack.Message.SetHostname(req.RemoteAddr)
-	pack.Message.SetPid(int32(os.Getpid()))
-	pack.Message.SetSeverity(int32(6))
-	pack.Message.SetPayload(unEscapedBody)
-	if field, err := message.NewField("Protocol", req.Proto, ""); err == nil {
-		pack.Message.AddField(field)
+		return fmt.Errorf("Listener [%s] start fail: %s",
+			hli.conf.Address, err.Error())
 	} else {
-		hli.ir.LogError(fmt.Errorf("can't add field: %s", err))
-	}
-	if field, err := message.NewField("UserAgent", req.UserAgent(), ""); err == nil {
-		pack.Message.AddField(field)
-	} else {
-		hli.ir.LogError(fmt.Errorf("can't add field: %s", err))
-	}
-	if field, err := message.NewField("ContentType", req.Header.Get("Content-Type"), ""); err == nil {
-		pack.Message.AddField(field)
-	} else {
-		hli.ir.LogError(fmt.Errorf("can't add field: %s", err))
+		hli.ir.LogMessage(fmt.Sprintf("Listening on %s",
+			hli.conf.Address))
 	}
 
-	for key, values := range req.URL.Query() {
-		for i := range values {
-			value := values[i]
-			if field, err := message.NewField(key, value, ""); err == nil {
-				pack.Message.AddField(field)
-			} else {
-				hli.ir.LogError(fmt.Errorf("can't add field: %s", err))
-			}
+	if hli.conf.UseTls {
+		if err = hli.setupTls(&hli.conf.Tls); err != nil {
+			return err
 		}
 	}
 
-	if hli.dRunner == nil {
-		hli.ir.Inject(pack)
-	} else {
-		hli.dRunner.InChan() <- pack
+	err = hli.server.Serve(hli.listener)
+	if err != nil {
+		return fmt.Errorf("Serve fail: %s", err.Error())
 	}
-}
-
-func (hli *HttpListenInput) Init(config interface{}) (err error) {
-	hli.stopChan = make(chan bool, 1)
-
-	hli.conf = config.(*HttpListenInputConfig)
-	hli.decoderName = hli.conf.Decoder
 
 	return nil
 }
 
-func (hli *HttpListenInput) Run(ir InputRunner, h PluginHelper) (err error) {
-	var ok bool
+func (hli *HttpListenInput) setupTls(tomlConf *TlsConfig) (err error) {
+	if tomlConf.CertFile == "" || tomlConf.KeyFile == "" {
+		return errors.New("TLS config requires both cert_file and key_file value.")
+	}
+	var goConf *tls.Config
+	if goConf, err = CreateGoTlsConfig(tomlConf); err == nil {
+		hli.listener = tls.NewListener(hli.listener, goConf)
+	}
+	return
+}
 
-	hli.ir = ir
-	hli.pConfig = h.PipelineConfig()
+func (hli *HttpListenInput) makeField(name string, value string) (field *message.Field, err error) {
+	field, err = message.NewField(name, value, "")
+	if err != nil {
+		hli.ir.LogError(fmt.Errorf("can't add field %s: %s", name, err))
+	}
+	return
+}
 
-	if hli.decoderName != "" {
-		if hli.dRunner, ok = h.DecoderRunner(hli.decoderName, fmt.Sprintf("%s-%s", ir.Name(), hli.decoderName)); !ok {
-			return fmt.Errorf("Decoder not found: %s", hli.decoderName)
+func (hli *HttpListenInput) makePackDecorator(req *http.Request) func(*PipelinePack) {
+	packDecorator := func(pack *PipelinePack) {
+		pack.Message.SetType("heka.httpdata.request")
+		pack.Message.SetPid(hli.hekaPid)
+		pack.Message.SetSeverity(int32(6))
+
+		// Host on which heka is running.
+		pack.Message.SetHostname(hli.hostname)
+		pack.Message.SetEnvVersion("1")
+		if field, err := hli.makeField("Protocol", req.Proto); err == nil {
+			pack.Message.AddField(field)
+		}
+		if field, err := hli.makeField("UserAgent", req.UserAgent()); err == nil {
+			pack.Message.AddField(field)
+		}
+		if field, err := hli.makeField("ContentType", req.Header.Get("Content-Type")); err == nil {
+			pack.Message.AddField(field)
+		}
+		if field, err := hli.makeField("Path", req.URL.Path); err == nil {
+			pack.Message.AddField(field)
+		}
+
+		// Host which the client requested.
+		host, _, err := net.SplitHostPort(req.Host)
+		if err != nil {
+			// Fall back to the un-split value.
+			host = req.Host
+		}
+		if field, err := hli.makeField("Host", host); err == nil {
+			pack.Message.AddField(field)
+		}
+
+		host, _, err = net.SplitHostPort(req.RemoteAddr)
+		if err != nil {
+			// Fall back to the un-split value.
+			host = req.RemoteAddr
+		}
+		if field, err := hli.makeField("RemoteAddr", host); err == nil {
+			pack.Message.AddField(field)
+		}
+		for _, key := range hli.conf.RequestHeaders {
+			value := req.Header.Get(key)
+			if len(value) == 0 {
+				continue
+			} else if field, err := hli.makeField(key, value); err == nil {
+				pack.Message.AddField(field)
+			}
+		}
+		for key, values := range req.URL.Query() {
+			for i := range values {
+				value := values[i]
+				if field, err := hli.makeField(key, value); err == nil {
+					pack.Message.AddField(field)
+				}
+			}
 		}
 	}
+	return packDecorator
+}
 
-	hliEndpointMux := http.NewServeMux()
-	hli.listener, err = net.Listen("tcp", hli.conf.Address)
-	if err != nil {
-		return fmt.Errorf("[HttpListenInput] Listener [%s] start fail: %s\n",
-			hli.conf.Address, err.Error())
-	} else {
-		hli.ir.LogMessage(fmt.Sprintf("[HttpListenInput (%s)] Listening.",
-			hli.conf.Address))
+func (hli *HttpListenInput) RequestHandler(w http.ResponseWriter, req *http.Request) {
+	var err error
+
+	if hli.conf.AuthType == "Basic" {
+		if hli.conf.Username != "" && hli.conf.Password != "" {
+			user, pass, ok := req.BasicAuth()
+			if !ok || user != hli.conf.Username || pass != hli.conf.Password {
+				err = fmt.Errorf("Basic Auth Failed")
+				hli.ir.LogError(err)
+			}
+		}
 	}
+	if hli.conf.AuthType == "API" {
+		if hli.conf.Key != "" {
+			api_key := req.Header.Get("X-API-Key")
+			if api_key != hli.conf.Key {
+				err = fmt.Errorf("API Auth Failed")
+				hli.ir.LogError(err)
+			}
+		}
+	}
+	if err == nil {
+		sRunner := hli.ir.NewSplitterRunner(req.RemoteAddr)
+		if !sRunner.UseMsgBytes() {
+			sRunner.SetPackDecorator(hli.makePackDecorator(req))
+		}
+		err = sRunner.SplitStreamNullSplitterToEOF(req.Body, nil)
+		if err != nil && err != io.EOF {
+			hli.ir.LogError(fmt.Errorf("receiving request body: %s", err.Error()))
+		}
+		req.Body.Close()
+		sRunner.Done()
+	}
+}
 
-	hliEndpointMux.HandleFunc("/", hli.RequestHandler)
-	err = http.Serve(hli.listener, hliEndpointMux)
+func (hli *HttpListenInput) Init(config interface{}) (err error) {
+	hli.conf = config.(*HttpListenInputConfig)
+	if hli.starterFunc == nil {
+		hli.starterFunc = defaultStarter
+	}
+	hli.stopChan = make(chan bool, 1)
+
+	handler := http.HandlerFunc(hli.RequestHandler)
+	hli.server = &http.Server{
+		Handler: CustomHeadersHandler(handler, hli.conf.Headers),
+	}
+	hli.hekaPid = int32(os.Getpid())
+	return nil
+}
+
+func (hli *HttpListenInput) Run(ir InputRunner, h PluginHelper) (err error) {
+	hli.ir = ir
+	var hostname, _ = os.Hostname()
+	hli.hostname = hostname
+	err = hli.starterFunc(hli)
 	if err != nil {
-		return fmt.Errorf("[HttpListenInput] Serve fail: %s\n", err.Error())
+		return err
 	}
 
 	<-hli.stopChan
@@ -149,7 +237,9 @@ func (hli *HttpListenInput) Run(ir InputRunner, h PluginHelper) (err error) {
 }
 
 func (hli *HttpListenInput) Stop() {
-	hli.listener.Close()
+	if hli.listener != nil {
+		hli.listener.Close()
+	}
 	close(hli.stopChan)
 }
 

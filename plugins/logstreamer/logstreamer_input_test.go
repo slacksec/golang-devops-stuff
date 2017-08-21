@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2014
+# Portions created by the Initial Developer are Copyright (C) 2014-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -16,19 +16,21 @@
 package logstreamer
 
 import (
-	"code.google.com/p/gomock/gomock"
-	ls "github.com/mozilla-services/heka/logstreamer"
-	. "github.com/mozilla-services/heka/pipeline"
-	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
-	"github.com/mozilla-services/heka/pipelinemock"
-	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
-	gs "github.com/rafrombrc/gospec/src/gospec"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
+
+	ls "github.com/mozilla-services/heka/logstreamer"
+	. "github.com/mozilla-services/heka/pipeline"
+	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
+	"github.com/mozilla-services/heka/pipelinemock"
+	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
+	"github.com/rafrombrc/gomock/gomock"
+	gs "github.com/rafrombrc/gospec/src/gospec"
 )
 
 func TestAllSpecs(t *testing.T) {
@@ -40,6 +42,21 @@ func TestAllSpecs(t *testing.T) {
 	gs.MainGoTest(r, t)
 }
 
+type deliverer struct {
+	deliver DeliverFunc
+}
+
+func (d *deliverer) Deliver(pack *PipelinePack) {
+	d.deliver(pack)
+}
+
+func (d *deliverer) DeliverFunc() DeliverFunc {
+	return d.deliver
+}
+
+func (d *deliverer) Done() {
+}
+
 func LogstreamerInputSpec(c gs.Context) {
 	t := &pipeline_ts.SimpleT{}
 	ctrl := gomock.NewController(t)
@@ -48,45 +65,43 @@ func LogstreamerInputSpec(c gs.Context) {
 	here, _ := os.Getwd()
 	dirPath := filepath.Join(here, "../../logstreamer", "testdir", "filehandling/subdir")
 
-	config := NewPipelineConfig(nil)
+	tmpDir, tmpErr := ioutil.TempDir("", "hekad-tests")
+	c.Expect(tmpErr, gs.Equals, nil)
+	defer func() {
+		tmpErr = os.RemoveAll(tmpDir)
+		c.Expect(tmpErr, gs.IsNil)
+	}()
+
+	globals := DefaultGlobals()
+	globals.BaseDir = tmpDir
+	pConfig := NewPipelineConfig(globals)
 	ith := new(plugins_ts.InputTestHelper)
 	ith.Msg = pipeline_ts.GetTestMessage()
-	ith.Pack = NewPipelinePack(config.InputRecycleChan())
+	ith.Pack = NewPipelinePack(pConfig.InputRecycleChan())
 
-	// Specify localhost, but we're not really going to use the network
+	// Specify localhost, but we're not really going to use the network.
 	ith.AddrStr = "localhost:55565"
 	ith.ResolvedAddrStr = "127.0.0.1:55565"
 
-	// set up mock helper, decoder set, and packSupply channel
+	// Set up mock helper, runner, and pack supply channel.
 	ith.MockHelper = pipelinemock.NewMockPluginHelper(ctrl)
 	ith.MockInputRunner = pipelinemock.NewMockInputRunner(ctrl)
-	ith.Decoder = pipelinemock.NewMockDecoderRunner(ctrl)
+	ith.MockDeliverer = pipelinemock.NewMockDeliverer(ctrl)
+	ith.MockSplitterRunner = pipelinemock.NewMockSplitterRunner(ctrl)
 	ith.PackSupply = make(chan *PipelinePack, 1)
-	ith.DecodeChan = make(chan *PipelinePack)
 
 	c.Specify("A LogstreamerInput", func() {
-		tmpDir, tmpErr := ioutil.TempDir("", "hekad-tests")
-		c.Expect(tmpErr, gs.Equals, nil)
-		origBaseDir := Globals().BaseDir
-		Globals().BaseDir = tmpDir
-		defer func() {
-			Globals().BaseDir = origBaseDir
-			tmpErr = os.RemoveAll(tmpDir)
-			c.Expect(tmpErr, gs.IsNil)
-		}()
-		lsInput := new(LogstreamerInput)
+		lsInput := &LogstreamerInput{pConfig: pConfig}
 		lsiConfig := lsInput.ConfigStruct().(*LogstreamerInputConfig)
 		lsiConfig.LogDirectory = dirPath
 		lsiConfig.FileMatch = `file.log(\.?)(?P<Seq>\d+)?`
 		lsiConfig.Differentiator = []string{"logfile"}
 		lsiConfig.Priority = []string{"^Seq"}
-		lsiConfig.Decoder = "decoder-name"
 
-		c.Specify("w/ no tranlation map", func() {
+		c.Specify("w/ no translation map", func() {
 			err := lsInput.Init(lsiConfig)
 			c.Expect(err, gs.IsNil)
 			c.Expect(len(lsInput.plugins), gs.Equals, 1)
-			mockDecoderRunner := pipelinemock.NewMockDecoderRunner(ctrl)
 
 			// Create pool of packs.
 			numLines := 5 // # of lines in the log file we're parsing.
@@ -98,30 +113,46 @@ func LogstreamerInputSpec(c gs.Context) {
 			}
 
 			c.Specify("reads a log file", func() {
-				// Expect InputRunner calls to get InChan and inject outgoing msgs
+				// Expect InputRunner calls to get InChan and inject outgoing msgs.
 				ith.MockInputRunner.EXPECT().LogError(gomock.Any()).AnyTimes()
 				ith.MockInputRunner.EXPECT().LogMessage(gomock.Any()).AnyTimes()
-				ith.MockInputRunner.EXPECT().InChan().Return(ith.PackSupply).Times(numLines)
-				// Expect calls to get decoder and decode each message. Since the
-				// decoding is a no-op, the message payload will be the log file
-				// line, unchanged.
-				pbcall := ith.MockHelper.EXPECT().DecoderRunner(lsiConfig.Decoder,
-					"-"+lsiConfig.Decoder)
-				pbcall.Return(mockDecoderRunner, true)
-				decodeCall := mockDecoderRunner.EXPECT().InChan().Times(numLines)
-				decodeCall.Return(ith.DecodeChan)
+				ith.MockInputRunner.EXPECT().NewDeliverer("1").Return(ith.MockDeliverer)
+				ith.MockInputRunner.EXPECT().NewSplitterRunner("1").Return(
+					ith.MockSplitterRunner)
+				ith.MockSplitterRunner.EXPECT().UseMsgBytes().Return(false)
+				ith.MockSplitterRunner.EXPECT().IncompleteFinal().Return(false)
+				ith.MockSplitterRunner.EXPECT().SetPackDecorator(gomock.Any())
+				ith.MockSplitterRunner.EXPECT().Done()
 
+				getRecCall := ith.MockSplitterRunner.EXPECT().GetRecordFromStream(
+					gomock.Any()).Times(numLines)
+				line := "boo hoo foo foo"
+				getRecCall.Return(len(line), []byte(line), nil)
+				getRecCall = ith.MockSplitterRunner.EXPECT().GetRecordFromStream(gomock.Any())
+				getRecCall.Return(0, make([]byte, 0), io.EOF)
+
+				deliverChan := make(chan []byte, 1)
+				deliverCall := ith.MockSplitterRunner.EXPECT().DeliverRecord(gomock.Any(),
+					ith.MockDeliverer).Times(numLines)
+				deliverCall.Do(func(record []byte, del Deliverer) {
+					deliverChan <- record
+				})
+
+				ith.MockDeliverer.EXPECT().Done()
+
+				runOutChan := make(chan error, 1)
 				go func() {
 					err = lsInput.Run(ith.MockInputRunner, ith.MockHelper)
-					c.Expect(err, gs.IsNil)
+					runOutChan <- err
 				}()
 
-				d, _ := time.ParseDuration("5s")
-				timeout := time.After(d)
+				dur, _ := time.ParseDuration("5s")
+				timeout := time.After(dur)
 				timed := false
 				for x := 0; x < numLines; x++ {
 					select {
-					case <-ith.DecodeChan:
+					case record := <-deliverChan:
+						c.Expect(string(record), gs.Equals, line)
 					case <-timeout:
 						timed = true
 						x += numLines
@@ -132,6 +163,7 @@ func LogstreamerInputSpec(c gs.Context) {
 				}
 				lsInput.Stop()
 				c.Expect(timed, gs.Equals, false)
+				c.Expect(<-runOutChan, gs.Equals, nil)
 			})
 		})
 

@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2014
+# Portions created by the Initial Developer are Copyright (C) 2014-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -325,7 +325,7 @@ func (l *Logstream) DumpDebug() string {
 		finfo, _ = l.fd.Stat()
 	}
 	return fmt.Sprintf("Logfiles: %s\n%s\nFileInfo: %s\n",
-		l.logfiles,
+		l.logfiles.FileNames(),
 		l.position.Debug(),
 		finfo,
 	)
@@ -384,7 +384,7 @@ func fileMatchRegexp(logRoot, fileMatch string) *regexp.Regexp {
 }
 
 func NewLogstreamSet(sortPattern *SortPattern, oldest time.Duration,
-	logRoot, journalRoot string) *LogstreamSet {
+	logRoot, journalRoot string) (*LogstreamSet, error) {
 	// Lowercase the actual matching keys.
 	newTranslation := make(SubmatchTranslationMap)
 	for key, val := range sortPattern.Translation {
@@ -396,15 +396,20 @@ func NewLogstreamSet(sortPattern *SortPattern, oldest time.Duration,
 	}
 	sortPattern.Translation = newTranslation
 
-	return &LogstreamSet{
+	realLogRoot, err := filepath.EvalSymlinks(logRoot)
+	if err != nil {
+		return nil, err
+	}
+	ls := &LogstreamSet{
 		logstreams:     make(map[string]*Logstream),
 		oldestDuration: oldest,
 		sortPattern:    sortPattern,
-		logRoot:        logRoot,
+		logRoot:        realLogRoot,
 		journalRoot:    journalRoot,
 		logstreamMutex: new(sync.RWMutex),
-		fileMatch:      fileMatchRegexp(logRoot, sortPattern.FileMatch),
+		fileMatch:      fileMatchRegexp(realLogRoot, sortPattern.FileMatch),
 	}
+	return ls, nil
 }
 
 // Access a logstream by name if it exists
@@ -442,7 +447,7 @@ func (ls *LogstreamSet) ScanForLogstreams() (result []string, errors *MultipleEr
 
 	// Filter out old logfiles
 	if ls.oldestDuration != time.Duration(0) {
-		logfiles.FilterOld(time.Now().Add(-ls.oldestDuration))
+		logfiles = logfiles.FilterOld(time.Now().Add(-ls.oldestDuration))
 	}
 
 	// Setup all the sorting ints in every logfile
@@ -473,9 +478,9 @@ func (ls *LogstreamSet) ScanForLogstreams() (result []string, errors *MultipleEr
 		// Add an error if there's multiple logfiles but no priority for sorting
 		// Continue the loop, to avoid adding this logstream as its not usable
 		if len(ls.sortPattern.Priority) == 0 && len(newLogfiles) > 1 {
-			errors.AddMessage(fmt.Sprintf("Found multiple logfiles without Priority to sort"+
+			errors.AddMessage(fmt.Sprintf("Found multiple logfiles without Priority to sort "+
 				"on for name: %s, filematch: %s, files: %s",
-				name, ls.sortPattern.FileMatch, newLogfiles))
+				name, ls.sortPattern.FileMatch, newLogfiles.FileNames()))
 			continue
 		}
 

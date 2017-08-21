@@ -33,30 +33,15 @@ function process_message ()
         a.ir = a.x
         inject_payload("json", "", cjson.encode(a))
     elseif msg == "error circular reference" then
-        local a = {x = 1, y = 2}
-        a.self = a
-        inject_payload("json", "", cjson.encode(a))
+        local a = {}
+        a[1] = a
+        cjson.encode(a)
     elseif msg == "error escape overflow" then
         local escape = "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
         for i=1, 10 do
             escape = escape .. escape
         end
         inject_payload("json", "", cjson.encode({escape = escape}))
-    elseif msg == "message" then
-        local msg = {Timestamp = 1e9, Type="type", Logger="logger", Payload="payload", EnvVersion="env_version", Hostname="hostname", Severity=9, }
-        inject_message(msg)
-    elseif msg == "message field" then
-        local msg = {Timestamp = 1e9, Fields = {count=1}}
-        inject_message(msg)
-    elseif msg == "message field array" then
-        local msg = {Timestamp = 1e9, Fields = {counts={2,3,4}}}
-        inject_message(msg)
-    elseif msg == "message field metadata" then
-        local msg = {Timestamp = 1e9, Fields = {count={value=5,representation="count"}}}
-        inject_message(msg)
-    elseif msg == "message field metadata array" then
-        local msg = {Timestamp = 1e9, Fields = {counts={value={6,7,8},representation="count"}}}
-        inject_message(msg)
     elseif msg == "message field all types" then
         local msg = {Timestamp = 1e9, Fields = {number=1,numbers={value={1,2,3}, representation="count"},string="string",strings={"s1","s2","s3"}, bool=true, bools={true,false,false}}}
         inject_message(msg)
@@ -72,12 +57,16 @@ function process_message ()
         inject_payload("txt", nil)
     elseif msg == "error nil message" then
         inject_message(nil, "name")
-    elseif msg == "message force memmove" then
-        local msg = {Timestamp = 1e9, Fields = {string="0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"}}
-        inject_message(msg)
     elseif msg == "error userdata output_limit" then
         local cb = circular_buffer.new(1000, 1, 60);
         inject_payload("cbuf", "", cb)
+    elseif msg == "round trip" then
+        local msg = decode_message("\010\016\111\021\235\034\090\107\077\120\169\175\058\232\153\002\231\132\016\128\148\235\220\003\082\027\010\005count\016\003\058\016\000\000\000\000\000\000\240\063\000\000\000\000\000\000\240\063")
+        inject_message(msg)
+    elseif msg == "inject raw" then
+        inject_message("\010\016\111\021\235\034\090\107\077\120\169\175\058\232\153\002\231\132\016\128\148\235\220\003\082\027\010\005count\016\003\058\016\000\000\000\000\000\000\240\063\000\000\000\000\000\000\240\063")
+    elseif msg == "error invalid protobuf string" then
+        inject_message("boom")
     end
     return 0
 end

@@ -1,8 +1,12 @@
+.. _config_log_output:
 
-LogOutput
-=========
+Log Output
+==========
 
-Logs messages to stdout using Go's `log` package.
+Plugin Name: **LogOutput**
+
+Logs messages to stdout using Go's `log` package. Honors hekad's global
+``log_flags`` setting.
 
 Config:
 

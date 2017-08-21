@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012-2014
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -34,6 +34,18 @@ type Input interface {
 	Stop()
 }
 
+// Splitter plugin interface type.
+type Splitter interface {
+	FindRecord(buf []byte) (bytesRead int, record []byte)
+}
+
+// UnframingSplitter is an interface optionally implemented by splitter
+// plugins to remove and process any record framing that may have been used by
+// the splitter.
+type UnframingSplitter interface {
+	UnframeRecord(framed []byte, pack *PipelinePack) []byte
+}
+
 // Heka Decoder plugin interface.
 type Decoder interface {
 	// Extract data loaded into the PipelinePack (usually in pack.MsgBytes)
@@ -47,7 +59,7 @@ type Decoder interface {
 }
 
 // Heka Filter plugin type.
-type Filter interface {
+type OldFilter interface {
 	// Starts the filter listening on the FilterRunner's provided input
 	// channel. Should not return until shutdown, signaled to the Filter by
 	// the closure of the input channel. Should return a non-nil error value
@@ -55,6 +67,15 @@ type Filter interface {
 	// shutdown (i.e. not due to an error processing an isolated message, in
 	// that case use FilterRunner.LogError).
 	Run(r FilterRunner, h PluginHelper) (err error)
+}
+
+type MessageProcessor interface {
+	ProcessMessage(pack *PipelinePack) (err error)
+}
+
+type Filter interface {
+	Prepare(r FilterRunner, h PluginHelper) (err error)
+	CleanUp()
 }
 
 // Heka Encoder plugin interface.
@@ -71,6 +92,21 @@ type NeedsStopping interface {
 }
 
 // Heka Output plugin type.
-type Output interface {
+type OldOutput interface {
 	Run(or OutputRunner, h PluginHelper) (err error)
+}
+
+type Output interface {
+	Prepare(r OutputRunner, h PluginHelper) (err error)
+	CleanUp()
+}
+
+type TickerPlugin interface {
+	TimerEvent() (err error)
+}
+
+// Implemented by the sandbox plugins to allow out-of-band sandbox teardown.
+type Destroyable interface {
+	StopSB()
+	Destroy() error
 }

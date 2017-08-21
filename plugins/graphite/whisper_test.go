@@ -4,7 +4,7 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # The Initial Developer of the Original Code is the Mozilla Foundation.
-# Portions created by the Initial Developer are Copyright (C) 2012
+# Portions created by the Initial Developer are Copyright (C) 2012-2015
 # the Initial Developer. All Rights Reserved.
 #
 # Contributor(s):
@@ -15,20 +15,21 @@
 package graphite
 
 import (
-	"code.google.com/p/gomock/gomock"
 	"fmt"
-	. "github.com/mozilla-services/heka/pipeline"
-	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
-	"github.com/mozilla-services/heka/pipelinemock"
-	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
-	"github.com/rafrombrc/gospec/src/gospec"
-	gs "github.com/rafrombrc/gospec/src/gospec"
-	"github.com/rafrombrc/whisper-go/whisper"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	. "github.com/mozilla-services/heka/pipeline"
+	pipeline_ts "github.com/mozilla-services/heka/pipeline/testsupport"
+	"github.com/mozilla-services/heka/pipelinemock"
+	plugins_ts "github.com/mozilla-services/heka/plugins/testsupport"
+	"github.com/rafrombrc/gomock/gomock"
+	"github.com/rafrombrc/gospec/src/gospec"
+	gs "github.com/rafrombrc/gospec/src/gospec"
+	"github.com/rafrombrc/whisper-go/whisper"
 )
 
 func WhisperRunnerSpec(c gospec.Context) {
@@ -100,7 +101,7 @@ func WhisperOutputSpec(c gospec.Context) {
 	pConfig := NewPipelineConfig(nil)
 
 	c.Specify("A WhisperOutput", func() {
-		o := new(WhisperOutput)
+		o := &WhisperOutput{pConfig: pConfig}
 		config := o.ConfigStruct().(*WhisperOutputConfig)
 		config.BasePath = filepath.Join(os.TempDir(), config.BasePath)
 		o.Init(config)
@@ -124,8 +125,8 @@ func WhisperOutputSpec(c gospec.Context) {
 		pack.Message.SetPayload(strings.Join(lines, "\n"))
 
 		c.Specify("turns statmetric lines into points", func() {
-			inChanCall := oth.MockOutputRunner.EXPECT().InChan()
-			inChanCall.Return(inChan)
+			oth.MockOutputRunner.EXPECT().InChan().Return(inChan)
+			oth.MockOutputRunner.EXPECT().UpdateCursor("")
 			wChanCall := mockWr.EXPECT().InChan().Times(count)
 			wChanCall.Return(wChan)
 
