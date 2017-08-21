@@ -10,16 +10,17 @@ package plugin
 import (
 	"errors"
 	"fmt"
-	"github.com/mitchellh/packer/packer"
-	packrpc "github.com/mitchellh/packer/packer/rpc"
+	packrpc "github.com/hashicorp/packer/packer/rpc"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"runtime"
 	"strconv"
 	"sync/atomic"
+	"time"
 )
 
 // This is a count of the number of interrupts the process has received.
@@ -33,13 +34,11 @@ const MagicCookieValue = "d602bf8f470bc67ca7faa0386276bbdd4330efaf76d1a219cb4d69
 // The APIVersion is outputted along with the RPC address. The plugin
 // client validates this API version and will show an error if it doesn't
 // know how to speak it.
-const APIVersion = "3"
+const APIVersion = "4"
 
 // Server waits for a connection to this plugin and returns a Packer
 // RPC server that you can use to register components and serve them.
 func Server() (*packrpc.Server, error) {
-	log.Printf("Plugin build against Packer '%s'", packer.GitCommit)
-
 	if os.Getenv(MagicCookieKey) != MagicCookieValue {
 		return nil, errors.New(
 			"Please do not execute plugins directly. Packer will execute these for you.")
@@ -140,4 +139,9 @@ func serverListener_unix() (net.Listener, error) {
 	}
 
 	return net.Listen("unix", path)
+}
+
+func init() {
+	// Seed the random number generator
+	rand.Seed(time.Now().UTC().UnixNano())
 }

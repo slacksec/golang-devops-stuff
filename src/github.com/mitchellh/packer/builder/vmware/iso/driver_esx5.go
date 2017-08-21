@@ -3,31 +3,35 @@ package iso
 import (
 	"bufio"
 	"bytes"
-	gossh "code.google.com/p/go.crypto/ssh"
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/communicator/ssh"
-	"github.com/mitchellh/packer/packer"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
+
+	commonssh "github.com/hashicorp/packer/common/ssh"
+	"github.com/hashicorp/packer/communicator/ssh"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // ESX5 driver talks to an ESXi5 hypervisor remotely over SSH to build
 // virtual machines. This driver can only manage one machine at a time.
 type ESX5Driver struct {
-	Host      string
-	Port      uint
-	Username  string
-	Password  string
-	Datastore string
+	Host           string
+	Port           uint
+	Username       string
+	Password       string
+	PrivateKey     string
+	Datastore      string
+	CacheDatastore string
+	CacheDirectory string
 
 	comm      packer.Communicator
 	outputDir string
@@ -55,8 +59,24 @@ func (d *ESX5Driver) IsRunning(string) (bool, error) {
 	return strings.Contains(state, "Powered on"), nil
 }
 
+func (d *ESX5Driver) ReloadVM() error {
+	return d.sh("vim-cmd", "vmsvc/reload", d.vmId)
+}
+
 func (d *ESX5Driver) Start(vmxPathLocal string, headless bool) error {
-	return d.sh("vim-cmd", "vmsvc/power.on", d.vmId)
+	for i := 0; i < 20; i++ {
+		//intentionally not checking for error since poweron may fail specially after initial VM registration
+		d.sh("vim-cmd", "vmsvc/power.on", d.vmId)
+		time.Sleep((time.Duration(i) * time.Second) + 1)
+		running, err := d.IsRunning(vmxPathLocal)
+		if err != nil {
+			return err
+		}
+		if running {
+			return nil
+		}
+	}
+	return errors.New("Retry limit exceeded")
 }
 
 func (d *ESX5Driver) Stop(vmxPathLocal string) error {
@@ -84,14 +104,20 @@ func (d *ESX5Driver) Unregister(vmxPathLocal string) error {
 	return d.sh("vim-cmd", "vmsvc/unregister", d.vmId)
 }
 
-func (d *ESX5Driver) UploadISO(localPath string, checksum string, checksumType string) (string, error) {
-	cacheRoot, _ := filepath.Abs(".")
-	targetFile, err := filepath.Rel(cacheRoot, localPath)
-	if err != nil {
-		return "", err
-	}
+func (d *ESX5Driver) Destroy() error {
+	return d.sh("vim-cmd", "vmsvc/destroy", d.vmId)
+}
 
-	finalPath := d.datastorePath(targetFile)
+func (d *ESX5Driver) IsDestroyed() (bool, error) {
+	err := d.sh("test", "!", "-e", d.outputDir)
+	if err != nil {
+		return false, err
+	}
+	return true, err
+}
+
+func (d *ESX5Driver) UploadISO(localPath string, checksum string, checksumType string) (string, error) {
+	finalPath := d.cachePath(localPath)
 	if err := d.mkdir(filepath.ToSlash(filepath.Dir(finalPath))); err != nil {
 		return "", err
 	}
@@ -148,36 +174,92 @@ func (d *ESX5Driver) HostIP() (string, error) {
 	return host, err
 }
 
-func (d *ESX5Driver) VNCAddress(portMin, portMax uint) (string, uint) {
+func (d *ESX5Driver) VNCAddress(_ string, portMin, portMax uint) (string, uint, error) {
 	var vncPort uint
-	// TODO(dougm) use esxcli network ip connection list
-	for port := portMin; port <= portMax; port++ {
-		address := fmt.Sprintf("%s:%d", d.Host, port)
-		log.Printf("Trying address: %s...", address)
-		l, err := net.DialTimeout("tcp", address, 1*time.Second)
 
-		if err == nil {
-			log.Printf("%s in use", address)
-			l.Close()
-		} else if e, ok := err.(*net.OpError); ok {
-			if e.Err == syscall.ECONNREFUSED {
-				// then port should be available for listening
-				vncPort = port
-				break
-			} else if e.Timeout() {
-				log.Printf("Timeout connecting to: %s (check firewall rules)", address)
+	//Process ports ESXi is listening on to determine which are available
+	//This process does best effort to detect ports that are unavailable,
+	//it will ignore any ports listened to by only localhost
+	r, err := d.esxcli("network", "ip", "connection", "list")
+	if err != nil {
+		err = fmt.Errorf("Could not retrieve network information for ESXi: %v", err)
+		return "", 0, err
+	}
+
+	listenPorts := make(map[string]bool)
+	for record, err := r.read(); record != nil && err == nil; record, err = r.read() {
+		if record["State"] == "LISTEN" {
+			splitAddress := strings.Split(record["LocalAddress"], ":")
+			if splitAddress[0] != "127.0.0.1" {
+				port := splitAddress[len(splitAddress)-1]
+				log.Printf("ESXi listening on address %s, port %s unavailable for VNC", record["LocalAddress"], port)
+				listenPorts[port] = true
 			}
 		}
 	}
 
-	return d.Host, vncPort
+	vncTimeout := time.Duration(15 * time.Second)
+	envTimeout := os.Getenv("PACKER_ESXI_VNC_PROBE_TIMEOUT")
+	if envTimeout != "" {
+		if parsedTimeout, err := time.ParseDuration(envTimeout); err != nil {
+			log.Printf("Error parsing PACKER_ESXI_VNC_PROBE_TIMEOUT. Falling back to default (15s). %s", err)
+		} else {
+			vncTimeout = parsedTimeout
+		}
+	}
+
+	for port := portMin; port <= portMax; port++ {
+		if _, ok := listenPorts[fmt.Sprintf("%d", port)]; ok {
+			log.Printf("Port %d in use", port)
+			continue
+		}
+		address := fmt.Sprintf("%s:%d", d.Host, port)
+		log.Printf("Trying address: %s...", address)
+		l, err := net.DialTimeout("tcp", address, vncTimeout)
+
+		if err != nil {
+			if e, ok := err.(*net.OpError); ok {
+				if e.Timeout() {
+					log.Printf("Timeout connecting to: %s (check firewall rules)", address)
+				} else {
+					vncPort = port
+					break
+				}
+			}
+		} else {
+			defer l.Close()
+		}
+	}
+
+	if vncPort == 0 {
+		err := fmt.Errorf("Unable to find available VNC port between %d and %d",
+			portMin, portMax)
+		return d.Host, vncPort, err
+	}
+
+	return d.Host, vncPort, nil
 }
 
-func (d *ESX5Driver) SSHAddress(state multistep.StateBag) (string, error) {
-	config := state.Get("config").(*config)
+// UpdateVMX, adds the VNC port to the VMX data.
+func (ESX5Driver) UpdateVMX(_, password string, port uint, data map[string]string) {
+	// Do not set remotedisplay.vnc.ip - this breaks ESXi.
+	data["remotedisplay.vnc.enabled"] = "TRUE"
+	data["remotedisplay.vnc.port"] = fmt.Sprintf("%d", port)
+	if len(password) > 0 {
+		data["remotedisplay.vnc.password"] = password
+	}
+}
 
-	if address, ok := state.GetOk("vm_address"); ok {
-		return address.(string), nil
+func (d *ESX5Driver) CommHost(state multistep.StateBag) (string, error) {
+	config := state.Get("config").(*Config)
+	sshc := config.SSHConfig.Comm
+	port := sshc.SSHPort
+	if sshc.Type == "winrm" {
+		port = sshc.WinRMPort
+	}
+
+	if address := config.CommConfig.Host(); address != "" {
+		return address, nil
 	}
 
 	r, err := d.esxcli("network", "vm", "list")
@@ -199,18 +281,36 @@ func (d *ESX5Driver) SSHAddress(state multistep.StateBag) (string, error) {
 		return "", err
 	}
 
-	record, err = r.read()
-	if err != nil {
-		return "", err
-	}
+	// Loop through interfaces
+	for {
+		record, err = r.read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
 
-	if record["IPAddress"] == "0.0.0.0" {
-		return "", errors.New("VM network port found, but no IP address")
+		if record["IPAddress"] == "0.0.0.0" {
+			continue
+		}
+		// When multiple NICs are connected to the same network, choose
+		// one that has a route back. This Dial should ensure that.
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", record["IPAddress"], port), 2*time.Second)
+		if err != nil {
+			if e, ok := err.(*net.OpError); ok {
+				if e.Timeout() {
+					log.Printf("Timeout connecting to %s", record["IPAddress"])
+					continue
+				}
+			}
+		} else {
+			defer conn.Close()
+			address := record["IPAddress"]
+			return address, nil
+		}
 	}
-
-	address := fmt.Sprintf("%s:%d", record["IPAddress"], config.SSHPort)
-	state.Put("vm_address", address)
-	return address, nil
+	return "", errors.New("No interface on the VM has an IP address ready")
 }
 
 //-------------------------------------------------------------------
@@ -266,8 +366,12 @@ func (d *ESX5Driver) String() string {
 }
 
 func (d *ESX5Driver) datastorePath(path string) string {
-	baseDir := filepath.Base(filepath.Dir(path))
-	return filepath.ToSlash(filepath.Join("/vmfs/volumes", d.Datastore, baseDir, filepath.Base(path)))
+	dirPath := filepath.Dir(path)
+	return filepath.ToSlash(filepath.Join("/vmfs/volumes", d.Datastore, dirPath, filepath.Base(path)))
+}
+
+func (d *ESX5Driver) cachePath(path string) string {
+	return filepath.ToSlash(filepath.Join("/vmfs/volumes", d.CacheDatastore, d.CacheDirectory, filepath.Base(path)))
 }
 
 func (d *ESX5Driver) connect() error {
@@ -279,14 +383,22 @@ func (d *ESX5Driver) connect() error {
 			ssh.PasswordKeyboardInteractive(d.Password)),
 	}
 
-	// TODO(dougm) KeyPath support
+	if d.PrivateKey != "" {
+		signer, err := commonssh.FileSigner(d.PrivateKey)
+		if err != nil {
+			return err
+		}
+
+		auth = append(auth, gossh.PublicKeys(signer))
+	}
+
 	sshConfig := &ssh.Config{
 		Connection: ssh.ConnectFunc("tcp", address),
 		SSHConfig: &gossh.ClientConfig{
-			User: d.Username,
-			Auth: auth,
+			User:            d.Username,
+			Auth:            auth,
+			HostKeyCallback: gossh.InsecureIgnoreHostKey(),
 		},
-		NoPty: true,
 	}
 
 	comm, err := ssh.New(address, sshConfig)
@@ -344,15 +456,22 @@ func (d *ESX5Driver) upload(dst, src string) error {
 		return err
 	}
 	defer f.Close()
-	return d.comm.Upload(dst, f)
+	return d.comm.Upload(dst, f, nil)
 }
 
 func (d *ESX5Driver) verifyChecksum(ctype string, hash string, file string) bool {
-	stdin := bytes.NewBufferString(fmt.Sprintf("%s  %s", hash, file))
-	_, err := d.run(stdin, fmt.Sprintf("%ssum", ctype), "-c")
-	if err != nil {
-		return false
+	if ctype == "none" {
+		if err := d.sh("stat", file); err != nil {
+			return false
+		}
+	} else {
+		stdin := bytes.NewBufferString(fmt.Sprintf("%s  %s", hash, file))
+		_, err := d.run(stdin, fmt.Sprintf("%ssum", ctype), "-c")
+		if err != nil {
+			return false
+		}
 	}
+
 	return true
 }
 

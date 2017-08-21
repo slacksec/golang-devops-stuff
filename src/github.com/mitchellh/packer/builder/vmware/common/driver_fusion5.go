@@ -12,7 +12,7 @@ import (
 	"github.com/mitchellh/multistep"
 )
 
-// Fusion5Driver is a driver that can run VMWare Fusion 5.
+// Fusion5Driver is a driver that can run VMware Fusion 5.
 type Fusion5Driver struct {
 	// This is the path to the "VMware Fusion.app"
 	AppPath string
@@ -69,8 +69,8 @@ func (d *Fusion5Driver) IsRunning(vmxPath string) (bool, error) {
 	return false, nil
 }
 
-func (d *Fusion5Driver) SSHAddress(state multistep.StateBag) (string, error) {
-	return SSHAddressFunc(d.SSHConfig)(state)
+func (d *Fusion5Driver) CommHost(state multistep.StateBag) (string, error) {
+	return CommHost(d.SSHConfig)(state)
 }
 
 func (d *Fusion5Driver) Start(vmxPath string, headless bool) error {
@@ -90,6 +90,12 @@ func (d *Fusion5Driver) Start(vmxPath string, headless bool) error {
 func (d *Fusion5Driver) Stop(vmxPath string) error {
 	cmd := exec.Command(d.vmrunPath(), "-T", "fusion", "stop", vmxPath, "hard")
 	if _, _, err := runAndLog(cmd); err != nil {
+		// Check if the VM is running. If its not, it was already stopped
+		running, rerr := d.IsRunning(vmxPath)
+		if rerr == nil && !running {
+			return nil
+		}
+
 		return err
 	}
 

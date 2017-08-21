@@ -2,12 +2,12 @@ package vagrantcloud
 
 import (
 	"fmt"
+
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 type Upload struct {
-	Token      string `json:"token"`
 	UploadPath string `json:"upload_path"`
 }
 
@@ -22,7 +22,7 @@ func (s *stepPrepareUpload) Run(state multistep.StateBag) multistep.StepAction {
 	provider := state.Get("provider").(*Provider)
 	artifactFilePath := state.Get("artifactFilePath").(string)
 
-	path := fmt.Sprintf("box/%s/version/%v/provider/%s/upload", box.Tag, version.Number, provider.Name)
+	path := fmt.Sprintf("box/%s/version/%v/provider/%s/upload", box.Tag, version.Version, provider.Name)
 	upload := &Upload{}
 
 	ui.Say(fmt.Sprintf("Preparing upload of box: %s", artifactFilePath))
@@ -40,8 +40,6 @@ func (s *stepPrepareUpload) Run(state multistep.StateBag) multistep.StepAction {
 		state.Put("error", fmt.Errorf("Error parsing upload response: %s", err))
 		return multistep.ActionHalt
 	}
-
-	ui.Message(fmt.Sprintf("Box upload prepared with token %s", upload.Token))
 
 	// Save the upload details to the state
 	state.Put("upload", upload)

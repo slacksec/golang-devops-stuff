@@ -23,7 +23,7 @@ type Workstation9Driver struct {
 }
 
 func (d *Workstation9Driver) Clone(dst, src string) error {
-	return errors.New("Cloning is not supported with VMWare WS version 9. Please use VMWare WS version 10, or greater.")
+	return errors.New("Cloning is not supported with VMware WS version 9. Please use VMware WS version 10, or greater.")
 }
 
 func (d *Workstation9Driver) CompactDisk(diskPath string) error {
@@ -70,8 +70,8 @@ func (d *Workstation9Driver) IsRunning(vmxPath string) (bool, error) {
 	return false, nil
 }
 
-func (d *Workstation9Driver) SSHAddress(state multistep.StateBag) (string, error) {
-	return SSHAddressFunc(d.SSHConfig)(state)
+func (d *Workstation9Driver) CommHost(state multistep.StateBag) (string, error) {
+	return CommHost(d.SSHConfig)(state)
 }
 
 func (d *Workstation9Driver) Start(vmxPath string, headless bool) error {

@@ -2,40 +2,39 @@ package common
 
 import (
 	"fmt"
-	"github.com/mitchellh/packer/packer"
 	"time"
+
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type ShutdownConfig struct {
-	ShutdownCommand    string `mapstructure:"shutdown_command"`
-	RawShutdownTimeout string `mapstructure:"shutdown_timeout"`
+	ShutdownCommand      string `mapstructure:"shutdown_command"`
+	RawShutdownTimeout   string `mapstructure:"shutdown_timeout"`
+	RawPostShutdownDelay string `mapstructure:"post_shutdown_delay"`
 
-	ShutdownTimeout time.Duration ``
+	ShutdownTimeout   time.Duration ``
+	PostShutdownDelay time.Duration ``
 }
 
-func (c *ShutdownConfig) Prepare(t *packer.ConfigTemplate) []error {
+func (c *ShutdownConfig) Prepare(ctx *interpolate.Context) []error {
 	if c.RawShutdownTimeout == "" {
 		c.RawShutdownTimeout = "5m"
 	}
 
-	templates := map[string]*string{
-		"shutdown_command": &c.ShutdownCommand,
-		"shutdown_timeout": &c.RawShutdownTimeout,
+	if c.RawPostShutdownDelay == "" {
+		c.RawPostShutdownDelay = "0s"
 	}
 
-	errs := make([]error, 0)
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = t.Process(*ptr, nil)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
+	var errs []error
 	var err error
 	c.ShutdownTimeout, err = time.ParseDuration(c.RawShutdownTimeout)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("Failed parsing shutdown_timeout: %s", err))
+	}
+
+	c.PostShutdownDelay, err = time.ParseDuration(c.RawPostShutdownDelay)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("Failed parsing post_shutdown_delay: %s", err))
 	}
 
 	return errs

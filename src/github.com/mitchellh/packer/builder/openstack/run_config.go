@@ -3,49 +3,51 @@ package openstack
 import (
 	"errors"
 	"fmt"
-	"github.com/mitchellh/packer/packer"
-	"time"
+
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // RunConfig contains configuration for running an instance from a source
 // image and details on how to access that launched image.
 type RunConfig struct {
-	SourceImage       string   `mapstructure:"source_image"`
-	Flavor            string   `mapstructure:"flavor"`
-	RawSSHTimeout     string   `mapstructure:"ssh_timeout"`
-	SSHUsername       string   `mapstructure:"ssh_username"`
-	SSHPort           int      `mapstructure:"ssh_port"`
-	OpenstackProvider string   `mapstructure:"openstack_provider"`
-	UseFloatingIp     bool     `mapstructure:"use_floating_ip"`
-	FloatingIpPool    string   `mapstructure:"floating_ip_pool"`
-	FloatingIp        string   `mapstructure:"floating_ip"`
-	SecurityGroups    []string `mapstructure:"security_groups"`
-	Networks          []string `mapstructure:"networks"`
+	Comm                 communicator.Config `mapstructure:",squash"`
+	SSHKeyPairName       string              `mapstructure:"ssh_keypair_name"`
+	TemporaryKeyPairName string              `mapstructure:"temporary_key_pair_name"`
+	SSHInterface         string              `mapstructure:"ssh_interface"`
+	SSHIPVersion         string              `mapstructure:"ssh_ip_version"`
 
-	// Unexported fields that are calculated from others
-	sshTimeout time.Duration
+	SourceImage      string            `mapstructure:"source_image"`
+	SourceImageName  string            `mapstructure:"source_image_name"`
+	Flavor           string            `mapstructure:"flavor"`
+	AvailabilityZone string            `mapstructure:"availability_zone"`
+	RackconnectWait  bool              `mapstructure:"rackconnect_wait"`
+	FloatingIpPool   string            `mapstructure:"floating_ip_pool"`
+	FloatingIp       string            `mapstructure:"floating_ip"`
+	ReuseIps         bool              `mapstructure:"reuse_ips"`
+	SecurityGroups   []string          `mapstructure:"security_groups"`
+	Networks         []string          `mapstructure:"networks"`
+	UserData         string            `mapstructure:"user_data"`
+	UserDataFile     string            `mapstructure:"user_data_file"`
+	InstanceMetadata map[string]string `mapstructure:"instance_metadata"`
+
+	ConfigDrive bool `mapstructure:"config_drive"`
+
+	// Not really used, but here for BC
+	OpenstackProvider string `mapstructure:"openstack_provider"`
+	UseFloatingIp     bool   `mapstructure:"use_floating_ip"`
 }
 
-func (c *RunConfig) Prepare(t *packer.ConfigTemplate) []error {
-	if t == nil {
-		var err error
-		t, err = packer.NewConfigTemplate()
-		if err != nil {
-			return []error{err}
-		}
-	}
+func (c *RunConfig) Prepare(ctx *interpolate.Context) []error {
+	// If we are not given an explicit ssh_keypair_name or
+	// ssh_private_key_file, then create a temporary one, but only if the
+	// temporary_key_pair_name has not been provided and we are not using
+	// ssh_password.
+	if c.SSHKeyPairName == "" && c.TemporaryKeyPairName == "" &&
+		c.Comm.SSHPrivateKey == "" && c.Comm.SSHPassword == "" {
 
-	// Defaults
-	if c.SSHUsername == "" {
-		c.SSHUsername = "root"
-	}
-
-	if c.SSHPort == 0 {
-		c.SSHPort = 22
-	}
-
-	if c.RawSSHTimeout == "" {
-		c.RawSSHTimeout = "5m"
+		c.TemporaryKeyPairName = fmt.Sprintf("packer_%s", uuid.TimeOrderedUUID())
 	}
 
 	if c.UseFloatingIp && c.FloatingIpPool == "" {
@@ -53,43 +55,38 @@ func (c *RunConfig) Prepare(t *packer.ConfigTemplate) []error {
 	}
 
 	// Validation
-	var err error
-	errs := make([]error, 0)
-	if c.SourceImage == "" {
-		errs = append(errs, errors.New("A source_image must be specified"))
+	errs := c.Comm.Prepare(ctx)
+
+	if c.SSHKeyPairName != "" {
+		if c.Comm.Type == "winrm" && c.Comm.WinRMPassword == "" && c.Comm.SSHPrivateKey == "" {
+			errs = append(errs, errors.New("A ssh_private_key_file must be provided to retrieve the winrm password when using ssh_keypair_name."))
+		} else if c.Comm.SSHPrivateKey == "" && !c.Comm.SSHAgentAuth {
+			errs = append(errs, errors.New("A ssh_private_key_file must be provided or ssh_agent_auth enabled when ssh_keypair_name is specified."))
+		}
+	}
+
+	if c.SourceImage == "" && c.SourceImageName == "" {
+		errs = append(errs, errors.New("Either a source_image or a source_image_name must be specified"))
+	} else if len(c.SourceImage) > 0 && len(c.SourceImageName) > 0 {
+		errs = append(errs, errors.New("Only a source_image or a source_image_name can be specified, not both."))
 	}
 
 	if c.Flavor == "" {
 		errs = append(errs, errors.New("A flavor must be specified"))
 	}
 
-	if c.SSHUsername == "" {
-		errs = append(errs, errors.New("An ssh_username must be specified"))
+	if c.SSHIPVersion != "" && c.SSHIPVersion != "4" && c.SSHIPVersion != "6" {
+		errs = append(errs, errors.New("SSH IP version must be either 4 or 6"))
 	}
 
-	templates := map[string]*string{
-		"flavor":       &c.Flavor,
-		"ssh_timeout":  &c.RawSSHTimeout,
-		"ssh_username": &c.SSHUsername,
-		"source_image": &c.SourceImage,
-	}
-
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = t.Process(*ptr, nil)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("Error processing %s: %s", n, err))
+	for key, value := range c.InstanceMetadata {
+		if len(key) > 255 {
+			errs = append(errs, fmt.Errorf("Instance metadata key too long (max 255 bytes): %s", key))
+		}
+		if len(value) > 255 {
+			errs = append(errs, fmt.Errorf("Instance metadata value too long (max 255 bytes): %s", value))
 		}
 	}
 
-	c.sshTimeout, err = time.ParseDuration(c.RawSSHTimeout)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("Failed parsing ssh_timeout: %s", err))
-	}
-
 	return errs
-}
-
-func (c *RunConfig) SSHTimeout() time.Duration {
-	return c.sshTimeout
 }

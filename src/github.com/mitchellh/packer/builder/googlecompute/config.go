@@ -3,62 +3,78 @@ package googlecompute
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
+
+var reImageFamily = regexp.MustCompile(`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 // Config is the configuration structure for the GCE builder. It stores
 // both the publicly settable state as well as the privately generated
 // state of the config object.
 type Config struct {
 	common.PackerConfig `mapstructure:",squash"`
+	Comm                communicator.Config `mapstructure:",squash"`
 
-	BucketName        string            `mapstructure:"bucket_name"`
-	ClientSecretsFile string            `mapstructure:"client_secrets_file"`
-	DiskSizeGb        int64             `mapstructure:"disk_size"`
-	ImageName         string            `mapstructure:"image_name"`
-	ImageDescription  string            `mapstructure:"image_description"`
-	InstanceName      string            `mapstructure:"instance_name"`
-	MachineType       string            `mapstructure:"machine_type"`
-	Metadata          map[string]string `mapstructure:"metadata"`
-	Network           string            `mapstructure:"network"`
-	Passphrase        string            `mapstructure:"passphrase"`
-	PrivateKeyFile    string            `mapstructure:"private_key_file"`
-	ProjectId         string            `mapstructure:"project_id"`
-	SourceImage       string            `mapstructure:"source_image"`
-	SSHUsername       string            `mapstructure:"ssh_username"`
-	SSHPort           uint              `mapstructure:"ssh_port"`
-	RawSSHTimeout     string            `mapstructure:"ssh_timeout"`
-	RawStateTimeout   string            `mapstructure:"state_timeout"`
-	Tags              []string          `mapstructure:"tags"`
-	Zone              string            `mapstructure:"zone"`
+	AccountFile string `mapstructure:"account_file"`
+	ProjectId   string `mapstructure:"project_id"`
 
-	clientSecrets   *clientSecrets
-	instanceName    string
-	privateKeyBytes []byte
-	sshTimeout      time.Duration
-	stateTimeout    time.Duration
-	tpl             *packer.ConfigTemplate
+	Address              string            `mapstructure:"address"`
+	DiskName             string            `mapstructure:"disk_name"`
+	DiskSizeGb           int64             `mapstructure:"disk_size"`
+	DiskType             string            `mapstructure:"disk_type"`
+	ImageName            string            `mapstructure:"image_name"`
+	ImageDescription     string            `mapstructure:"image_description"`
+	ImageFamily          string            `mapstructure:"image_family"`
+	InstanceName         string            `mapstructure:"instance_name"`
+	MachineType          string            `mapstructure:"machine_type"`
+	Metadata             map[string]string `mapstructure:"metadata"`
+	Network              string            `mapstructure:"network"`
+	NetworkProjectId     string            `mapstructure:"network_project_id"`
+	OmitExternalIP       bool              `mapstructure:"omit_external_ip"`
+	OnHostMaintenance    string            `mapstructure:"on_host_maintenance"`
+	Preemptible          bool              `mapstructure:"preemptible"`
+	RawStateTimeout      string            `mapstructure:"state_timeout"`
+	Region               string            `mapstructure:"region"`
+	Scopes               []string          `mapstructure:"scopes"`
+	SourceImage          string            `mapstructure:"source_image"`
+	SourceImageFamily    string            `mapstructure:"source_image_family"`
+	SourceImageProjectId string            `mapstructure:"source_image_project_id"`
+	StartupScriptFile    string            `mapstructure:"startup_script_file"`
+	Subnetwork           string            `mapstructure:"subnetwork"`
+	Tags                 []string          `mapstructure:"tags"`
+	UseInternalIP        bool              `mapstructure:"use_internal_ip"`
+	Zone                 string            `mapstructure:"zone"`
+
+	Account            AccountFile
+	stateTimeout       time.Duration
+	imageAlreadyExists bool
+	ctx                interpolate.Context
 }
 
 func NewConfig(raws ...interface{}) (*Config, []string, error) {
 	c := new(Config)
-	md, err := common.DecodeConfig(c, raws...)
+	err := config.Decode(c, &config.DecodeOpts{
+		Interpolate:        true,
+		InterpolateContext: &c.ctx,
+		InterpolateFilter: &interpolate.RenderFilter{
+			Exclude: []string{
+				"run_command",
+			},
+		},
+	}, raws...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	c.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return nil, nil, err
-	}
-	c.tpl.UserVars = c.PackerUserVars
-
-	// Prepare the errors
-	errs := common.CheckUnusedConfig(md)
+	var errs *packer.MultiError
 
 	// Set defaults.
 	if c.Network == "" {
@@ -69,129 +85,124 @@ func NewConfig(raws ...interface{}) (*Config, []string, error) {
 		c.DiskSizeGb = 10
 	}
 
+	if c.DiskType == "" {
+		c.DiskType = "pd-standard"
+	}
+
 	if c.ImageDescription == "" {
 		c.ImageDescription = "Created by Packer"
 	}
 
+	if c.OnHostMaintenance == "MIGRATE" && c.Preemptible {
+		errs = packer.MultiErrorAppend(errs,
+			errors.New("on_host_maintenance must be TERMINATE when using preemptible instances."))
+	}
+	// Setting OnHostMaintenance Correct Defaults
+	//   "MIGRATE" : Possible and default if Preemptible is false
+	//   "TERMINATE": Required if Preemptible is true
+	if c.Preemptible {
+		c.OnHostMaintenance = "TERMINATE"
+	} else {
+		if c.OnHostMaintenance == "" {
+			c.OnHostMaintenance = "MIGRATE"
+		}
+	}
+
+	// Make sure user sets a valid value for on_host_maintenance option
+	if !(c.OnHostMaintenance == "MIGRATE" || c.OnHostMaintenance == "TERMINATE") {
+		errs = packer.MultiErrorAppend(errs,
+			errors.New("on_host_maintenance must be one of MIGRATE or TERMINATE."))
+	}
+
 	if c.ImageName == "" {
-		c.ImageName = "packer-{{timestamp}}"
+		img, err := interpolate.Render("packer-{{timestamp}}", nil)
+		if err != nil {
+			errs = packer.MultiErrorAppend(errs,
+				fmt.Errorf("Unable to parse image name: %s ", err))
+		} else {
+			c.ImageName = img
+		}
+	}
+
+	if len(c.ImageFamily) > 63 {
+		errs = packer.MultiErrorAppend(errs,
+			errors.New("Invalid image family: Must not be longer than 63 characters"))
+	}
+
+	if c.ImageFamily != "" {
+		if !reImageFamily.MatchString(c.ImageFamily) {
+			errs = packer.MultiErrorAppend(errs,
+				errors.New("Invalid image family: The first character must be a lowercase letter, and all following characters must be a dash, lowercase letter, or digit, except the last character, which cannot be a dash"))
+		}
+
 	}
 
 	if c.InstanceName == "" {
 		c.InstanceName = fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID())
 	}
 
-	if c.MachineType == "" {
-		c.MachineType = "n1-standard-1"
+	if c.DiskName == "" {
+		c.DiskName = c.InstanceName
 	}
 
-	if c.RawSSHTimeout == "" {
-		c.RawSSHTimeout = "5m"
+	if c.MachineType == "" {
+		c.MachineType = "n1-standard-1"
 	}
 
 	if c.RawStateTimeout == "" {
 		c.RawStateTimeout = "5m"
 	}
 
-	if c.SSHUsername == "" {
-		c.SSHUsername = "root"
-	}
-
-	if c.SSHPort == 0 {
-		c.SSHPort = 22
-	}
-
-	// Process Templates
-	templates := map[string]*string{
-		"bucket_name":         &c.BucketName,
-		"client_secrets_file": &c.ClientSecretsFile,
-		"image_name":          &c.ImageName,
-		"image_description":   &c.ImageDescription,
-		"instance_name":       &c.InstanceName,
-		"machine_type":        &c.MachineType,
-		"network":             &c.Network,
-		"passphrase":          &c.Passphrase,
-		"private_key_file":    &c.PrivateKeyFile,
-		"project_id":          &c.ProjectId,
-		"source_image":        &c.SourceImage,
-		"ssh_username":        &c.SSHUsername,
-		"ssh_timeout":         &c.RawSSHTimeout,
-		"state_timeout":       &c.RawStateTimeout,
-		"zone":                &c.Zone,
-	}
-
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = c.tpl.Process(*ptr, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
+	if es := c.Comm.Prepare(&c.ctx); len(es) > 0 {
+		errs = packer.MultiErrorAppend(errs, es...)
 	}
 
 	// Process required parameters.
-	if c.BucketName == "" {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("a bucket_name must be specified"))
-	}
-
-	if c.ClientSecretsFile == "" {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("a client_secrets_file must be specified"))
-	}
-
-	if c.PrivateKeyFile == "" {
-		errs = packer.MultiErrorAppend(
-			errs, errors.New("a private_key_file must be specified"))
-	}
-
 	if c.ProjectId == "" {
 		errs = packer.MultiErrorAppend(
 			errs, errors.New("a project_id must be specified"))
 	}
 
-	if c.SourceImage == "" {
+	if c.Scopes == nil {
+		c.Scopes = []string{
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/compute",
+			"https://www.googleapis.com/auth/devstorage.full_control",
+		}
+	}
+
+	if c.SourceImage == "" && c.SourceImageFamily == "" {
 		errs = packer.MultiErrorAppend(
-			errs, errors.New("a source_image must be specified"))
+			errs, errors.New("a source_image or source_image_family must be specified"))
 	}
 
 	if c.Zone == "" {
 		errs = packer.MultiErrorAppend(
 			errs, errors.New("a zone must be specified"))
 	}
+	if c.Region == "" && len(c.Zone) > 2 {
+		// get region from Zone
+		region := c.Zone[:len(c.Zone)-2]
+		c.Region = region
+	}
 
-	// Process timeout settings.
-	sshTimeout, err := time.ParseDuration(c.RawSSHTimeout)
+	err = c.CalcTimeout()
 	if err != nil {
-		errs = packer.MultiErrorAppend(
-			errs, fmt.Errorf("Failed parsing ssh_timeout: %s", err))
+		errs = packer.MultiErrorAppend(errs, err)
 	}
-	c.sshTimeout = sshTimeout
 
-	stateTimeout, err := time.ParseDuration(c.RawStateTimeout)
-	if err != nil {
-		errs = packer.MultiErrorAppend(
-			errs, fmt.Errorf("Failed parsing state_timeout: %s", err))
-	}
-	c.stateTimeout = stateTimeout
-
-	if c.ClientSecretsFile != "" {
-		// Load the client secrets file.
-		cs, err := loadClientSecrets(c.ClientSecretsFile)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Failed parsing client secrets file: %s", err))
+	if c.AccountFile != "" {
+		if err := ProcessAccountFile(&c.Account, c.AccountFile); err != nil {
+			errs = packer.MultiErrorAppend(errs, err)
 		}
-		c.clientSecrets = cs
 	}
 
-	if c.PrivateKeyFile != "" {
-		// Load the private key.
-		c.privateKeyBytes, err = processPrivateKeyFile(c.PrivateKeyFile, c.Passphrase)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Failed loading private key file: %s", err))
-		}
+	if c.OmitExternalIP && c.Address != "" {
+		errs = packer.MultiErrorAppend(fmt.Errorf("you can not specify an external address when 'omit_external_ip' is true"))
+	}
+
+	if c.OmitExternalIP && !c.UseInternalIP {
+		errs = packer.MultiErrorAppend(fmt.Errorf("'use_internal_ip' must be true if 'omit_external_ip' is true"))
 	}
 
 	// Check for any errors.
@@ -200,4 +211,13 @@ func NewConfig(raws ...interface{}) (*Config, []string, error) {
 	}
 
 	return c, nil, nil
+}
+
+func (c *Config) CalcTimeout() error {
+	stateTimeout, err := time.ParseDuration(c.RawStateTimeout)
+	if err != nil {
+		return fmt.Errorf("Failed parsing state_timeout: %s", err)
+	}
+	c.stateTimeout = stateTimeout
+	return nil
 }

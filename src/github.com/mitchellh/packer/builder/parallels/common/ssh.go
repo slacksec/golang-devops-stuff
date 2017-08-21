@@ -1,41 +1,41 @@
 package common
 
 import (
-	"code.google.com/p/go.crypto/ssh"
-	"fmt"
+	commonssh "github.com/hashicorp/packer/common/ssh"
+	packerssh "github.com/hashicorp/packer/communicator/ssh"
 	"github.com/mitchellh/multistep"
-	packerssh "github.com/mitchellh/packer/communicator/ssh"
-	"io/ioutil"
-	"os"
+	"golang.org/x/crypto/ssh"
 )
 
-func SSHAddress(state multistep.StateBag) (string, error) {
+// CommHost returns the VM's IP address which should be used to access it by SSH.
+func CommHost(state multistep.StateBag) (string, error) {
 	vmName := state.Get("vmName").(string)
 	driver := state.Get("driver").(Driver)
 
-	mac, err := driver.Mac(vmName)
+	mac, err := driver.MAC(vmName)
 	if err != nil {
 		return "", err
 	}
 
-	ip, err := driver.IpAddress(mac)
+	ip, err := driver.IPAddress(mac)
 	if err != nil {
 		return "", err
 	}
 
-	return fmt.Sprintf("%s:22", ip), nil
+	return ip, nil
 }
 
+// SSHConfigFunc returns SSH credentials to access the VM by SSH.
 func SSHConfigFunc(config SSHConfig) func(multistep.StateBag) (*ssh.ClientConfig, error) {
 	return func(state multistep.StateBag) (*ssh.ClientConfig, error) {
 		auth := []ssh.AuthMethod{
-			ssh.Password(config.SSHPassword),
+			ssh.Password(config.Comm.SSHPassword),
 			ssh.KeyboardInteractive(
-				packerssh.PasswordKeyboardInteractive(config.SSHPassword)),
+				packerssh.PasswordKeyboardInteractive(config.Comm.SSHPassword)),
 		}
 
-		if config.SSHKeyPath != "" {
-			signer, err := sshKeyToSigner(config.SSHKeyPath)
+		if config.Comm.SSHPrivateKey != "" {
+			signer, err := commonssh.FileSigner(config.Comm.SSHPrivateKey)
 			if err != nil {
 				return nil, err
 			}
@@ -44,28 +44,9 @@ func SSHConfigFunc(config SSHConfig) func(multistep.StateBag) (*ssh.ClientConfig
 		}
 
 		return &ssh.ClientConfig{
-			User: config.SSHUser,
-			Auth: auth,
+			User:            config.Comm.SSHUsername,
+			Auth:            auth,
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		}, nil
 	}
-}
-
-func sshKeyToSigner(path string) (ssh.Signer, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	keyBytes, err := ioutil.ReadAll(f)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("Error setting up SSH config: %s", err)
-	}
-
-	return signer, nil
 }

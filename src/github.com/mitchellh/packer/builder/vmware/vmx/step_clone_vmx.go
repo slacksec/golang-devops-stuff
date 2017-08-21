@@ -5,9 +5,9 @@ import (
 	"log"
 	"path/filepath"
 
+	vmwcommon "github.com/hashicorp/packer/builder/vmware/common"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	vmwcommon "github.com/mitchellh/packer/builder/vmware/common"
-	"github.com/mitchellh/packer/packer"
 )
 
 // StepCloneVMX takes a VMX file and clones the VM into the output directory.
@@ -37,8 +37,17 @@ func (s *StepCloneVMX) Run(state multistep.StateBag) multistep.StepAction {
 		return multistep.ActionHalt
 	}
 
-	diskName, ok := vmxData["scsi0:0.filename"]
-	if !ok {
+	var diskName string
+	if _, ok := vmxData["scsi0:0.filename"]; ok {
+		diskName = vmxData["scsi0:0.filename"]
+	}
+	if _, ok := vmxData["sata0:0.filename"]; ok {
+		diskName = vmxData["sata0:0.filename"]
+	}
+	if _, ok := vmxData["ide0:0.filename"]; ok {
+		diskName = vmxData["ide0:0.filename"]
+	}
+	if diskName == "" {
 		err := fmt.Errorf("Root disk filename could not be found!")
 		state.Put("error", err)
 		return multistep.ActionHalt

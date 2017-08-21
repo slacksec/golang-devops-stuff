@@ -1,7 +1,7 @@
 package rpc
 
 import (
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 	"log"
 	"net/rpc"
 )
@@ -10,14 +10,14 @@ import (
 // executed over an RPC connection.
 type provisioner struct {
 	client *rpc.Client
-	mux    *MuxConn
+	mux    *muxBroker
 }
 
 // ProvisionerServer wraps a packer.Provisioner implementation and makes it
 // exportable as part of a Golang RPC server.
 type ProvisionerServer struct {
 	p   packer.Provisioner
-	mux *MuxConn
+	mux *muxBroker
 }
 
 type ProvisionerPrepareArgs struct {

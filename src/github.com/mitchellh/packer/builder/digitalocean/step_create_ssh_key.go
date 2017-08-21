@@ -1,24 +1,32 @@
 package digitalocean
 
 import (
-	"code.google.com/p/gosshold/ssh"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/packer"
 	"log"
+	"os"
+	"runtime"
+
+	"github.com/digitalocean/godo"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
+	"golang.org/x/crypto/ssh"
 )
 
 type stepCreateSSHKey struct {
-	keyId uint
+	Debug        bool
+	DebugKeyPath string
+
+	keyId int
 }
 
 func (s *stepCreateSSHKey) Run(state multistep.StateBag) multistep.StepAction {
-	client := state.Get("client").(*DigitalOceanClient)
+	client := state.Get("client").(*godo.Client)
 	ui := state.Get("ui").(packer.Ui)
 
 	ui.Say("Creating temporary ssh key for droplet...")
@@ -45,7 +53,10 @@ func (s *stepCreateSSHKey) Run(state multistep.StateBag) multistep.StepAction {
 	name := fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID())
 
 	// Create the key!
-	keyId, err := client.CreateKey(name, pub_sshformat)
+	key, _, err := client.Keys.Create(context.TODO(), &godo.KeyCreateRequest{
+		Name:      name,
+		PublicKey: pub_sshformat,
+	})
 	if err != nil {
 		err := fmt.Errorf("Error creating temporary SSH key: %s", err)
 		state.Put("error", err)
@@ -54,12 +65,37 @@ func (s *stepCreateSSHKey) Run(state multistep.StateBag) multistep.StepAction {
 	}
 
 	// We use this to check cleanup
-	s.keyId = keyId
+	s.keyId = key.ID
 
 	log.Printf("temporary ssh key name: %s", name)
 
 	// Remember some state for the future
-	state.Put("ssh_key_id", keyId)
+	state.Put("ssh_key_id", key.ID)
+
+	// If we're in debug mode, output the private key to the working directory.
+	if s.Debug {
+		ui.Message(fmt.Sprintf("Saving key for debug purposes: %s", s.DebugKeyPath))
+		f, err := os.Create(s.DebugKeyPath)
+		if err != nil {
+			state.Put("error", fmt.Errorf("Error saving debug key: %s", err))
+			return multistep.ActionHalt
+		}
+		defer f.Close()
+
+		// Write the key out
+		if _, err := f.Write(pem.EncodeToMemory(&priv_blk)); err != nil {
+			state.Put("error", fmt.Errorf("Error saving debug key: %s", err))
+			return multistep.ActionHalt
+		}
+
+		// Chmod it so that it is SSH ready
+		if runtime.GOOS != "windows" {
+			if err := f.Chmod(0600); err != nil {
+				state.Put("error", fmt.Errorf("Error setting permissions of debug key: %s", err))
+				return multistep.ActionHalt
+			}
+		}
+	}
 
 	return multistep.ActionContinue
 }
@@ -70,19 +106,14 @@ func (s *stepCreateSSHKey) Cleanup(state multistep.StateBag) {
 		return
 	}
 
-	client := state.Get("client").(*DigitalOceanClient)
+	client := state.Get("client").(*godo.Client)
 	ui := state.Get("ui").(packer.Ui)
-	c := state.Get("config").(config)
 
 	ui.Say("Deleting temporary ssh key...")
-	err := client.DestroyKey(s.keyId)
-
-	curlstr := fmt.Sprintf("curl '%v/ssh_keys/%v/destroy?client_id=%v&api_key=%v'",
-		DIGITALOCEAN_API_URL, s.keyId, c.ClientID, c.APIKey)
-
+	_, err := client.Keys.DeleteByID(context.TODO(), s.keyId)
 	if err != nil {
-		log.Printf("Error cleaning up ssh key: %v", err.Error())
+		log.Printf("Error cleaning up ssh key: %s", err)
 		ui.Error(fmt.Sprintf(
-			"Error cleaning up ssh key. Please delete the key manually: %v", curlstr))
+			"Error cleaning up ssh key. Please delete the key manually: %s", err))
 	}
 }

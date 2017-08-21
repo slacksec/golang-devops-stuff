@@ -2,75 +2,111 @@ package common
 
 import (
 	"fmt"
-	"github.com/mitchellh/goamz/aws"
-	"github.com/mitchellh/packer/packer"
-	"strings"
-	"unicode"
+	"log"
+	"os"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // AccessConfig is for common configuration related to AWS access
 type AccessConfig struct {
-	AccessKey string `mapstructure:"access_key"`
-	SecretKey string `mapstructure:"secret_key"`
-	RawRegion string `mapstructure:"region"`
+	AccessKey         string `mapstructure:"access_key"`
+	CustomEndpointEc2 string `mapstructure:"custom_endpoint_ec2"`
+	MFACode           string `mapstructure:"mfa_code"`
+	ProfileName       string `mapstructure:"profile"`
+	RawRegion         string `mapstructure:"region"`
+	SecretKey         string `mapstructure:"secret_key"`
+	SkipValidation    bool   `mapstructure:"skip_region_validation"`
+	Token             string `mapstructure:"token"`
+	session           *session.Session
 }
 
-// Auth returns a valid aws.Auth object for access to AWS services, or
-// an error if the authentication couldn't be resolved.
-func (c *AccessConfig) Auth() (aws.Auth, error) {
-	auth, err := aws.GetAuth(c.AccessKey, c.SecretKey)
-	if err == nil {
-		// Store the accesskey and secret that we got...
-		c.AccessKey = auth.AccessKey
-		c.SecretKey = auth.SecretKey
+// Config returns a valid aws.Config object for access to AWS services, or
+// an error if the authentication and region couldn't be resolved
+func (c *AccessConfig) Session() (*session.Session, error) {
+	if c.session != nil {
+		return c.session, nil
 	}
 
-	return auth, err
+	region, err := c.Region()
+	if err != nil {
+		return nil, err
+	}
+
+	if c.ProfileName != "" {
+		if err := os.Setenv("AWS_PROFILE", c.ProfileName); err != nil {
+			log.Printf("Set env error: %s", err)
+		}
+	}
+
+	config := aws.NewConfig().WithRegion(region).WithMaxRetries(11).WithCredentialsChainVerboseErrors(true)
+
+	if c.CustomEndpointEc2 != "" {
+		config = config.WithEndpoint(c.CustomEndpointEc2)
+	}
+
+	if c.AccessKey != "" {
+		creds := credentials.NewChainCredentials(
+			[]credentials.Provider{
+				&credentials.StaticProvider{
+					Value: credentials.Value{
+						AccessKeyID:     c.AccessKey,
+						SecretAccessKey: c.SecretKey,
+						SessionToken:    c.Token,
+					},
+				},
+			})
+		config = config.WithCredentials(creds)
+	}
+
+	opts := session.Options{
+		SharedConfigState: session.SharedConfigEnable,
+		Config:            *config,
+	}
+	if c.MFACode != "" {
+		opts.AssumeRoleTokenProvider = func() (string, error) {
+			return c.MFACode, nil
+		}
+	}
+	c.session, err = session.NewSessionWithOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.session, nil
 }
 
 // Region returns the aws.Region object for access to AWS services, requesting
 // the region from the instance metadata if possible.
-func (c *AccessConfig) Region() (aws.Region, error) {
+func (c *AccessConfig) Region() (string, error) {
 	if c.RawRegion != "" {
-		return aws.Regions[c.RawRegion], nil
+		if !c.SkipValidation {
+			if valid := ValidateRegion(c.RawRegion); !valid {
+				return "", fmt.Errorf("Not a valid region: %s", c.RawRegion)
+			}
+		}
+		return c.RawRegion, nil
 	}
 
-	md, err := aws.GetMetaData("placement/availability-zone")
+	sess := session.New()
+	ec2meta := ec2metadata.New(sess)
+	identity, err := ec2meta.GetInstanceIdentityDocument()
 	if err != nil {
-		return aws.Region{}, err
+		log.Println("Error getting region from metadata service, "+
+			"probably because we're not running on AWS.", err)
+		return "", nil
 	}
-
-	region := strings.TrimRightFunc(string(md), unicode.IsLetter)
-	return aws.Regions[region], nil
+	return identity.Region, nil
 }
 
-func (c *AccessConfig) Prepare(t *packer.ConfigTemplate) []error {
-	if t == nil {
-		var err error
-		t, err = packer.NewConfigTemplate()
-		if err != nil {
-			return []error{err}
-		}
-	}
-
-	templates := map[string]*string{
-		"access_key": &c.AccessKey,
-		"secret_key": &c.SecretKey,
-		"region":     &c.RawRegion,
-	}
-
-	errs := make([]error, 0)
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = t.Process(*ptr, nil)
-		if err != nil {
-			errs = append(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
-	if c.RawRegion != "" {
-		if _, ok := aws.Regions[c.RawRegion]; !ok {
+func (c *AccessConfig) Prepare(ctx *interpolate.Context) []error {
+	var errs []error
+	if c.RawRegion != "" && !c.SkipValidation {
+		if valid := ValidateRegion(c.RawRegion); !valid {
 			errs = append(errs, fmt.Errorf("Unknown region: %s", c.RawRegion))
 		}
 	}

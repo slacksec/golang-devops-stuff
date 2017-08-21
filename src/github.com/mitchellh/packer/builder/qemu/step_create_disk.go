@@ -2,10 +2,10 @@ package qemu
 
 import (
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"path/filepath"
-	"strings"
+
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
 // This step creates the virtual disk that will be used as the
@@ -13,17 +13,21 @@ import (
 type stepCreateDisk struct{}
 
 func (s *stepCreateDisk) Run(state multistep.StateBag) multistep.StepAction {
-	config := state.Get("config").(*config)
+	config := state.Get("config").(*Config)
 	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
-	path := filepath.Join(config.OutputDir, fmt.Sprintf("%s.%s", config.VMName,
-		strings.ToLower(config.Format)))
+	name := config.VMName
+	path := filepath.Join(config.OutputDir, name)
 
 	command := []string{
 		"create",
 		"-f", config.Format,
 		path,
 		fmt.Sprintf("%vM", config.DiskSize),
+	}
+
+	if config.DiskImage == true {
+		return multistep.ActionContinue
 	}
 
 	ui.Say("Creating hard drive...")
@@ -33,6 +37,8 @@ func (s *stepCreateDisk) Run(state multistep.StateBag) multistep.StepAction {
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
+
+	state.Put("disk_filename", name)
 
 	return multistep.ActionContinue
 }

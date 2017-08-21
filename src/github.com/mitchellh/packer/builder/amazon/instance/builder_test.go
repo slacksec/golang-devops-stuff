@@ -1,7 +1,7 @@
 package instance
 
 import (
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -130,7 +130,6 @@ func TestBuilderPrepare_BundlePrefix(t *testing.T) {
 	b := &Builder{}
 	config := testConfig()
 
-	config["bundle_prefix"] = ""
 	warnings, err := b.Prepare(config)
 	if len(warnings) > 0 {
 		t.Fatalf("bad: %#v", warnings)

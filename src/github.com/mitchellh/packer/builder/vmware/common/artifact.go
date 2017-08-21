@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 // BuilderId for the local artifacts
@@ -23,11 +23,13 @@ type localArtifact struct {
 func NewLocalArtifact(dir string) (packer.Artifact, error) {
 	files := make([]string, 0, 5)
 	visit := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() {
 			files = append(files, path)
 		}
-
-		return err
+		return nil
 	}
 
 	if err := filepath.Walk(dir, visit); err != nil {
@@ -54,6 +56,10 @@ func (*localArtifact) Id() string {
 
 func (a *localArtifact) String() string {
 	return fmt.Sprintf("VM files in directory: %s", a.dir)
+}
+
+func (a *localArtifact) State(name string) interface{} {
+	return nil
 }
 
 func (a *localArtifact) Destroy() error {

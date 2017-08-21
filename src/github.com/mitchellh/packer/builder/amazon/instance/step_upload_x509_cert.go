@@ -2,8 +2,8 @@ package instance
 
 import (
 	"fmt"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"os"
 )
 
@@ -45,5 +45,5 @@ func (s *StepUploadX509Cert) uploadSingle(comm packer.Communicator, dst, src str
 	}
 	defer f.Close()
 
-	return comm.Upload(dst, f)
+	return comm.Upload(dst, f, nil)
 }

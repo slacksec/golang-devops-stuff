@@ -1,11 +1,12 @@
 package googlecompute
 
 import (
+	"errors"
 	"fmt"
-	"path/filepath"
+	"time"
 
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 // StepCreateImage represents a Packer build step that creates GCE machine
@@ -14,39 +15,48 @@ type StepCreateImage int
 
 // Run executes the Packer build step that creates a GCE machine image.
 //
-// Currently the only way to create a GCE image is to run the gcimagebundle
-// command on the running GCE instance.
+// The image is created from the persistent disk used by the instance. The
+// instance must be deleted and the disk retained before doing this step.
 func (s *StepCreateImage) Run(state multistep.StateBag) multistep.StepAction {
 	config := state.Get("config").(*Config)
-	comm := state.Get("communicator").(packer.Communicator)
+	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
 
-	sudoPrefix := ""
-	if config.SSHUsername != "root" {
-		sudoPrefix = "sudo "
-	}
+	if config.PackerForce && config.imageAlreadyExists {
+		ui.Say("Deleting previous image...")
 
-	imageFilename := fmt.Sprintf("%s.tar.gz", config.ImageName)
-	imageBundleCmd := "/usr/bin/gcimagebundle -d /dev/sda -o /tmp/"
+		errCh := driver.DeleteImage(config.ImageName)
+		err := <-errCh
+		if err != nil {
+			err := fmt.Errorf("Error deleting image: %s", err)
+			state.Put("error", err)
+			ui.Error(err.Error())
+			return multistep.ActionHalt
+		}
+	}
 
 	ui.Say("Creating image...")
-	cmd := new(packer.RemoteCmd)
-	cmd.Command = fmt.Sprintf("%s%s --output_file_name %s --fssize %d",
-		sudoPrefix, imageBundleCmd, imageFilename, config.DiskSizeGb*1024*1024*1024)
-	err := cmd.StartWithUi(comm, ui)
-	if err == nil && cmd.ExitStatus != 0 {
-		err = fmt.Errorf(
-			"gcimagebundle exited with non-zero exit status: %d", cmd.ExitStatus)
+
+	imageCh, errCh := driver.CreateImage(
+		config.ImageName, config.ImageDescription, config.ImageFamily, config.Zone,
+		config.DiskName)
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(config.stateTimeout):
+		err = errors.New("time out while waiting for image to register")
 	}
+
 	if err != nil {
-		err := fmt.Errorf("Error creating image: %s", err)
+		err := fmt.Errorf("Error waiting for image: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
 
-	state.Put("image_file_name", filepath.Join("/tmp", imageFilename))
+	state.Put("image", <-imageCh)
 	return multistep.ActionContinue
 }
 
+// Cleanup.
 func (s *StepCreateImage) Cleanup(state multistep.StateBag) {}

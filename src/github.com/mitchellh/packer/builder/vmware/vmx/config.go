@@ -4,14 +4,18 @@ import (
 	"fmt"
 	"os"
 
-	vmwcommon "github.com/mitchellh/packer/builder/vmware/common"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
+	vmwcommon "github.com/hashicorp/packer/builder/vmware/common"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // Config is the configuration structure for the builder.
 type Config struct {
 	common.PackerConfig      `mapstructure:",squash"`
+	common.HTTPConfig        `mapstructure:",squash"`
+	common.FloppyConfig      `mapstructure:",squash"`
 	vmwcommon.DriverConfig   `mapstructure:",squash"`
 	vmwcommon.OutputConfig   `mapstructure:",squash"`
 	vmwcommon.RunConfig      `mapstructure:",squash"`
@@ -20,27 +24,30 @@ type Config struct {
 	vmwcommon.ToolsConfig    `mapstructure:",squash"`
 	vmwcommon.VMXConfig      `mapstructure:",squash"`
 
-	FloppyFiles    []string `mapstructure:"floppy_files"`
+	BootCommand    []string `mapstructure:"boot_command"`
 	RemoteType     string   `mapstructure:"remote_type"`
 	SkipCompaction bool     `mapstructure:"skip_compaction"`
 	SourcePath     string   `mapstructure:"source_path"`
 	VMName         string   `mapstructure:"vm_name"`
 
-	tpl *packer.ConfigTemplate
+	ctx interpolate.Context
 }
 
 func NewConfig(raws ...interface{}) (*Config, []string, error) {
 	c := new(Config)
-	md, err := common.DecodeConfig(c, raws...)
+	err := config.Decode(c, &config.DecodeOpts{
+		Interpolate:        true,
+		InterpolateContext: &c.ctx,
+		InterpolateFilter: &interpolate.RenderFilter{
+			Exclude: []string{
+				"boot_command",
+				"tools_upload_path",
+			},
+		},
+	}, raws...)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	c.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return nil, nil, err
-	}
-	c.tpl.UserVars = c.PackerUserVars
 
 	// Defaults
 	if c.VMName == "" {
@@ -48,32 +55,19 @@ func NewConfig(raws ...interface{}) (*Config, []string, error) {
 	}
 
 	// Prepare the errors
-	errs := common.CheckUnusedConfig(md)
-	errs = packer.MultiErrorAppend(errs, c.DriverConfig.Prepare(c.tpl)...)
-	errs = packer.MultiErrorAppend(errs, c.OutputConfig.Prepare(c.tpl, &c.PackerConfig)...)
-	errs = packer.MultiErrorAppend(errs, c.RunConfig.Prepare(c.tpl)...)
-	errs = packer.MultiErrorAppend(errs, c.ShutdownConfig.Prepare(c.tpl)...)
-	errs = packer.MultiErrorAppend(errs, c.SSHConfig.Prepare(c.tpl)...)
-	errs = packer.MultiErrorAppend(errs, c.ToolsConfig.Prepare(c.tpl)...)
-	errs = packer.MultiErrorAppend(errs, c.VMXConfig.Prepare(c.tpl)...)
-
-	templates := map[string]*string{
-		"remote_type": &c.RemoteType,
-		"source_path": &c.SourcePath,
-		"vm_name":     &c.VMName,
-	}
-
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = c.tpl.Process(*ptr, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
+	var errs *packer.MultiError
+	errs = packer.MultiErrorAppend(errs, c.DriverConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.HTTPConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.OutputConfig.Prepare(&c.ctx, &c.PackerConfig)...)
+	errs = packer.MultiErrorAppend(errs, c.RunConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.ShutdownConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.SSHConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.ToolsConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.VMXConfig.Prepare(&c.ctx)...)
+	errs = packer.MultiErrorAppend(errs, c.FloppyConfig.Prepare(&c.ctx)...)
 
 	if c.SourcePath == "" {
-		errs = packer.MultiErrorAppend(errs, fmt.Errorf("source_path is required"))
+		errs = packer.MultiErrorAppend(errs, fmt.Errorf("source_path is blank, but is required"))
 	} else {
 		if _, err := os.Stat(c.SourcePath); err != nil {
 			errs = packer.MultiErrorAppend(errs,

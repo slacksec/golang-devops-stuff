@@ -1,8 +1,9 @@
 package ebs
 
 import (
-	"github.com/mitchellh/packer/packer"
 	"testing"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 func testConfig() map[string]interface{} {
@@ -84,6 +85,41 @@ func TestBuilderPrepare_InvalidKey(t *testing.T) {
 	// Add a random key
 	config["i_should_not_be_valid"] = true
 	warnings, err := b.Prepare(config)
+	if len(warnings) > 0 {
+		t.Fatalf("bad: %#v", warnings)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
+}
+
+func TestBuilderPrepare_InvalidShutdownBehavior(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	// Test good
+	config["shutdown_behavior"] = "terminate"
+	warnings, err := b.Prepare(config)
+	if len(warnings) > 0 {
+		t.Fatalf("bad: %#v", warnings)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	// Test good
+	config["shutdown_behavior"] = "stop"
+	warnings, err = b.Prepare(config)
+	if len(warnings) > 0 {
+		t.Fatalf("bad: %#v", warnings)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	// Test bad
+	config["shutdown_behavior"] = "foobar"
+	warnings, err = b.Prepare(config)
 	if len(warnings) > 0 {
 		t.Fatalf("bad: %#v", warnings)
 	}

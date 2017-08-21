@@ -2,12 +2,13 @@ package vagrantcloud
 
 import (
 	"fmt"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 type Provider struct {
 	Name        string `json:"name"`
+	Url         string `json:"url,omitempty"`
 	HostedToken string `json:"hosted_token,omitempty"`
 	UploadUrl   string `json:"upload_url,omitempty"`
 }
@@ -22,10 +23,15 @@ func (s *stepCreateProvider) Run(state multistep.StateBag) multistep.StepAction 
 	box := state.Get("box").(*Box)
 	version := state.Get("version").(*Version)
 	providerName := state.Get("providerName").(string)
+	downloadUrl := state.Get("boxDownloadUrl").(string)
 
-	path := fmt.Sprintf("box/%s/version/%v/providers", box.Tag, version.Number)
+	path := fmt.Sprintf("box/%s/version/%v/providers", box.Tag, version.Version)
 
 	provider := &Provider{Name: providerName}
+
+	if downloadUrl != "" {
+		provider.Url = downloadUrl
+	}
 
 	// Wrap the provider in a provider object for the API
 	wrapper := make(map[string]interface{})
@@ -80,7 +86,7 @@ func (s *stepCreateProvider) Cleanup(state multistep.StateBag) {
 	ui.Say("Cleaning up provider")
 	ui.Message(fmt.Sprintf("Deleting provider: %s", s.name))
 
-	path := fmt.Sprintf("box/%s/version/%v/provider/%s", box.Tag, version.Number, s.name)
+	path := fmt.Sprintf("box/%s/version/%v/provider/%s", box.Tag, version.Version, s.name)
 
 	// No need for resp from the cleanup DELETE
 	_, err := client.Delete(path)

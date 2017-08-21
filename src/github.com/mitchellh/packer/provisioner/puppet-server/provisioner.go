@@ -4,15 +4,21 @@ package puppetserver
 
 import (
 	"fmt"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
 	"os"
 	"strings"
+
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type Config struct {
 	common.PackerConfig `mapstructure:",squash"`
-	tpl                 *packer.ConfigTemplate
+	ctx                 interpolate.Context
+
+	// The command used to execute Puppet.
+	ExecuteCommand string `mapstructure:"execute_command"`
 
 	// Additional facts to set when executing Puppet
 	Facter map[string]string
@@ -38,6 +44,13 @@ type Config struct {
 	// The directory where files will be uploaded. Packer requires write
 	// permissions in this directory.
 	StagingDir string `mapstructure:"staging_dir"`
+
+	// The directory that contains the puppet binary.
+	// E.g. if it can't be found on the standard path.
+	PuppetBinDir string `mapstructure:"puppet_bin_dir"`
+
+	// If true, packer will ignore all exit-codes from a puppet run
+	IgnoreExitCodes bool `mapstructure:"ignore_exit_codes"`
 }
 
 type Provisioner struct {
@@ -51,66 +64,39 @@ type ExecuteTemplate struct {
 	PuppetNode           string
 	PuppetServer         string
 	Options              string
+	PuppetBinDir         string
 	Sudo                 bool
 }
 
 func (p *Provisioner) Prepare(raws ...interface{}) error {
-	md, err := common.DecodeConfig(&p.config, raws...)
+	err := config.Decode(&p.config, &config.DecodeOpts{
+		Interpolate:        true,
+		InterpolateContext: &p.config.ctx,
+		InterpolateFilter: &interpolate.RenderFilter{
+			Exclude: []string{
+				"execute_command",
+			},
+		},
+	}, raws...)
 	if err != nil {
 		return err
 	}
 
-	p.config.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return err
+	if p.config.ExecuteCommand == "" {
+		p.config.ExecuteCommand = p.commandTemplate()
 	}
-	p.config.tpl.UserVars = p.config.PackerUserVars
-
-	// Accumulate any errors
-	errs := common.CheckUnusedConfig(md)
 
 	if p.config.StagingDir == "" {
 		p.config.StagingDir = "/tmp/packer-puppet-server"
 	}
 
-	// Templates
-	templates := map[string]*string{
-		"client_cert_dir":        &p.config.ClientCertPath,
-		"client_private_key_dir": &p.config.ClientPrivateKeyPath,
-		"puppet_server":          &p.config.PuppetServer,
-		"puppet_node":            &p.config.PuppetNode,
-		"options":                &p.config.Options,
+	if p.config.Facter == nil {
+		p.config.Facter = make(map[string]string)
 	}
+	p.config.Facter["packer_build_name"] = p.config.PackerBuildName
+	p.config.Facter["packer_builder_type"] = p.config.PackerBuilderType
 
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = p.config.tpl.Process(*ptr, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
-	newFacts := make(map[string]string)
-	for k, v := range p.config.Facter {
-		k, err := p.config.tpl.Process(k, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(errs,
-				fmt.Errorf("Error processing facter key %s: %s", k, err))
-			continue
-		}
-
-		v, err := p.config.tpl.Process(v, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(errs,
-				fmt.Errorf("Error processing facter value '%s': %s", v, err))
-			continue
-		}
-
-		newFacts[k] = v
-	}
-	p.config.Facter = newFacts
-
+	var errs *packer.MultiError
 	if p.config.ClientCertPath != "" {
 		info, err := os.Stat(p.config.ClientCertPath)
 		if err != nil {
@@ -178,15 +164,17 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	}
 
 	// Execute Puppet
-	command, err := p.config.tpl.Process(p.commandTemplate(), &ExecuteTemplate{
+	p.config.ctx.Data = &ExecuteTemplate{
 		FacterVars:           strings.Join(facterVars, " "),
 		ClientCertPath:       remoteClientCertPath,
 		ClientPrivateKeyPath: remoteClientPrivateKeyPath,
 		PuppetNode:           p.config.PuppetNode,
 		PuppetServer:         p.config.PuppetServer,
 		Options:              p.config.Options,
+		PuppetBinDir:         p.config.PuppetBinDir,
 		Sudo:                 !p.config.PreventSudo,
-	})
+	}
+	command, err := interpolate.Render(p.config.ExecuteCommand, &p.config.ctx)
 	if err != nil {
 		return err
 	}
@@ -200,7 +188,7 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 		return err
 	}
 
-	if cmd.ExitStatus != 0 && cmd.ExitStatus != 2 {
+	if cmd.ExitStatus != 0 && cmd.ExitStatus != 2 && !p.config.IgnoreExitCodes {
 		return fmt.Errorf("Puppet exited with a non-zero exit status: %d", cmd.ExitStatus)
 	}
 
@@ -245,7 +233,8 @@ func (p *Provisioner) uploadDirectory(ui packer.Ui, comm packer.Communicator, ds
 
 func (p *Provisioner) commandTemplate() string {
 	return "{{.FacterVars}} {{if .Sudo}} sudo -E {{end}}" +
-		"puppet agent --onetime --no-daemonize " +
+		"{{if ne .PuppetBinDir \"\"}}{{.PuppetBinDir}}/{{end}}puppet agent " +
+		"--onetime --no-daemonize " +
 		"{{if ne .PuppetServer \"\"}}--server='{{.PuppetServer}}' {{end}}" +
 		"{{if ne .Options \"\"}}{{.Options}} {{end}}" +
 		"{{if ne .PuppetNode \"\"}}--certname={{.PuppetNode}} {{end}}" +

@@ -2,12 +2,14 @@ package common
 
 import (
 	"fmt"
-	"github.com/mitchellh/goamz/aws"
-	"github.com/mitchellh/goamz/ec2"
-	"github.com/mitchellh/packer/packer"
 	"log"
 	"sort"
 	"strings"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/hashicorp/packer/packer"
 )
 
 // Artifact is an artifact implementation that contains built AMIs.
@@ -37,6 +39,7 @@ func (a *Artifact) Id() string {
 		parts = append(parts, fmt.Sprintf("%s:%s", region, amiId))
 	}
 
+	sort.Strings(parts)
 	return strings.Join(parts, ",")
 }
 
@@ -47,8 +50,17 @@ func (a *Artifact) String() string {
 		amiStrings = append(amiStrings, single)
 	}
 
-	sort.Sort(sort.StringSlice(amiStrings))
+	sort.Strings(amiStrings)
 	return fmt.Sprintf("AMIs were created:\n\n%s", strings.Join(amiStrings, "\n"))
+}
+
+func (a *Artifact) State(name string) interface{} {
+	switch name {
+	case "atlas.artifact.metadata":
+		return a.stateAtlasMetadata()
+	default:
+		return nil
+	}
 }
 
 func (a *Artifact) Destroy() error {
@@ -56,8 +68,34 @@ func (a *Artifact) Destroy() error {
 
 	for region, imageId := range a.Amis {
 		log.Printf("Deregistering image ID (%s) from region (%s)", imageId, region)
-		regionconn := ec2.New(a.Conn.Auth, aws.Regions[region])
-		if _, err := regionconn.DeregisterImage(imageId); err != nil {
+
+		regionConfig := &aws.Config{
+			Credentials: a.Conn.Config.Credentials,
+			Region:      aws.String(region),
+		}
+		session, err := session.NewSession(regionConfig)
+		if err != nil {
+			return err
+		}
+		regionConn := ec2.New(session)
+
+		// Get image metadata
+		imageResp, err := regionConn.DescribeImages(&ec2.DescribeImagesInput{
+			ImageIds: []*string{&imageId},
+		})
+		if err != nil {
+			errors = append(errors, err)
+		}
+		if len(imageResp.Images) == 0 {
+			err := fmt.Errorf("Error retrieving details for AMI (%s), no images found", imageId)
+			errors = append(errors, err)
+		}
+
+		// Deregister ami
+		input := &ec2.DeregisterImageInput{
+			ImageId: &imageId,
+		}
+		if _, err := regionConn.DeregisterImage(input); err != nil {
 			errors = append(errors, err)
 		}
 
@@ -68,9 +106,19 @@ func (a *Artifact) Destroy() error {
 		if len(errors) == 1 {
 			return errors[0]
 		} else {
-			return &packer.MultiError{errors}
+			return &packer.MultiError{Errors: errors}
 		}
 	}
 
 	return nil
+}
+
+func (a *Artifact) stateAtlasMetadata() interface{} {
+	metadata := make(map[string]string)
+	for region, imageId := range a.Amis {
+		k := fmt.Sprintf("region.%s", region)
+		metadata[k] = imageId
+	}
+
+	return metadata
 }

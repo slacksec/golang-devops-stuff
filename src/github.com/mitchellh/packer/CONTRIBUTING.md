@@ -51,37 +51,108 @@ it raises the chances we can quickly merge or address your contributions.
 ## Setting up Go to work on Packer
 
 If you have never worked with Go before, you will have to complete the
-following steps in order to be able to compile and test Packer.
+following steps in order to be able to compile and test Packer. These instructions target POSIX-like environments (Mac OS X, Linux, Cygwin, etc.) so you may need to adjust them for Windows or other shells.
 
-1. Install Go. Make sure the Go version is at least Go 1.2. Packer will not work with anything less than
-   Go 1.2. On a Mac, you can `brew install go` to install Go 1.2.
+1. [Download](https://golang.org/dl) and install Go. The instructions below
+   are for go 1.7. Earlier versions of Go are no longer supported.
 
-2. Set and export the `GOPATH` environment variable and update your `PATH`.
-   For example, you can add to your `.bash_profile`.
+2. Set and export the `GOPATH` environment variable and update your `PATH`. For
+   example, you can add to your `.bash_profile`.
 
     ```
-    export GOPATH=$HOME/Documents/golang
+    export GOPATH=$HOME/go
     export PATH=$PATH:$GOPATH/bin
     ```
 
-3. Install and build `gox` with
+3. Download the Packer source (and its dependencies) by running `go get
+   github.com/hashicorp/packer`. This will download the Packer source to
+   `$GOPATH/src/github.com/hashicorp/packer`.
 
-    ```
-    go get github.com/mitchellh/gox
-    cd $GOPATH/src/github.com/mitchellh/gox
-    go build
-    ```
+4. When working on packer `cd $GOPATH/src/github.com/hashicorp/packer` so you
+   can run `make` and easily access other files. Run `make help` to get
+   information about make targets.
 
-4. Download the Packer source (and its dependencies) by running
-   `go get github.com/mitchellh/packer`. This will download the Packer
-   source to `$GOPATH/src/github.com/mitchellh/packer`.
+5. Make your changes to the Packer source. You can run `make` in
+   `$GOPATH/src/github.com/hashicorp/packer` to run tests and build the packer
+   binary. Any compilation errors will be shown when the binaries are
+   rebuilding. If you don't have `make` you can simply run `go build -o bin/packer .` from the project root.
 
-5. Make your changes to the Packer source. You can run `make` from the main
-   source directory to recompile all the binaries. Any compilation errors
-   will be shown when the binaries are rebuilding.
-
-6. Test your changes by running `make test` and then running
-   `$GOPATH/src/github.com/mitchellh/packer/bin/packer` to build a machine.
+6. After running building packer successfully, use
+   `$GOPATH/src/github.com/hashicorp/packer/bin/packer` to build a machine and
+   verify your changes work. For instance: `$GOPATH/src/github.com/hashicorp/packer/bin/packer build template.json`.
 
 7. If everything works well and the tests pass, run `go fmt` on your code
-   before submitting a pull request.
+   before submitting a pull-request.
+
+### Opening an Pull Request
+
+When you are ready to open a pull-request, you will need to [fork packer](https://github.com/hashicorp/packer#fork-destination-box), push your changes to your fork, and then open a pull-request.
+
+For example, my github username is `cbednarski` so I would do the following:
+
+    git checkout -b f-my-feature
+    // develop a patch
+    git push https://github.com/cbednarski/packer f-my-feature
+
+From there, open your fork in your browser to open a new pull-request.
+
+**Note** Go infers package names from their filepaths. This means `go build` will break if you `git clone` your fork instead of using `go get` on the main packer project.
+
+### Tips for Working on Packer
+
+#### Working on forks
+
+The easiest way to work on a fork is to set it as a remote of the packer project. After following the steps in "Setting up Go to work on Packer":
+
+1. Navigate to $GOPATH/src/github.com/hashicorp/packer
+2. Add the remote `git remote add <name of remote> <github url of fork>`. For example `git remote add mwhooker https://github.com/mwhooker/packer.git`.
+3. Checkout a feature branch: `git checkout -b new-feature`
+4. Make changes
+5. (Optional) Push your changes to the fork: `git push -u <name of remote> new-feature`
+
+This way you can push to your fork to create a PR, but the code on disk still lives in the spot where the go cli tools are expecting to find it.
+
+#### Govendor
+
+If you are submitting a change that requires new or updated dependencies, please include them in `vendor/vendor.json` and in the `vendor/` folder.  This helps everything get tested properly in CI.
+
+Note that you will need to use [govendor](https://github.com/kardianos/govendor) to do this. This step is recommended but not required; if you don't use govendor please indicate in your PR which dependencies have changed and to what versions.
+
+Use `govendor fetch <project>` to add dependencies to the project. See
+[govendor quick
+start](https://github.com/kardianos/govendor#quick-start-also-see-the-faq) for
+examples.
+
+Please only apply the minimal vendor changes to get your PR to work. Packer does not attempt to track the latest version for each dependency.
+
+#### Running Unit Tests
+
+You can run tests for individual packages using commands like this:
+
+    $ make test TEST=./builder/amazon/...
+
+#### Running Acceptance Tests
+
+Packer has [acceptance tests](https://en.wikipedia.org/wiki/Acceptance_testing)
+for various builders. These typically require an API key (AWS, GCE), or
+additional software to be installed on your computer (VirtualBox, VMware).
+
+If you're working on a new builder or builder feature and want verify it is functioning (and also hasn't broken anything else), we recommend running the
+acceptance tests.
+
+**Warning:** The acceptance tests create/destroy/modify *real resources*, which
+may incur costs for real money. In the presence of a bug, it is possible that resources may be left behind, which can cost money even though you were not using them. We recommend running tests in an account used only for that purpose so it is easy to see if there are any dangling resources, and so production resources are not accidentally destroyed or overwritten during testing.
+
+To run the acceptance tests, invoke `make testacc`:
+
+    $ make testacc TEST=./builder/amazon/ebs
+    ...
+
+The `TEST` variable lets you narrow the scope of the acceptance tests to a
+specific package / folder. The `TESTARGS` variable is recommended to filter
+down to a specific resource to test, since testing all of them at once can
+sometimes take a very long time.
+
+Acceptance tests typically require other environment variables to be set for
+things such as API tokens and keys. Each test should error and tell you which
+credentials are missing, so those are not documented here.

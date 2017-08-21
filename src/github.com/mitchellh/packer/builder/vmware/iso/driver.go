@@ -3,12 +3,12 @@ package iso
 import (
 	"fmt"
 
-	vmwcommon "github.com/mitchellh/packer/builder/vmware/common"
+	vmwcommon "github.com/hashicorp/packer/builder/vmware/common"
 )
 
 // NewDriver returns a new driver implementation for this operating
 // system, or an error if the driver couldn't be initialized.
-func NewDriver(config *config) (vmwcommon.Driver, error) {
+func NewDriver(config *Config) (vmwcommon.Driver, error) {
 	drivers := []vmwcommon.Driver{}
 
 	if config.RemoteType == "" {
@@ -17,11 +17,14 @@ func NewDriver(config *config) (vmwcommon.Driver, error) {
 
 	drivers = []vmwcommon.Driver{
 		&ESX5Driver{
-			Host:      config.RemoteHost,
-			Port:      config.RemotePort,
-			Username:  config.RemoteUser,
-			Password:  config.RemotePassword,
-			Datastore: config.RemoteDatastore,
+			Host:           config.RemoteHost,
+			Port:           config.RemotePort,
+			Username:       config.RemoteUser,
+			Password:       config.RemotePassword,
+			PrivateKey:     config.RemotePrivateKey,
+			Datastore:      config.RemoteDatastore,
+			CacheDatastore: config.RemoteCacheDatastore,
+			CacheDirectory: config.RemoteCacheDirectory,
 		},
 	}
 

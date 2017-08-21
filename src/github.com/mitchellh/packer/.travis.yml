@@ -1,21 +1,25 @@
+env:
+    - USER=travis
+
+sudo: false
+
 language: go
 
 go:
-    - 1.2
-    - tip
+  - 1.7.4
+  - 1.8.3
 
-install: make deps
+install:
+  - make deps
+
 script:
-    - go test ./...
-    #- go test -race ./...
+  - GOMAXPROCS=2 make ci
 
-notifications:
-    irc:
-        channels:
-            - "chat.freenode.net#packer-tool"
-        on_success: change
-        on_failure: always
+branches:
+  only:
+    - master
 
 matrix:
-    allow_failures:
-        - go: tip
+  fast_finish: true
+  allow_failures:
+    - go: 1.4.3

@@ -30,7 +30,8 @@ type Provisioner interface {
 type ProvisionHook struct {
 	// The provisioners to run as part of the hook. These should already
 	// be prepared (by calling Prepare) at some earlier stage.
-	Provisioners []Provisioner
+	Provisioners     []Provisioner
+	ProvisionerTypes []string
 
 	lock               sync.Mutex
 	runningProvisioner Provisioner
@@ -38,6 +39,18 @@ type ProvisionHook struct {
 
 // Runs the provisioners in order.
 func (h *ProvisionHook) Run(name string, ui Ui, comm Communicator, data interface{}) error {
+	// Shortcut
+	if len(h.Provisioners) == 0 {
+		return nil
+	}
+
+	if comm == nil {
+		return fmt.Errorf(
+			"No communicator found for provisioners! This is usually because the\n" +
+				"`communicator` config was set to \"none\". If you have any provisioners\n" +
+				"then a communicator is required. Please fix this to continue.")
+	}
+
 	defer func() {
 		h.lock.Lock()
 		defer h.lock.Unlock()
@@ -45,12 +58,15 @@ func (h *ProvisionHook) Run(name string, ui Ui, comm Communicator, data interfac
 		h.runningProvisioner = nil
 	}()
 
-	for _, p := range h.Provisioners {
+	for i, p := range h.Provisioners {
 		h.lock.Lock()
 		h.runningProvisioner = p
 		h.lock.Unlock()
 
-		if err := p.Provision(ui, comm); err != nil {
+		ts := CheckpointReporter.AddSpan(h.ProvisionerTypes[i], "provisioner")
+		err := p.Provision(ui, comm)
+		ts.End(err)
+		if err != nil {
 			return err
 		}
 	}

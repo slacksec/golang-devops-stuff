@@ -1,31 +1,18 @@
 package common
 
 import (
-	"fmt"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type VBoxVersionConfig struct {
-	VBoxVersionFile string `mapstructure:"virtualbox_version_file"`
+	VBoxVersionFile *string `mapstructure:"virtualbox_version_file"`
 }
 
-func (c *VBoxVersionConfig) Prepare(t *packer.ConfigTemplate) []error {
-	if c.VBoxVersionFile == "" {
-		c.VBoxVersionFile = ".vbox_version"
+func (c *VBoxVersionConfig) Prepare(ctx *interpolate.Context) []error {
+	if c.VBoxVersionFile == nil {
+		default_file := ".vbox_version"
+		c.VBoxVersionFile = &default_file
 	}
 
-	templates := map[string]*string{
-		"virtualbox_version_file": &c.VBoxVersionFile,
-	}
-
-	errs := make([]error, 0)
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = t.Process(*ptr, nil)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
-	return errs
+	return nil
 }

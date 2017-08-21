@@ -1,26 +1,30 @@
 package digitalocean
 
 import (
+	"context"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"log"
 	"time"
+
+	"github.com/digitalocean/godo"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
 type stepShutdown struct{}
 
 func (s *stepShutdown) Run(state multistep.StateBag) multistep.StepAction {
-	client := state.Get("client").(*DigitalOceanClient)
+	client := state.Get("client").(*godo.Client)
+	c := state.Get("config").(Config)
 	ui := state.Get("ui").(packer.Ui)
-	dropletId := state.Get("droplet_id").(uint)
+	dropletId := state.Get("droplet_id").(int)
 
 	// Gracefully power off the droplet. We have to retry this a number
 	// of times because sometimes it says it completed when it actually
 	// did absolutely nothing (*ALAKAZAM!* magic!). We give up after
 	// a pretty arbitrary amount of time.
 	ui.Say("Gracefully shutting down droplet...")
-	err := client.ShutdownDroplet(dropletId)
+	_, _, err := client.DropletActions.Shutdown(context.TODO(), dropletId)
 	if err != nil {
 		// If we get an error the first time, actually report it
 		err := fmt.Errorf("Error shutting down droplet: %s", err)
@@ -47,7 +51,7 @@ func (s *stepShutdown) Run(state multistep.StateBag) multistep.StepAction {
 
 		for attempts := 2; attempts > 0; attempts++ {
 			log.Printf("ShutdownDroplet attempt #%d...", attempts)
-			err := client.ShutdownDroplet(dropletId)
+			_, _, err := client.DropletActions.Shutdown(context.TODO(), dropletId)
 			if err != nil {
 				log.Printf("Shutdown retry error: %s", err)
 			}
@@ -61,9 +65,21 @@ func (s *stepShutdown) Run(state multistep.StateBag) multistep.StepAction {
 		}
 	}()
 
-	err = waitForDropletState("off", dropletId, client, 2*time.Minute)
+	err = waitForDropletState("off", dropletId, client, c.StateTimeout)
 	if err != nil {
-		log.Printf("Error waiting for graceful off: %s", err)
+		// If we get an error the first time, actually report it
+		err := fmt.Errorf("Error shutting down droplet: %s", err)
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return multistep.ActionHalt
+	}
+
+	if err := waitForDropletUnlocked(client, dropletId, c.StateTimeout); err != nil {
+		// If we get an error the first time, actually report it
+		err := fmt.Errorf("Error shutting down droplet: %s", err)
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return multistep.ActionHalt
 	}
 
 	return multistep.ActionContinue

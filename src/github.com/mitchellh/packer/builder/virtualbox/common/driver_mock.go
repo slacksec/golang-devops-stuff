@@ -9,6 +9,10 @@ type DriverMock struct {
 	CreateSATAControllerController string
 	CreateSATAControllerErr        error
 
+	CreateSCSIControllerVM         string
+	CreateSCSIControllerController string
+	CreateSCSIControllerErr        error
+
 	DeleteCalled bool
 	DeleteName   string
 	DeleteErr    error
@@ -16,7 +20,7 @@ type DriverMock struct {
 	ImportCalled bool
 	ImportName   string
 	ImportPath   string
-	ImportOpts   string
+	ImportFlags  []string
 	ImportErr    error
 
 	IsoCalled bool
@@ -43,10 +47,16 @@ type DriverMock struct {
 	VersionErr    error
 }
 
-func (d *DriverMock) CreateSATAController(vm string, controller string) error {
+func (d *DriverMock) CreateSATAController(vm string, controller string, portcount int) error {
 	d.CreateSATAControllerVM = vm
 	d.CreateSATAControllerController = vm
 	return d.CreateSATAControllerErr
+}
+
+func (d *DriverMock) CreateSCSIController(vm string, controller string) error {
+	d.CreateSCSIControllerVM = vm
+	d.CreateSCSIControllerController = vm
+	return d.CreateSCSIControllerErr
 }
 
 func (d *DriverMock) Delete(name string) error {
@@ -55,11 +65,11 @@ func (d *DriverMock) Delete(name string) error {
 	return d.DeleteErr
 }
 
-func (d *DriverMock) Import(name, path, opts string) error {
+func (d *DriverMock) Import(name string, path string, flags []string) error {
 	d.ImportCalled = true
 	d.ImportName = name
 	d.ImportPath = path
-	d.ImportOpts = opts
+	d.ImportFlags = flags
 	return d.ImportErr
 }
 

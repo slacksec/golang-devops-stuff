@@ -2,12 +2,13 @@ package common
 
 import (
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"time"
+
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
-// This step starts the virtual machine.
+// StepRun is a step that starts the virtual machine.
 //
 // Uses:
 //   driver Driver
@@ -17,27 +18,20 @@ import (
 // Produces:
 type StepRun struct {
 	BootWait time.Duration
-	Headless bool
 
 	vmName string
 }
 
+// Run starts the VM.
 func (s *StepRun) Run(state multistep.StateBag) multistep.StepAction {
 	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
 	vmName := state.Get("vmName").(string)
 
 	ui.Say("Starting the virtual machine...")
-	//guiArgument := "gui"
-	if s.Headless == true {
-		ui.Message("WARNING: The VM will be started in headless mode, as configured.\n" +
-			"In headless mode, errors during the boot sequence or OS setup\n" +
-			"won't be easily visible. Use at your own discretion.")
-		//guiArgument = "headless"
-	}
 	command := []string{"start", vmName}
 	if err := driver.Prlctl(command...); err != nil {
-		err := fmt.Errorf("Error starting VM: %s", err)
+		err = fmt.Errorf("Error starting VM: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
@@ -64,6 +58,7 @@ func (s *StepRun) Run(state multistep.StateBag) multistep.StepAction {
 	return multistep.ActionContinue
 }
 
+// Cleanup stops the VM.
 func (s *StepRun) Cleanup(state multistep.StateBag) {
 	if s.vmName == "" {
 		return

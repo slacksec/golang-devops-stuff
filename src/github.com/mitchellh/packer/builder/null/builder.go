@@ -1,11 +1,12 @@
 package null
 
 import (
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
 	"log"
-	"time"
+
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/packer"
+	"github.com/mitchellh/multistep"
 )
 
 const BuilderId = "fnoeding.null"
@@ -26,14 +27,25 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 }
 
 func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
-	steps := []multistep.Step{
-		&common.StepConnectSSH{
-			SSHAddress:     SSHAddress(b.config.Host, b.config.Port),
-			SSHConfig:      SSHConfig(b.config.SSHUsername, b.config.SSHPassword, b.config.SSHPrivateKeyFile),
-			SSHWaitTimeout: 1 * time.Minute,
-		},
-		&common.StepProvision{},
+	steps := []multistep.Step{}
+
+	if b.config.CommConfig.Type != "none" {
+		steps = append(steps,
+			&communicator.StepConnect{
+				Config: &b.config.CommConfig,
+				Host:   CommHost(b.config.CommConfig.Host()),
+				SSHConfig: SSHConfig(
+					b.config.CommConfig.SSHAgentAuth,
+					b.config.CommConfig.SSHUsername,
+					b.config.CommConfig.SSHPassword,
+					b.config.CommConfig.SSHPrivateKey),
+			},
+		)
 	}
+
+	steps = append(steps,
+		new(common.StepProvision),
+	)
 
 	// Setup the state bag and initial state for the steps
 	state := new(multistep.BasicStateBag)
@@ -42,15 +54,7 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	state.Put("ui", ui)
 
 	// Run!
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
+	b.runner = common.NewRunner(steps, b.config.PackerConfig, ui)
 	b.runner.Run(state)
 
 	// If there was an error, return that

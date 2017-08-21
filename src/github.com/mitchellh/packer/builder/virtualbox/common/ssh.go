@@ -1,29 +1,33 @@
 package common
 
 import (
-	gossh "code.google.com/p/go.crypto/ssh"
-	"fmt"
+	commonssh "github.com/hashicorp/packer/common/ssh"
+	"github.com/hashicorp/packer/communicator/ssh"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/communicator/ssh"
-	"io/ioutil"
-	"os"
+	gossh "golang.org/x/crypto/ssh"
 )
 
-func SSHAddress(state multistep.StateBag) (string, error) {
-	sshHostPort := state.Get("sshHostPort").(uint)
-	return fmt.Sprintf("127.0.0.1:%d", sshHostPort), nil
+func CommHost(host string) func(multistep.StateBag) (string, error) {
+	return func(state multistep.StateBag) (string, error) {
+		return host, nil
+	}
+}
+
+func SSHPort(state multistep.StateBag) (int, error) {
+	sshHostPort := state.Get("sshHostPort").(int)
+	return sshHostPort, nil
 }
 
 func SSHConfigFunc(config SSHConfig) func(multistep.StateBag) (*gossh.ClientConfig, error) {
 	return func(state multistep.StateBag) (*gossh.ClientConfig, error) {
 		auth := []gossh.AuthMethod{
-			gossh.Password(config.SSHPassword),
+			gossh.Password(config.Comm.SSHPassword),
 			gossh.KeyboardInteractive(
-				ssh.PasswordKeyboardInteractive(config.SSHPassword)),
+				ssh.PasswordKeyboardInteractive(config.Comm.SSHPassword)),
 		}
 
-		if config.SSHKeyPath != "" {
-			signer, err := sshKeyToSigner(config.SSHKeyPath)
+		if config.Comm.SSHPrivateKey != "" {
+			signer, err := commonssh.FileSigner(config.Comm.SSHPrivateKey)
 			if err != nil {
 				return nil, err
 			}
@@ -32,28 +36,9 @@ func SSHConfigFunc(config SSHConfig) func(multistep.StateBag) (*gossh.ClientConf
 		}
 
 		return &gossh.ClientConfig{
-			User: config.SSHUser,
-			Auth: auth,
+			User:            config.Comm.SSHUsername,
+			Auth:            auth,
+			HostKeyCallback: gossh.InsecureIgnoreHostKey(),
 		}, nil
 	}
-}
-
-func sshKeyToSigner(path string) (gossh.Signer, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	keyBytes, err := ioutil.ReadAll(f)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := gossh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("Error setting up SSH config: %s", err)
-	}
-
-	return signer, nil
 }

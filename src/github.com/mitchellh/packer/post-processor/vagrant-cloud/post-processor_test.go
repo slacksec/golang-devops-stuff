@@ -2,8 +2,10 @@ package vagrantcloud
 
 import (
 	"bytes"
-	"github.com/mitchellh/packer/packer"
+	"os"
 	"testing"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 func testGoodConfig() map[string]interface{} {
@@ -20,6 +22,48 @@ func testBadConfig() map[string]interface{} {
 		"access_token":        "foo",
 		"box_tag":             "baz",
 		"version_description": "bar",
+	}
+}
+
+func TestPostProcessor_Configure_fromVagrantEnv(t *testing.T) {
+	var p PostProcessor
+	config := testGoodConfig()
+	config["access_token"] = ""
+	os.Setenv("VAGRANT_CLOUD_TOKEN", "bar")
+	defer func() {
+		os.Setenv("VAGRANT_CLOUD_TOKEN", "")
+	}()
+
+	if err := p.Configure(config); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if p.config.AccessToken != "bar" {
+		t.Fatalf("Expected to get token from VAGRANT_CLOUD_TOKEN env var. Got '%s' instead",
+			p.config.AccessToken)
+	}
+}
+
+func TestPostProcessor_Configure_fromAtlasEnv(t *testing.T) {
+	var p PostProcessor
+	config := testGoodConfig()
+	config["access_token"] = ""
+	os.Setenv("ATLAS_TOKEN", "foo")
+	defer func() {
+		os.Setenv("ATLAS_TOKEN", "")
+	}()
+
+	if err := p.Configure(config); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if p.config.AccessToken != "foo" {
+		t.Fatalf("Expected to get token from ATLAS_TOKEN env var. Got '%s' instead",
+			p.config.AccessToken)
+	}
+
+	if !p.warnAtlasToken {
+		t.Fatal("Expected warn flag to be set when getting token from atlas env var.")
 	}
 }
 
@@ -48,7 +92,7 @@ func TestPostProcessor_ImplementsPostProcessor(t *testing.T) {
 	var _ packer.PostProcessor = new(PostProcessor)
 }
 
-func TestproviderFromBuilderName(t *testing.T) {
+func TestProviderFromBuilderName(t *testing.T) {
 	if providerFromBuilderName("foobar") != "foobar" {
 		t.Fatal("should copy unknown provider")
 	}
