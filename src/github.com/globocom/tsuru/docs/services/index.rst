@@ -8,6 +8,6 @@ Services
 
 .. toctree::
 
-    usage
     api
     build
+    tsuru-services-env-var

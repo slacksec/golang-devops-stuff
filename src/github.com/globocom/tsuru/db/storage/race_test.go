@@ -7,37 +7,37 @@
 package storage
 
 import (
-	"launchpad.net/gocheck"
 	"sync"
-	"time"
+
+	"gopkg.in/check.v1"
 )
 
-func (s *S) TestOpenIsThreadSafe(c *gocheck.C) {
+func (s *S) TestOpenIsThreadSafe(c *check.C) {
 	storage, err := Open("127.0.0.1:27017", "tsuru_db_race_tests")
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	defer storage.session.Close()
-	sess := conn["127.0.0.1:27017"]
-	sess.used = time.Now().Add(-1 * time.Hour)
-	conn["127.0.0.1:27017"] = sess
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
+		defer wg.Done()
 		st1, err := Open("127.0.0.1:27017", "tsuru_db_race_tests_2")
-		c.Check(err, gocheck.IsNil)
-		c.Check(st1.session.LiveServers(), gocheck.DeepEquals, storage.session.LiveServers())
-		wg.Done()
+		c.Assert(err, check.IsNil)
+		defer st1.Close()
+		c.Check(st1.session.LiveServers(), check.DeepEquals, storage.session.LiveServers())
 	}()
 	go func() {
+		defer wg.Done()
 		st2, err := Open("127.0.0.1:27017", "tsuru_db_race_tests_3")
-		c.Check(err, gocheck.IsNil)
-		c.Check(st2.session.LiveServers(), gocheck.DeepEquals, storage.session.LiveServers())
-		wg.Done()
+		c.Assert(err, check.IsNil)
+		defer st2.Close()
+		c.Check(st2.session.LiveServers(), check.DeepEquals, storage.session.LiveServers())
 	}()
 	go func() {
+		defer wg.Done()
 		st3, err := Open("127.0.0.1:27017", "tsuru_db_race_tests_4")
-		c.Check(err, gocheck.IsNil)
-		c.Check(st3.session.LiveServers(), gocheck.DeepEquals, storage.session.LiveServers())
-		wg.Done()
+		c.Assert(err, check.IsNil)
+		defer st3.Close()
+		c.Check(st3.session.LiveServers(), check.DeepEquals, storage.session.LiveServers())
 	}()
 	wg.Wait()
 }

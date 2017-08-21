@@ -1,233 +1,372 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package app
 
 import (
+	"bytes"
 	"errors"
+
 	"github.com/tsuru/config"
+	"github.com/tsuru/tsuru/builder"
+	"github.com/tsuru/tsuru/builder/fake"
 	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/testing"
-	"gopkg.in/mgo.v2/bson"
-	"launchpad.net/gocheck"
+	"github.com/tsuru/tsuru/db/dbtest"
+	"github.com/tsuru/tsuru/repository/repositorytest"
+	appTypes "github.com/tsuru/tsuru/types/app"
+	"gopkg.in/check.v1"
 )
 
 type PlatformSuite struct {
-	provisioner *testing.FakeProvisioner
+	builder *fake.FakeBuilder
+	conn    *db.Storage
 }
 
-var _ = gocheck.Suite(&PlatformSuite{})
+var _ = check.Suite(&PlatformSuite{})
 
-func (s *PlatformSuite) SetUpSuite(c *gocheck.C) {
+func (s *PlatformSuite) SetUpSuite(c *check.C) {
+	config.Set("log:disable-syslog", true)
 	config.Set("database:url", "127.0.0.1:27017")
 	config.Set("database:name", "platform_tests")
-	s.provisioner = testing.NewFakeProvisioner()
-	Provisioner = s.provisioner
-}
-
-func (s *PlatformSuite) TearDownSuite(c *gocheck.C) {
 	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	conn.Apps().Database.DropDatabase()
-	conn.Close()
+	c.Assert(err, check.IsNil)
+	s.conn = conn
+	s.builder = fake.NewFakeBuilder()
+	builder.Register("fake", s.builder)
 }
 
-func (s *PlatformSuite) TestPlatforms(c *gocheck.C) {
-	want := []Platform{
+func (s *PlatformSuite) TearDownSuite(c *check.C) {
+	defer s.conn.Close()
+	s.conn.Apps().Database.DropDatabase()
+}
+
+func (s *PlatformSuite) SetUpTest(c *check.C) {
+	repositorytest.Reset()
+	s.builder.Reset()
+	dbtest.ClearAllCollections(s.conn.Apps().Database)
+}
+
+func (s *PlatformSuite) TestPlatforms(c *check.C) {
+	want := []appTypes.Platform{
 		{Name: "dea"},
 		{Name: "pecuniae"},
 		{Name: "money"},
 		{Name: "raise"},
 		{Name: "glass"},
 	}
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
 	for _, p := range want {
-		conn.Platforms().Insert(p)
-		defer conn.Platforms().Remove(p)
+		PlatformService().Insert(p)
 	}
-	got, err := Platforms()
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(got, gocheck.DeepEquals, want)
+	got, err := Platforms(false)
+	c.Assert(err, check.IsNil)
+	c.Assert(got, check.DeepEquals, want)
 }
 
-func (s *PlatformSuite) TestPlatformsEmpty(c *gocheck.C) {
-	got, err := Platforms()
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(got, gocheck.HasLen, 0)
-}
-
-func (s *PlatformSuite) TestGetPlatform(c *gocheck.C) {
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
-	p := Platform{Name: "dea"}
-	conn.Platforms().Insert(p)
-	defer conn.Platforms().Remove(p)
-	got, err := getPlatform(p.Name)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(*got, gocheck.DeepEquals, p)
-	got, err = getPlatform("WAT")
-	c.Assert(got, gocheck.IsNil)
-	_, ok := err.(InvalidPlatformError)
-	c.Assert(ok, gocheck.Equals, true)
-}
-
-func (s *PlatformSuite) TestPlatformAdd(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
+func (s *PlatformSuite) TestPlatformsWithFilterOnlyEnabledPlatforms(c *check.C) {
+	input := []appTypes.Platform{
+		{Name: "dea"},
+		{Name: "pecuniae", Disabled: true},
+		{Name: "money"},
+		{Name: "raise", Disabled: true},
+		{Name: "glass", Disabled: false},
 	}
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
-	name := "test_platform_add"
+	expected := []appTypes.Platform{
+		{Name: "dea"},
+		{Name: "money"},
+		{Name: "glass", Disabled: false},
+	}
+	for _, p := range input {
+		PlatformService().Insert(p)
+	}
+	got, err := Platforms(true)
+	c.Assert(err, check.IsNil)
+	c.Assert(got, check.DeepEquals, expected)
+}
+
+func (s *PlatformSuite) TestPlatformsEmpty(c *check.C) {
+	got, err := Platforms(false)
+	c.Assert(err, check.IsNil)
+	c.Assert(got, check.HasLen, 0)
+}
+
+func (s *PlatformSuite) TestPlatformsEmptyWithQueryTrue(c *check.C) {
+	got, err := Platforms(true)
+	c.Assert(err, check.IsNil)
+	c.Assert(got, check.HasLen, 0)
+}
+
+func (s *PlatformSuite) TestGetPlatform(c *check.C) {
+	p := appTypes.Platform{Name: "dea"}
+	PlatformService().Insert(p)
+	got, err := GetPlatform(p.Name)
+	c.Assert(err, check.IsNil)
+	c.Assert(*got, check.DeepEquals, p)
+	got, err = GetPlatform("WAT")
+	c.Assert(got, check.IsNil)
+	c.Assert(err, check.Equals, appTypes.ErrInvalidPlatform)
+}
+
+func (s *PlatformSuite) TestPlatformAdd(c *check.C) {
+	name := "test-platform-add"
 	args := make(map[string]string)
 	args["dockerfile"] = "http://localhost/Dockerfile"
-	err = PlatformAdd(name, args, nil)
-	defer conn.Platforms().Remove(bson.M{"_id": name})
-	c.Assert(err, gocheck.IsNil)
-	platform := provisioner.GetPlatform(name)
-	c.Assert(platform.Name, gocheck.Equals, name)
-	c.Assert(platform.Args, gocheck.DeepEquals, args)
-	c.Assert(platform.Version, gocheck.Equals, 1)
+	err := PlatformAdd(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
+	platform, err := GetPlatform(name)
+	c.Assert(err, check.IsNil)
+	c.Assert(platform.Name, check.Equals, name)
 }
 
-func (s *PlatformSuite) TestPlatformAddDuplicate(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
+func (s *PlatformSuite) TestPlatformAddValidatesPlatformName(c *check.C) {
+	tt := []struct {
+		name        string
+		expectedErr error
+	}{
+		{"platform", nil},
+		{"Platform", appTypes.ErrInvalidPlatformName},
+		{"", appTypes.ErrPlatformNameMissing},
+		{"plat_form", appTypes.ErrInvalidPlatformName},
+		{"123platform", appTypes.ErrInvalidPlatformName},
+		{"plat-form", nil},
+		{"myappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyapp", appTypes.ErrInvalidPlatformName},
+		{"myappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyap", appTypes.ErrInvalidPlatformName},
+		{"myappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmyappmya", nil},
 	}
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
-	name := "test_platform_add"
+	for _, t := range tt {
+		err := PlatformAdd(builder.PlatformOptions{Name: t.name})
+		c.Assert(err, check.DeepEquals, t.expectedErr)
+	}
+}
+
+func (s *PlatformSuite) TestPlatformAddDuplicate(c *check.C) {
+	name := "test-platform-add"
 	args := make(map[string]string)
 	args["dockerfile"] = "http://localhost/Dockerfile"
-	err = PlatformAdd(name, args, nil)
-	defer conn.Platforms().Remove(bson.M{"_id": name})
-	c.Assert(err, gocheck.IsNil)
-	provisioner.PlatformRemove(name)
-	err = PlatformAdd(name, args, nil)
-	_, ok := err.(DuplicatePlatformError)
-	c.Assert(ok, gocheck.Equals, true)
+	err := PlatformAdd(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
+	err = PlatformAdd(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.Equals, appTypes.ErrDuplicatePlatform)
 }
 
-func (s *PlatformSuite) TestPlatformAddWithProvisionerError(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
-	}
-	provisioner.PrepareFailure("PlatformAdd", errors.New("build error"))
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
-	name := "test_platform_add"
+func (s *PlatformSuite) TestPlatformAddWithProvisionerError(c *check.C) {
+	name := "test-platform-add"
 	args := make(map[string]string)
 	args["dockerfile"] = "http://localhost/Dockerfile"
-	err = PlatformAdd(name, args, nil)
-	defer conn.Platforms().Remove(bson.M{"_id": name})
-	c.Assert(err, gocheck.NotNil)
-	count, err := conn.Platforms().FindId(name).Count()
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(count, gocheck.Equals, 0)
+	opts := builder.PlatformOptions{Name: name, Args: args}
+	s.builder.PrepareFailure("PlatformAdd", errors.New("something wrong happened"))
+	err := PlatformAdd(opts)
+	c.Assert(err, check.NotNil)
+	p, err := PlatformService().FindByName(name)
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNotFound)
+	c.Assert(p, check.IsNil)
 }
 
-func (s *PlatformSuite) TestPlatformAddNotExtensibleProvisioner(c *gocheck.C) {
-	err := PlatformAdd("python", nil, nil)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err.Error(), gocheck.Equals, "Provisioner is not extensible")
+func (s *PlatformSuite) TestPlatformAddWithoutName(c *check.C) {
+	err := PlatformAdd(builder.PlatformOptions{Name: ""})
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNameMissing)
 }
 
-func (s *PlatformSuite) TestPlatformAddWithoutName(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
-	}
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	err := PlatformAdd("", nil, nil)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err.Error(), gocheck.Equals, "Platform name is required.")
-}
-
-func (s *PlatformSuite) TestPlatformUpdate(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
-	}
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
-	name := "test_platform_update"
+func (s *PlatformSuite) TestPlatformUpdate(c *check.C) {
+	name := "test-platform-update"
 	args := make(map[string]string)
 	args["dockerfile"] = "http://localhost/Dockerfile"
-	err = PlatformUpdate(name, args, nil)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err.Error(), gocheck.Equals, "Platform doesn't exist.")
-	err = PlatformAdd(name, nil, nil)
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Platforms().Remove(bson.M{"_id": name})
-	err = PlatformUpdate(name, args, nil)
-	c.Assert(err, gocheck.IsNil)
+	args["disabled"] = ""
+	err := PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNotFound)
+	err = PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
 }
 
-func (s *PlatformSuite) TestPlatformUpdateWithoutName(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
-	}
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	err := PlatformUpdate("", nil, nil)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err.Error(), gocheck.Equals, "Platform name is required.")
-}
-
-func (s *PlatformSuite) TestPlatformUpdateShouldSetUpdatePlatformFlagOnApps(c *gocheck.C) {
-	provisioner := testing.ExtensibleFakeProvisioner{
-		FakeProvisioner: testing.NewFakeProvisioner(),
-	}
-	Provisioner = &provisioner
-	defer func() {
-		Provisioner = s.provisioner
-	}()
-	conn, err := db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Close()
-	name := "test_platform_update"
+func (s *PlatformSuite) TestPlatformUpdateDisableTrueWithDockerfile(c *check.C) {
+	name := "test-platform-update"
 	args := make(map[string]string)
 	args["dockerfile"] = "http://localhost/Dockerfile"
-	err = PlatformAdd(name, nil, nil)
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Platforms().Remove(bson.M{"_id": name})
-	appName := "test_app"
+	args["disabled"] = "true"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-app-1"
 	app := App{
 		Name:     appName,
 		Platform: name,
 	}
-	err = conn.Apps().Insert(app)
-	c.Assert(err, gocheck.IsNil)
-	defer conn.Apps().Remove(bson.M{"_id": appName})
-	err = PlatformUpdate(name, args, nil)
-	c.Assert(err, gocheck.IsNil)
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
 	a, err := GetByName(appName)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(a.UpdatePlatform, gocheck.Equals, true)
+	c.Assert(err, check.IsNil)
+	c.Assert(a.UpdatePlatform, check.Equals, true)
+	platf, err := GetPlatform(name)
+	c.Assert(err, check.IsNil)
+	c.Assert(platf.Disabled, check.Equals, true)
+}
+
+func (s *PlatformSuite) TestPlatformUpdateDisableTrueFileIn(c *check.C) {
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["disabled"] = "true"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-app-2"
+	app := App{
+		Name:     appName,
+		Platform: name,
+	}
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args, Input: bytes.NewReader(nil)})
+	c.Assert(err, check.IsNil)
+	platf, err := GetPlatform(name)
+	c.Assert(err, check.IsNil)
+	c.Assert(platf.Disabled, check.Equals, true)
+	a, err := GetByName(appName)
+	c.Assert(err, check.IsNil)
+	c.Assert(a.UpdatePlatform, check.Equals, true)
+}
+
+func (s *PlatformSuite) TestPlatformUpdateDisableTrueWithoutDockerfile(c *check.C) {
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = ""
+	args["disabled"] = "true"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-app-2"
+	app := App{
+		Name:     appName,
+		Platform: name,
+	}
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
+	platf, err := GetPlatform(name)
+	c.Assert(err, check.IsNil)
+	c.Assert(platf.Disabled, check.Equals, true)
+	a, err := GetByName(appName)
+	c.Assert(err, check.IsNil)
+	c.Assert(a.UpdatePlatform, check.Equals, false)
+}
+
+func (s *PlatformSuite) TestPlatformUpdateDisableFalseWithDockerfile(c *check.C) {
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = "http://localhost/Dockerfile"
+	args["disabled"] = "false"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-app-3"
+	app := App{
+		Name:     appName,
+		Platform: name,
+	}
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
+	a, err := GetByName(appName)
+	c.Assert(err, check.IsNil)
+	c.Assert(a.UpdatePlatform, check.Equals, true)
+	platf, err := GetPlatform(name)
+	c.Assert(err, check.IsNil)
+	c.Assert(platf.Disabled, check.Equals, false)
+}
+
+func (s *PlatformSuite) TestPlatformUpdateDisableFalseWithoutDockerfile(c *check.C) {
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = ""
+	args["disabled"] = "false"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-app-4"
+	app := App{
+		Name:     appName,
+		Platform: name,
+	}
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
+	platf, err := GetPlatform(name)
+	c.Assert(err, check.IsNil)
+	c.Assert(platf.Disabled, check.Equals, false)
+}
+
+func (s *PlatformSuite) TestPlatformUpdateWithoutName(c *check.C) {
+	err := PlatformUpdate(builder.PlatformOptions{Name: ""})
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNameMissing)
+}
+
+func (s *PlatformSuite) TestPlatformUpdateShouldSetUpdatePlatformFlagOnApps(c *check.C) {
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = "http://localhost/Dockerfile"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-app"
+	app := App{
+		Name:     appName,
+		Platform: name,
+	}
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformUpdate(builder.PlatformOptions{Name: name, Args: args})
+	c.Assert(err, check.IsNil)
+	a, err := GetByName(appName)
+	c.Assert(err, check.IsNil)
+	c.Assert(a.UpdatePlatform, check.Equals, true)
+}
+
+func (s *PlatformSuite) TestPlatformRemove(c *check.C) {
+	err := PlatformRemove("platform-dont-exists")
+	c.Assert(err, check.NotNil)
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNotFound)
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = "http://localhost/Dockerfile"
+	err = PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	err = PlatformRemove(name)
+	c.Assert(err, check.IsNil)
+	p, err := PlatformService().FindByName(name)
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNotFound)
+	c.Assert(p, check.IsNil)
+	err = PlatformRemove("")
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNameMissing)
+}
+
+func (s *PlatformSuite) TestPlatformWithAppsCantBeRemoved(c *check.C) {
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = "http://localhost/Dockerfile"
+	err := PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	appName := "test-another-app"
+	app := App{
+		Name:     appName,
+		Platform: name,
+	}
+	err = s.conn.Apps().Insert(app)
+	c.Assert(err, check.IsNil)
+	err = PlatformRemove(name)
+	c.Assert(err, check.NotNil)
+}
+
+func (s *PlatformSuite) TestPlatformRemoveAlwaysRemoveFromDB(c *check.C) {
+	err := PlatformRemove("platform-dont-exists")
+	c.Assert(err, check.NotNil)
+	name := "test-platform-update"
+	args := make(map[string]string)
+	args["dockerfile"] = "http://localhost/Dockerfile"
+	err = PlatformAdd(builder.PlatformOptions{Name: name})
+	c.Assert(err, check.IsNil)
+	err = PlatformRemove(name)
+	c.Assert(err, check.IsNil)
+	p, err := PlatformService().FindByName(name)
+	c.Assert(err, check.Equals, appTypes.ErrPlatformNotFound)
+	c.Assert(p, check.IsNil)
 }

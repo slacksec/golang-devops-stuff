@@ -1,24 +1,21 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package api
 
 import (
+	"net/http"
+
 	"github.com/tsuru/tsuru/api/context"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/errors"
-	"net/http"
 )
 
 var (
 	tokenRequiredErr = &errors.HTTP{
 		Code:    http.StatusUnauthorized,
 		Message: "You must provide a valid Authorization header",
-	}
-	adminRequiredErr = &errors.HTTP{
-		Code:    http.StatusForbidden,
-		Message: "You must be an admin",
 	}
 )
 
@@ -28,25 +25,13 @@ func (fn Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	context.AddRequestError(r, fn(w, r))
 }
 
-type authorizationRequiredHandler func(http.ResponseWriter, *http.Request, auth.Token) error
+type AuthorizationRequiredHandler func(http.ResponseWriter, *http.Request, auth.Token) error
 
-func (fn authorizationRequiredHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (fn AuthorizationRequiredHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t := context.GetAuthToken(r)
 	if t == nil {
+		w.Header().Set("WWW-Authenticate", "Bearer realm=\"tsuru\" scope=\"tsuru\"")
 		context.AddRequestError(r, tokenRequiredErr)
-	} else {
-		context.AddRequestError(r, fn(w, r, t))
-	}
-}
-
-type AdminRequiredHandler authorizationRequiredHandler
-
-func (fn AdminRequiredHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t := context.GetAuthToken(r)
-	if t == nil {
-		context.AddRequestError(r, tokenRequiredErr)
-	} else if user, err := t.User(); err != nil || !user.IsAdmin() {
-		context.AddRequestError(r, adminRequiredErr)
 	} else {
 		context.AddRequestError(r, fn(w, r, t))
 	}

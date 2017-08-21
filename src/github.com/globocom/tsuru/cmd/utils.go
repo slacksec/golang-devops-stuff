@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,25 +6,37 @@ package cmd
 
 import (
 	"encoding/json"
-	"errors"
 	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/gnuflag"
 )
 
+func getHome() string {
+	envs := []string{"HOME", "HOMEPATH"}
+	var home string
+	for i := 0; i < len(envs) && home == ""; i++ {
+		home = os.Getenv(envs[i])
+	}
+	return home
+}
+
 func JoinWithUserDir(p ...string) string {
-	paths := []string{os.ExpandEnv("$HOME")}
+	paths := []string{getHome()}
 	paths = append(paths, p...)
-	return path.Join(paths...)
+	return filepath.Join(paths...)
 }
 
 func writeToken(token string) error {
-	tokenPath := JoinWithUserDir(".tsuru_token")
+	tokenPath := JoinWithUserDir(".tsuru", "token")
 	file, err := filesystem().Create(tokenPath)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 	n, err := file.WriteString(token)
 	if err != nil {
 		return err
@@ -36,8 +48,14 @@ func writeToken(token string) error {
 }
 
 func ReadToken() (string, error) {
-	tokenPath := JoinWithUserDir(".tsuru_token")
+	if token := os.Getenv("TSURU_TOKEN"); token != "" {
+		return token, nil
+	}
+	tokenPath := JoinWithUserDir(".tsuru", "token")
 	file, err := filesystem().Open(tokenPath)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -71,4 +89,11 @@ func ShowServicesInstancesList(b []byte) ([]byte, error) {
 		table.AddRow(r)
 	}
 	return table.Bytes(), nil
+}
+
+func MergeFlagSet(fs1, fs2 *gnuflag.FlagSet) *gnuflag.FlagSet {
+	fs2.VisitAll(func(flag *gnuflag.Flag) {
+		fs1.Var(flag.Value, flag.Name, flag.Usage)
+	})
+	return fs1
 }

@@ -10,7 +10,7 @@ type Plan struct {
 	Description string
 }
 
-func GetPlansByServiceName(serviceName string) ([]Plan, error) {
+func GetPlansByServiceName(serviceName, requestID string) ([]Plan, error) {
 	s := Service{Name: serviceName}
 	err := s.Get()
 	if err != nil {
@@ -20,9 +20,22 @@ func GetPlansByServiceName(serviceName string) ([]Plan, error) {
 	if err != nil {
 		return []Plan{}, nil
 	}
-	plans, err := endpoint.Plans()
+	plans, err := endpoint.Plans(requestID)
 	if err != nil {
 		return nil, err
 	}
 	return plans, nil
+}
+
+func GetPlanByServiceNameAndPlanName(serviceName, planName, requestID string) (Plan, error) {
+	plans, err := GetPlansByServiceName(serviceName, requestID)
+	if err != nil {
+		return Plan{}, err
+	}
+	for _, plan := range plans {
+		if plan.Name == planName {
+			return plan, nil
+		}
+	}
+	return Plan{}, nil
 }

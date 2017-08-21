@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,11 +6,11 @@ package api
 
 import (
 	"fmt"
-	"github.com/tsuru/tsuru/auth"
-	"io/ioutil"
-	"launchpad.net/gocheck"
 	"net/http"
 	"net/http/httptest"
+
+	"github.com/tsuru/tsuru/auth"
+	"gopkg.in/check.v1"
 )
 
 func authorizedTsuruHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -18,71 +18,62 @@ func authorizedTsuruHandler(w http.ResponseWriter, r *http.Request, t auth.Token
 	return nil
 }
 
-func (s *S) TestRegisterHandlerMakesHandlerAvailableViaGet(c *gocheck.C) {
-	RegisterHandler("/foo/bar", "GET", authorizationRequiredHandler(authorizedTsuruHandler))
+func (s *S) TestRegisterHandlerMakesHandlerAvailableViaGet(c *check.C) {
+	RegisterHandler("/foo/bar", "GET", AuthorizationRequiredHandler(authorizedTsuruHandler))
 	defer resetHandlers()
 	rec := httptest.NewRecorder()
 	req, err := http.NewRequest("GET", "http://example.com/foo/bar", nil)
 	req.Header.Set("Authorization", "bearer "+s.token.GetValue())
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	m := RunServer(true)
 	m.ServeHTTP(rec, req)
-	b, err := ioutil.ReadAll(rec.Body)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert("GET", gocheck.Equals, string(b))
+	c.Assert("GET", check.Equals, rec.Body.String())
 }
 
-func (s *S) TestRegisterHandlerMakesHandlerAvailableViaPost(c *gocheck.C) {
-	RegisterHandler("/foo/bar", "POST", authorizationRequiredHandler(authorizedTsuruHandler))
+func (s *S) TestRegisterHandlerMakesHandlerAvailableViaPost(c *check.C) {
+	RegisterHandler("/foo/bar", "POST", AuthorizationRequiredHandler(authorizedTsuruHandler))
 	defer resetHandlers()
 	rec := httptest.NewRecorder()
 	req, err := http.NewRequest("POST", "http://example.com/foo/bar", nil)
 	req.Header.Set("Authorization", "bearer "+s.token.GetValue())
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	m := RunServer(true)
 	m.ServeHTTP(rec, req)
-	b, err := ioutil.ReadAll(rec.Body)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert("POST", gocheck.Equals, string(b))
+	c.Assert("POST", check.Equals, rec.Body.String())
 }
 
-func (s *S) TestRegisterHandlerMakesHandlerAvailableViaPut(c *gocheck.C) {
-	RegisterHandler("/foo/bar", "PUT", authorizationRequiredHandler(authorizedTsuruHandler))
+func (s *S) TestRegisterHandlerMakesHandlerAvailableViaPut(c *check.C) {
+	RegisterHandler("/foo/bar", "PUT", AuthorizationRequiredHandler(authorizedTsuruHandler))
 	defer resetHandlers()
 	rec := httptest.NewRecorder()
 	req, err := http.NewRequest("PUT", "http://example.com/foo/bar", nil)
 	req.Header.Set("Authorization", "bearer "+s.token.GetValue())
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	m := RunServer(true)
 	m.ServeHTTP(rec, req)
-	b, err := ioutil.ReadAll(rec.Body)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert("PUT", gocheck.Equals, string(b))
+	c.Assert("PUT", check.Equals, rec.Body.String())
 }
 
-func (s *S) TestRegisterHandlerMakesHandlerAvailableViaDelete(c *gocheck.C) {
-	RegisterHandler("/foo/bar", "DELETE", authorizationRequiredHandler(authorizedTsuruHandler))
+func (s *S) TestRegisterHandlerMakesHandlerAvailableViaDelete(c *check.C) {
+	RegisterHandler("/foo/bar", "DELETE", AuthorizationRequiredHandler(authorizedTsuruHandler))
 	defer resetHandlers()
 	rec := httptest.NewRecorder()
 	req, err := http.NewRequest("DELETE", "http://example.com/foo/bar", nil)
 	req.Header.Set("Authorization", "bearer "+s.token.GetValue())
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	m := RunServer(true)
 	m.ServeHTTP(rec, req)
-	b, err := ioutil.ReadAll(rec.Body)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert("DELETE", gocheck.Equals, string(b))
+	c.Assert("DELETE", check.Equals, rec.Body.String())
 }
 
-func (s *S) TestIsNotAdmin(c *gocheck.C) {
-	RegisterHandler("/foo/bar", "POST", authorizationRequiredHandler(authorizedTsuruHandler))
+func (s *S) TestIsNotAdmin(c *check.C) {
+	RegisterHandler("/foo/bar", "POST", AuthorizationRequiredHandler(authorizedTsuruHandler))
 	defer resetHandlers()
 	rec := httptest.NewRecorder()
 	req, err := http.NewRequest("POST", "http://example.com/foo/bar", nil)
 	req.Header.Set("Authorization", "bearer "+s.token.GetValue())
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	m := RunServer(true)
 	m.ServeHTTP(rec, req)
-	b, err := ioutil.ReadAll(rec.Body)
-	c.Assert("POST", gocheck.Equals, string(b))
+	c.Assert("POST", check.Equals, rec.Body.String())
 }

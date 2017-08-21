@@ -1,52 +1,52 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package git
 
 import (
-	"errors"
-	"launchpad.net/gocheck"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"gopkg.in/check.v1"
 )
 
 func Test(t *testing.T) {
-	gocheck.TestingT(t)
+	check.TestingT(t)
 }
 
 type S struct {
 	repoPath string
 }
 
-var _ = gocheck.Suite(&S{})
+var _ = check.Suite(&S{})
 
-func (s *S) SetUpSuite(c *gocheck.C) {
+func (s *S) SetUpSuite(c *check.C) {
 	tmpdir, err := filepath.EvalSymlinks(os.TempDir())
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	s.repoPath = path.Join(tmpdir, "git")
 	err = os.MkdirAll(s.repoPath, 0755)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	cmd := exec.Command("git", "init")
 	cmd.Dir = s.repoPath
 	err = cmd.Run()
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	err = exec.Command("cp", "testdata/gitconfig", path.Join(s.repoPath, ".git", "config")).Run()
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	subdir := path.Join(s.repoPath, "a", "b", "c")
 	err = os.MkdirAll(subdir, 0755)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 }
 
-func (s *S) TearDownSuite(c *gocheck.C) {
+func (s *S) TearDownSuite(c *check.C) {
 	os.RemoveAll(s.repoPath)
 }
 
-func (s *S) TestDiscoverRepositoryPath(c *gocheck.C) {
+func (s *S) TestDiscoverRepositoryPath(c *check.C) {
 	var data = []struct {
 		path     string
 		expected string
@@ -80,12 +80,12 @@ func (s *S) TestDiscoverRepositoryPath(c *gocheck.C) {
 		{
 			path:     path.Join(s.repoPath, "a", "b", "c", "d"),
 			expected: "",
-			err:      errors.New("Repository not found."),
+			err:      ErrRepositoryNotFound,
 		},
 		{
 			path:     path.Join(os.TempDir(), "aoshae8yahhh8ua", "doctor-jimmy"),
 			expected: "",
-			err:      errors.New("Repository not found."),
+			err:      ErrRepositoryNotFound,
 		},
 	}
 	for _, d := range data {
@@ -101,7 +101,7 @@ func (s *S) TestDiscoverRepositoryPath(c *gocheck.C) {
 	}
 }
 
-func (s *S) TestOpenRepository(c *gocheck.C) {
+func (s *S) TestOpenRepository(c *check.C) {
 	var data = []struct {
 		path     string
 		expected *Repository
@@ -125,7 +125,7 @@ func (s *S) TestOpenRepository(c *gocheck.C) {
 		{
 			path:     "/",
 			expected: nil,
-			err:      errors.New("Repository not found."),
+			err:      ErrRepositoryNotFound,
 		},
 	}
 	for _, d := range data {
@@ -141,7 +141,7 @@ func (s *S) TestOpenRepository(c *gocheck.C) {
 	}
 }
 
-func (s *S) TestGetRemoteURL(c *gocheck.C) {
+func (s *S) TestGetRemoteURL(c *check.C) {
 	var data = []struct {
 		name     string
 		expected string
@@ -149,15 +149,16 @@ func (s *S) TestGetRemoteURL(c *gocheck.C) {
 	}{
 		{"origin", "git@github.com:tsuru/tsuru-django-sample.git", nil},
 		{"tsuru", "git@tsuruhost.com:gopher.git", nil},
-		{"wut", "", errors.New(`Remote "wut" not found.`)},
+		{"wut", "", errRemoteNotFound{"wut"}},
 	}
 	repo, err := OpenRepository(s.repoPath)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	for _, d := range data {
 		got, err := repo.RemoteURL(d.name)
 		if got != d.expected {
 			c.Errorf("RemoteURL(%q): Want %q. Got %q.", d.name, d.expected, got)
 		}
+
 		if !reflect.DeepEqual(d.err, err) {
 			c.Errorf("RemoteURL(%q): Want error %q. Got %q.", d.name, d.err, err)
 		}

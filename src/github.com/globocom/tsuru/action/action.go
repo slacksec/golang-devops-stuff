@@ -1,13 +1,14 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package action
 
 import (
-	"errors"
-	"github.com/tsuru/tsuru/log"
 	"sync"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/log"
 )
 
 // Result is the value returned by Forward. It is used in the call of the next
@@ -26,6 +27,8 @@ type Forward func(context FWContext) (Result, error)
 // parameters given to the pipeline executor and the result of the forward
 // phase.
 type Backward func(context BWContext)
+
+type OnErrorFunc func(FWContext, error)
 
 // FWContext is the context used in calls to Forward functions (forward phase).
 type FWContext struct {
@@ -66,6 +69,10 @@ type Action struct {
 	// Minimum number of parameters that this action requires to run.
 	MinParams int
 
+	// Function that will be invoked after some failure occurured in the
+	// Forward phase of this same action.
+	OnError OnErrorFunc
+
 	// Result of the action. Stored for use in the backward phase.
 	result Result
 
@@ -80,14 +87,25 @@ type Pipeline struct {
 	actions []*Action
 }
 
+var (
+	ErrPipelineNoActions      = errors.New("No actions to execute.")
+	ErrPipelineForwardMissing = errors.New("All actions must define the forward function.")
+	ErrPipelineFewParameters  = errors.New("Not enough parameters to call Action.Forward.")
+)
+
 // NewPipeline creates a new pipeline instance with the given list of actions.
 func NewPipeline(actions ...*Action) *Pipeline {
 	// Actions are usually global functions, copying them
-	// guarantees each copy have an isolated Result.
+	// guarantees each copy has an isolated Result.
 	newActions := make([]*Action, len(actions))
 	for i, action := range actions {
-		newAction := new(Action)
-		*newAction = *action
+		newAction := &Action{
+			Name:      action.Name,
+			Forward:   action.Forward,
+			Backward:  action.Backward,
+			MinParams: action.MinParams,
+			OnError:   action.OnError,
+		}
 		newActions[i] = newAction
 	}
 	return &Pipeline{actions: newActions}
@@ -108,7 +126,7 @@ func (p *Pipeline) Result() Result {
 // all actions. If none of the Forward calls return error, the pipeline
 // execution ends in the forward phase and is "committed".
 //
-// If any of the Forward call fail, the executor switches to the backward phase
+// If any of the Forward calls fails, the executor switches to the backward phase
 // (roll back) and call the Backward function for each action completed. It
 // does not call the Backward function of the action that has failed.
 //
@@ -120,15 +138,15 @@ func (p *Pipeline) Execute(params ...interface{}) error {
 		err error
 	)
 	if len(p.actions) == 0 {
-		return errors.New("No actions to execute.")
+		return ErrPipelineNoActions
 	}
 	fwCtx := FWContext{Params: params}
 	for i, a := range p.actions {
 		log.Debugf("[pipeline] running the Forward for the %s action", a.Name)
 		if a.Forward == nil {
-			err = errors.New("All actions must define the forward function.")
+			err = ErrPipelineForwardMissing
 		} else if len(fwCtx.Params) < a.MinParams {
-			err = errors.New("Not enough parameters to call Action.Forward.")
+			err = ErrPipelineFewParameters
 		} else {
 			r, err = a.Forward(fwCtx)
 			a.rMutex.Lock()
@@ -138,6 +156,9 @@ func (p *Pipeline) Execute(params ...interface{}) error {
 		}
 		if err != nil {
 			log.Debugf("[pipeline] error running the Forward for the %s action - %s", a.Name, err)
+			if a.OnError != nil {
+				a.OnError(fwCtx, err)
+			}
 			p.rollback(i-1, params)
 			return err
 		}

@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,41 +6,75 @@ package service
 
 import (
 	"encoding/json"
-	"fmt"
-	"github.com/tsuru/tsuru/app/bind"
-	"github.com/tsuru/tsuru/errors"
-	"github.com/tsuru/tsuru/log"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tsuru/config"
+	"github.com/tsuru/tsuru/app/bind"
+	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/net"
 )
 
-type Client struct {
-	endpoint string
-	username string
-	password string
+var (
+	ErrInstanceAlreadyExistsInAPI = errors.New("instance already exists in the service API")
+	ErrInstanceNotFoundInAPI      = errors.New("instance does not exist in the service API")
+	ErrInstanceNotReady           = errors.New("instance is not ready yet")
+
+	requestLatencies = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "tsuru_service_request_duration_seconds",
+		Help: "The service requests latency distributions.",
+	}, []string{"service"})
+	requestErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tsuru_service_request_errors_total",
+		Help: "The total number of service request errors.",
+	}, []string{"service"})
+)
+
+func init() {
+	prometheus.MustRegister(requestLatencies)
+	prometheus.MustRegister(requestErrors)
 }
 
-func (c *Client) buildErrorMessage(err error, resp *http.Response) string {
+type Client struct {
+	serviceName string
+	endpoint    string
+	username    string
+	password    string
+}
+
+func (c *Client) buildErrorMessage(err error, resp *http.Response) error {
 	if err != nil {
-		return err.Error()
+		return err
 	}
 	if resp != nil {
+		defer resp.Body.Close()
 		b, _ := ioutil.ReadAll(resp.Body)
-		return string(b)
+		return errors.Errorf("invalid response: %s (code: %d)", string(b), resp.StatusCode)
 	}
-	return ""
+	return nil
 }
 
 func (c *Client) issueRequest(path, method string, params map[string][]string) (*http.Response, error) {
-	log.Debug("Issuing request...")
+	var requestID string
+	requestIDs, ok := params["requestID"]
+	if ok {
+		requestID = ""
+		if len(requestIDs) > 0 {
+			requestID = requestIDs[0]
+		}
+		delete(params, "requestID")
+	}
 	v := url.Values(params)
 	var suffix string
 	var body io.Reader
-	if method == "DELETE" || method == "GET" {
+	if method == "GET" {
 		suffix = "?" + v.Encode()
 	} else {
 		body = strings.NewReader(v.Encode())
@@ -53,68 +87,100 @@ func (c *Client) issueRequest(path, method string, params map[string][]string) (
 	}
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Add("Accept", "application/json")
+	requestIDHeader, err := config.GetString("request-id-header")
+	if err == nil && requestIDHeader != "" {
+		req.Header.Add(requestIDHeader, requestID)
+	}
 	req.SetBasicAuth(c.username, c.password)
-	return http.DefaultClient.Do(req)
+	req.Close = true
+	t0 := time.Now()
+	resp, err := net.Dial5Full300ClientNoKeepAlive.Do(req)
+	requestLatencies.WithLabelValues(c.serviceName).Observe(time.Since(t0).Seconds())
+	if err != nil {
+		requestErrors.WithLabelValues(c.serviceName).Inc()
+	}
+	return resp, err
 }
 
 func (c *Client) jsonFromResponse(resp *http.Response, v interface{}) error {
-	log.Debug("Parsing response json...")
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Errorf("Got error while parsing json: %s", err)
+		log.Errorf("Got error while parsing service json: %s", err)
 		return err
 	}
 	return json.Unmarshal(body, &v)
 }
 
-func (c *Client) Create(instance *ServiceInstance, user string) error {
+func (c *Client) Create(instance *ServiceInstance, user, requestID string) error {
 	var err error
-	log.Debug("Attempting to call creation of service instance " + instance.Name + " at " + instance.ServiceName + " api")
 	var resp *http.Response
 	params := map[string][]string{
-		"name": {instance.Name},
-		"user": {user},
-		"team": {instance.TeamOwner},
+		"name":      {instance.Name},
+		"user":      {user},
+		"team":      {instance.TeamOwner},
+		"requestID": {requestID},
 	}
 	if instance.PlanName != "" {
 		params["plan"] = []string{instance.PlanName}
 	}
-	if resp, err = c.issueRequest("/resources", "POST", params); err == nil && resp.StatusCode < 300 {
-		return nil
+	if instance.Description != "" {
+		params["description"] = []string{instance.Description}
 	}
-	msg := "Failed to create the instance " + instance.Name + ": " + c.buildErrorMessage(err, resp)
-	log.Error(msg)
-	return &errors.HTTP{Code: http.StatusInternalServerError, Message: msg}
+	log.Debugf("Attempting to call creation of service instance for %q, params: %#v", instance.ServiceName, params)
+	resp, err = c.issueRequest("/resources", "POST", params)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode < 300 {
+			return nil
+		}
+		if resp.StatusCode == http.StatusConflict {
+			return ErrInstanceAlreadyExistsInAPI
+		}
+	}
+	err = errors.Wrapf(c.buildErrorMessage(err, resp), "Failed to create the instance %s", instance.Name)
+	return log.WrapError(err)
 }
 
-func (c *Client) Destroy(instance *ServiceInstance) error {
-	log.Debug("Attempting to call destroy of service instance " + instance.Name + " at " + instance.ServiceName + " api")
-	resp, err := c.issueRequest("/resources/"+instance.Name, "DELETE", nil)
-	if err == nil && resp.StatusCode > 299 {
-		msg := "Failed to destroy the instance " + instance.Name + ": " + c.buildErrorMessage(err, resp)
-		log.Error(msg)
-		return &errors.HTTP{Code: http.StatusInternalServerError, Message: msg}
+func (c *Client) Destroy(instance *ServiceInstance, requestID string) error {
+	log.Debugf("Attempting to call destroy of service instance %q at %q api", instance.Name, instance.ServiceName)
+	params := map[string][]string{
+		"requestID": {requestID},
+	}
+	resp, err := c.issueRequest("/resources/"+instance.GetIdentifier(), "DELETE", params)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode > 299 {
+			if resp.StatusCode == http.StatusNotFound {
+				return ErrInstanceNotFoundInAPI
+			}
+			err = errors.Wrapf(c.buildErrorMessage(err, resp), "Failed to destroy the instance %s", instance.Name)
+			return log.WrapError(err)
+		}
 	}
 	return err
 }
 
-func (c *Client) Bind(instance *ServiceInstance, app bind.App, unit bind.Unit) (map[string]string, error) {
-	log.Debugf("Calling bind of instance %q and unit %q at %q API",
-		instance.Name, unit.GetIp(), instance.ServiceName)
+func (c *Client) BindApp(instance *ServiceInstance, app bind.App) (map[string]string, error) {
+	log.Debugf("Calling bind of instance %q and %q app at %q API",
+		instance.Name, app.GetName(), instance.ServiceName)
 	var resp *http.Response
 	params := map[string][]string{
-		"unit-host": {unit.GetIp()},
-		"app-host":  {app.GetIp()},
+		"app-host": {app.GetIp()},
 	}
-	resp, err := c.issueRequest("/resources/"+instance.Name, "POST", params)
+	resp, err := c.issueRequest("/resources/"+instance.GetIdentifier()+"/bind-app", "POST", params)
 	if err != nil {
-		if m, _ := regexp.MatchString("", err.Error()); m {
-			return nil, fmt.Errorf("%s api is down.", instance.Name)
-		}
-		return nil, err
+		return nil, log.WrapError(errors.Wrapf(err, `Failed to bind app %q to service instance "%s/%s"`, app.GetName(), instance.ServiceName, instance.Name))
 	}
-	if err == nil && resp.StatusCode < 300 {
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		resp, err = c.issueRequest("/resources/"+instance.GetIdentifier()+"/bind", "POST", params)
+	}
+	if err != nil {
+		return nil, log.WrapError(errors.Wrapf(err, `Failed to bind app %q to service instance "%s/%s"`, app.GetName(), instance.ServiceName, instance.Name))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 300 {
 		var result map[string]string
 		err = c.jsonFromResponse(resp, &result)
 		if err != nil {
@@ -122,66 +188,132 @@ func (c *Client) Bind(instance *ServiceInstance, app bind.App, unit bind.Unit) (
 		}
 		return result, nil
 	}
-	if resp.StatusCode == http.StatusPreconditionFailed {
-		return nil, &errors.HTTP{Code: resp.StatusCode, Message: "You cannot bind any app to this service instance because it is not ready yet."}
+	switch resp.StatusCode {
+	case http.StatusPreconditionFailed:
+		return nil, ErrInstanceNotReady
+	case http.StatusNotFound:
+		return nil, ErrInstanceNotFoundInAPI
 	}
-	msg := "Failed to bind instance " + instance.Name + " to the unit " + unit.GetIp() + ": " + c.buildErrorMessage(err, resp)
-	log.Error(msg)
-	return nil, &errors.HTTP{Code: http.StatusInternalServerError, Message: msg}
+	err = errors.Wrapf(c.buildErrorMessage(err, resp), `Failed to bind the instance "%s/%s" to the app %q`, instance.ServiceName, instance.Name, app.GetName())
+	return nil, log.WrapError(err)
 }
 
-func (c *Client) Unbind(instance *ServiceInstance, unit bind.Unit) error {
-	log.Debug("Attempting to call unbind of service instance " + instance.Name + " and unit " + unit.GetIp() + " at " + instance.ServiceName + " api")
+func (c *Client) BindUnit(instance *ServiceInstance, app bind.App, unit bind.Unit) error {
+	log.Debugf("Calling bind of instance %q and %q unit at %q API", instance.Name, unit.GetIp(), instance.ServiceName)
 	var resp *http.Response
-	url := "/resources/" + instance.Name + "/hostname/" + unit.GetIp()
-	resp, err := c.issueRequest(url, "DELETE", nil)
-	if err == nil && resp.StatusCode > 299 {
-		msg := fmt.Sprintf("Failed to unbind (%q): %s", url, c.buildErrorMessage(err, resp))
-		log.Error(msg)
-		return &errors.HTTP{Code: http.StatusInternalServerError, Message: msg}
+	params := map[string][]string{
+		"app-host":  {app.GetIp()},
+		"unit-host": {unit.GetIp()},
+	}
+	resp, err := c.issueRequest("/resources/"+instance.GetIdentifier()+"/bind", "POST", params)
+	if err != nil {
+		return log.WrapError(errors.Wrapf(err, `Failed to bind the instance "%s/%s" to the unit %q`, instance.ServiceName, instance.Name, unit.GetIp()))
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusPreconditionFailed:
+		return ErrInstanceNotReady
+	case http.StatusNotFound:
+		return ErrInstanceNotFoundInAPI
+	}
+	if resp.StatusCode > 299 {
+		err = errors.Wrapf(c.buildErrorMessage(err, resp), `Failed to bind the instance "%s/%s" to the unit %q`, instance.ServiceName, instance.Name, unit.GetIp())
+		return log.WrapError(err)
+	}
+	return nil
+}
+
+func (c *Client) UnbindApp(instance *ServiceInstance, app bind.App) error {
+	log.Debugf("Calling unbind of service instance %q and app %q at %q", instance.Name, app.GetName(), instance.ServiceName)
+	var resp *http.Response
+	url := "/resources/" + instance.GetIdentifier() + "/bind-app"
+	params := map[string][]string{
+		"app-host": {app.GetIp()},
+	}
+	resp, err := c.issueRequest(url, "DELETE", params)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode > 299 {
+			if resp.StatusCode == http.StatusNotFound {
+				return ErrInstanceNotFoundInAPI
+			}
+			err = errors.Wrapf(c.buildErrorMessage(err, resp), "Failed to unbind (%q)", url)
+			return log.WrapError(err)
+		}
 	}
 	return err
 }
 
-// Connects into service's api
-// The api should be prepared to receive the request,
-// like below:
-// GET /resources/<name>/status/
-// The service host here is the private ip of the service instance
-// 204 means the service is up, 500 means the service is down
-func (c *Client) Status(instance *ServiceInstance) (string, error) {
-	log.Debug("Attempting to call status of service instance " + instance.Name + " at " + instance.ServiceName + " api")
+func (c *Client) UnbindUnit(instance *ServiceInstance, app bind.App, unit bind.Unit) error {
+	log.Debugf("Calling unbind of service instance %q and unit %q at %q", instance.Name, unit.GetIp(), instance.ServiceName)
+	var resp *http.Response
+	url := "/resources/" + instance.GetIdentifier() + "/bind"
+	params := map[string][]string{
+		"app-host":  {app.GetIp()},
+		"unit-host": {unit.GetIp()},
+	}
+	resp, err := c.issueRequest(url, "DELETE", params)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode > 299 {
+			if resp.StatusCode == http.StatusNotFound {
+				return ErrInstanceNotFoundInAPI
+			}
+			err = errors.Wrapf(c.buildErrorMessage(err, resp), "Failed to unbind (%q)", url)
+			return log.WrapError(err)
+		}
+	}
+	return err
+}
+
+func (c *Client) Status(instance *ServiceInstance, requestID string) (string, error) {
+	log.Debugf("Attempting to call status of service instance %q at %q api", instance.Name, instance.ServiceName)
 	var (
 		resp *http.Response
 		err  error
 	)
-	url := "/resources/" + instance.Name + "/status"
-	if resp, err = c.issueRequest(url, "GET", nil); err == nil {
+	url := "/resources/" + instance.GetIdentifier() + "/status"
+	params := map[string][]string{
+		"requestID": {requestID},
+	}
+	if resp, err = c.issueRequest(url, "GET", params); err == nil {
+		defer resp.Body.Close()
 		switch resp.StatusCode {
-		case 202:
+		case http.StatusOK:
+			var data []byte
+			data, err = ioutil.ReadAll(resp.Body)
+			return string(data), err
+		case http.StatusAccepted:
 			return "pending", nil
-		case 204:
+		case http.StatusNoContent:
 			return "up", nil
-		case 500:
+		case http.StatusNotFound:
+			return "not implemented for this service", nil
+		case http.StatusInternalServerError:
 			return "down", nil
 		}
 	}
-	msg := "Failed to get status of instance " + instance.Name + ": " + c.buildErrorMessage(err, resp)
-	log.Error(msg)
-	err = &errors.HTTP{Code: http.StatusInternalServerError, Message: msg}
-	return "", err
+	err = errors.Wrapf(c.buildErrorMessage(err, resp), "Failed to get status of instance %s", instance.Name)
+	return "", log.WrapError(err)
 }
 
 // Info returns the additional info about a service instance.
 // The api should be prepared to receive the request,
 // like below:
 // GET /resources/<name>
-func (c *Client) Info(instance *ServiceInstance) ([]map[string]string, error) {
-	log.Debug("Attempting to call info of service instance " + instance.Name + " at " + instance.ServiceName + " api")
-	url := "/resources/" + instance.Name
-	resp, err := c.issueRequest(url, "GET", nil)
-	if err != nil || resp.StatusCode != 200 {
+func (c *Client) Info(instance *ServiceInstance, requestID string) ([]map[string]string, error) {
+	log.Debugf("Attempting to call info of service instance %q at %q api", instance.Name, instance.ServiceName)
+	url := "/resources/" + instance.GetIdentifier()
+	params := map[string][]string{
+		"requestID": {requestID},
+	}
+	resp, err := c.issueRequest(url, "GET", params)
+	if err != nil {
 		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil
 	}
 	result := []map[string]string{}
 	err = c.jsonFromResponse(resp, &result)
@@ -195,11 +327,18 @@ func (c *Client) Info(instance *ServiceInstance) ([]map[string]string, error) {
 // The api should be prepared to receive the request,
 // like below:
 // GET /resources/plans
-func (c *Client) Plans() ([]Plan, error) {
+func (c *Client) Plans(requestID string) ([]Plan, error) {
 	url := "/resources/plans"
-	resp, err := c.issueRequest(url, "GET", nil)
-	if err != nil || resp.StatusCode != 200 {
+	params := map[string][]string{
+		"requestID": {requestID},
+	}
+	resp, err := c.issueRequest(url, "GET", params)
+	if err != nil {
 		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil
 	}
 	result := []Plan{}
 	err = c.jsonFromResponse(resp, &result)
@@ -211,13 +350,19 @@ func (c *Client) Plans() ([]Plan, error) {
 
 // Proxy is a proxy between tsuru and the service.
 // This method allow customized service methods.
-func (c *Client) Proxy(method, path string, body io.ReadCloser) (*http.Response, error) {
-	url := strings.TrimRight(c.endpoint, "/") + "/" + strings.Trim(path, "/")
-	req, err := http.NewRequest(method, url, body)
+func (c *Client) Proxy(path string, w http.ResponseWriter, r *http.Request) error {
+	rawurl := strings.TrimRight(c.endpoint, "/") + "/" + strings.Trim(path, "/")
+	url, err := url.Parse(rawurl)
 	if err != nil {
-		log.Errorf("Got error while creating request: %s", err)
-		return nil, err
+		log.Errorf("Got error while creating service proxy url %s: %s", rawurl, err)
+		return err
 	}
-	req.SetBasicAuth(c.username, c.password)
-	return http.DefaultClient.Do(req)
+	director := func(req *http.Request) {
+		req.SetBasicAuth(c.username, c.password)
+		req.Host = url.Host
+		req.URL = url
+	}
+	proxy := &httputil.ReverseProxy{Director: director}
+	proxy.ServeHTTP(w, r)
+	return nil
 }

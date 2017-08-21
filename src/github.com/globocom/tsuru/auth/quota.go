@@ -1,11 +1,11 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package auth
 
 import (
-	"errors"
+	"github.com/pkg/errors"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/quota"
 	"gopkg.in/mgo.v2"
@@ -89,4 +89,18 @@ func ReleaseApp(user *User) error {
 		)
 	}
 	return err
+}
+
+// ChangeQuota redefines the limit of the user. The new limit must be bigger
+// than or equal to the current number of apps of the user. The new limit maybe
+// smaller than 0, which mean that the user should have an unlimited number of
+// apps.
+func ChangeQuota(user *User, limit int) error {
+	if limit < 0 {
+		limit = -1
+	} else if limit < user.Quota.InUse {
+		return errors.New("new limit is lesser than the current allocated value")
+	}
+	user.Quota.Limit = limit
+	return user.Update()
 }

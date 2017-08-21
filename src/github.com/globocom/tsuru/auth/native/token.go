@@ -5,18 +5,21 @@
 package native
 
 import (
-	"code.google.com/p/go.crypto/bcrypt"
 	"crypto"
 	"crypto/rand"
-	"errors"
 	"fmt"
+	"time"
+
+	"github.com/pkg/errors"
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/db"
 	tsuruErrors "github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/permission"
 	"github.com/tsuru/tsuru/validation"
+	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	"time"
 )
 
 const (
@@ -60,10 +63,15 @@ func (t *Token) GetAppName() string {
 	return t.AppName
 }
 
+func (t *Token) Permissions() ([]permission.Permission, error) {
+	return auth.BaseTokenPermission(t)
+}
+
 func loadConfig() error {
 	if cost == 0 && tokenExpire == 0 {
 		var err error
-		if days, err := config.GetInt("auth:token-expire-days"); err == nil {
+		var days int
+		if days, err = config.GetInt("auth:token-expire-days"); err == nil {
 			tokenExpire = time.Duration(int64(days) * 24 * int64(time.Hour))
 		} else {
 			tokenExpire = defaultExpiration
@@ -72,7 +80,7 @@ func loadConfig() error {
 			cost = bcrypt.DefaultCost
 		}
 		if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
-			return fmt.Errorf("Invalid value for setting %q: it must be between %d and %d.", "auth:hash-cost", bcrypt.MinCost, bcrypt.MaxCost)
+			return errors.Errorf("Invalid value for setting %q: it must be between %d and %d.", "auth:hash-cost", bcrypt.MinCost, bcrypt.MaxCost)
 		}
 	}
 	return nil
@@ -138,7 +146,8 @@ func removeOldTokens(userEmail string) error {
 		return nil
 	}
 	var tokens []map[string]interface{}
-	err = conn.Tokens().Find(bson.M{"useremail": userEmail}).Select(bson.M{"_id": 1}).Limit(diff).All(&tokens)
+	err = conn.Tokens().Find(bson.M{"useremail": userEmail}).
+		Select(bson.M{"_id": 1}).Sort("creation").Limit(diff).All(&tokens)
 	if err != nil {
 		return nil
 	}
@@ -194,9 +203,12 @@ func getToken(header string) (*Token, error) {
 	}
 	err = conn.Tokens().Find(bson.M{"token": token}).One(&t)
 	if err != nil {
-		return nil, auth.ErrInvalidToken
+		if err == mgo.ErrNotFound {
+			return nil, auth.ErrInvalidToken
+		}
+		return nil, err
 	}
-	if t.Creation.Add(t.Expires).Sub(time.Now()) < 1 {
+	if t.Expires > 0 && time.Until(t.Creation.Add(t.Expires)) < 1 {
 		return nil, auth.ErrInvalidToken
 	}
 	return &t, nil
@@ -230,7 +242,7 @@ func createApplicationToken(appName string) (*Token, error) {
 	t := Token{
 		Token:    token(appName, crypto.SHA1),
 		Creation: time.Now(),
-		Expires:  365 * 24 * time.Hour,
+		Expires:  0,
 		AppName:  appName,
 	}
 	err = conn.Tokens().Insert(t)

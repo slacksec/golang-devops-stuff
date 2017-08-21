@@ -5,6 +5,6 @@
 /*
 Package api implements the REST api for tsuru.
 
-It provides the REST api for manage users, teams, apps and services.
+It provides the REST api for managing users, teams, apps and services.
 */
 package api

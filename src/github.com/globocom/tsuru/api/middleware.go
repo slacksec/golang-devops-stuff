@@ -5,35 +5,52 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
+	stdLog "log"
+	"net/http"
+	"os"
+	"reflect"
+	"strconv"
+	"time"
+
+	"github.com/codegangsta/negroni"
+	"github.com/nu7hatch/gouuid"
+	"github.com/pkg/errors"
+	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/api/context"
 	"github.com/tsuru/tsuru/app"
 	"github.com/tsuru/tsuru/auth"
-	"github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/cmd"
+	tsuruErrors "github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/io"
 	"github.com/tsuru/tsuru/log"
-	"net/http"
-	"reflect"
 )
 
 const (
-	tsuruMin      = "0.11.0"
-	craneMin      = "0.5.1"
-	tsuruAdminMin = "0.5.0"
+	tsuruMin      = "1.0.1"
+	craneMin      = "1.0.0"
+	tsuruAdminMin = "1.0.0"
 )
 
 func validate(token string, r *http.Request) (auth.Token, error) {
 	t, err := app.AuthScheme.Auth(token)
 	if err != nil {
-		return nil, fmt.Errorf("Invalid token")
+		t, err = auth.APIAuth(token)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if t.IsAppToken() {
 		if q := r.URL.Query().Get(":app"); q != "" && t.GetAppName() != q {
-			return nil, fmt.Errorf("App token mismatch, token for %q, request for %q", t.GetAppName(), q)
+			return nil, &tsuruErrors.HTTP{
+				Code:    http.StatusForbidden,
+				Message: fmt.Sprintf("app token mismatch, token for %q, request for %q", t.GetAppName(), q),
+			}
 		}
-	} else if user, err := t.User(); err == nil {
+	} else {
 		if q := r.URL.Query().Get(":app"); q != "" {
-			_, err = getApp(q, user)
+			_, err = getAppFromContext(q, r)
 			if err != nil {
 				return nil, err
 			}
@@ -57,6 +74,26 @@ func flushingWriterMiddleware(w http.ResponseWriter, r *http.Request, next http.
 	next(&fw, r)
 }
 
+func setRequestIDHeaderMiddleware(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
+	requestIDHeader, _ := config.GetString("request-id-header")
+	if requestIDHeader == "" {
+		next(w, r)
+		return
+	}
+	requestID := r.Header.Get(requestIDHeader)
+	if requestID == "" {
+		unparsedID, err := uuid.NewV4()
+		if err != nil {
+			log.Errorf("unable to generate request id: %s", err)
+			next(w, r)
+			return
+		}
+		requestID = unparsedID.String()
+	}
+	context.SetRequestID(r, requestIDHeader, requestID)
+	next(w, r)
+}
+
 func setVersionHeadersMiddleware(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	w.Header().Set("Supported-Tsuru", tsuruMin)
 	w.Header().Set("Supported-Crane", craneMin)
@@ -68,17 +105,33 @@ func errorHandlingMiddleware(w http.ResponseWriter, r *http.Request, next http.H
 	next(w, r)
 	err := context.GetRequestError(r)
 	if err != nil {
+		verbosity, _ := strconv.Atoi(r.Header.Get(cmd.VerbosityHeader))
 		code := http.StatusInternalServerError
-		if e, ok := err.(*errors.HTTP); ok {
-			code = e.Code
+		switch t := errors.Cause(err).(type) {
+		case *tsuruErrors.ValidationError:
+			code = http.StatusBadRequest
+		case *tsuruErrors.HTTP:
+			code = t.Code
+		}
+		if verbosity == 0 {
+			err = fmt.Errorf("%s", err)
+		} else {
+			err = fmt.Errorf("%+v", err)
 		}
 		flushing, ok := w.(*io.FlushingWriter)
 		if ok && flushing.Wrote() {
-			fmt.Fprintln(w, err)
+			if w.Header().Get("Content-Type") == "application/x-json-stream" {
+				data, marshalErr := json.Marshal(io.SimpleJsonMessage{Error: err.Error()})
+				if marshalErr == nil {
+					w.Write(append(data, "\n"...))
+				}
+			} else {
+				fmt.Fprintln(w, err)
+			}
 		} else {
 			http.Error(w, err.Error(), code)
 		}
-		log.Error(err.Error())
+		log.Errorf("failure running HTTP request %s %s (%d): %s", r.Method, r.URL.Path, code, err)
 	}
 }
 
@@ -87,7 +140,7 @@ func authTokenMiddleware(w http.ResponseWriter, r *http.Request, next http.Handl
 	if token != "" {
 		t, err := validate(token, r)
 		if err != nil {
-			if _, ok := err.(*errors.HTTP); ok {
+			if err != auth.ErrInvalidToken {
 				context.AddRequestError(r, err)
 				return
 			}
@@ -102,6 +155,8 @@ func authTokenMiddleware(w http.ResponseWriter, r *http.Request, next http.Handl
 type appLockMiddleware struct {
 	excludedHandlers []http.Handler
 }
+
+var lockWaitDuration time.Duration = 10 * time.Second
 
 func (m *appLockMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	if r.Method == "GET" {
@@ -135,9 +190,14 @@ func (m *appLockMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, ne
 			owner = t.GetUserName()
 		}
 	}
-	ok, err := app.AcquireApplicationLock(appName, owner, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
+	_, err := app.GetByName(appName)
+	if err == app.ErrAppNotFound {
+		context.AddRequestError(r, &tsuruErrors.HTTP{Code: http.StatusNotFound, Message: err.Error()})
+		return
+	}
+	ok, err := app.AcquireApplicationLockWait(appName, owner, fmt.Sprintf("%s %s", r.Method, r.URL.Path), lockWaitDuration)
 	if err != nil {
-		context.AddRequestError(r, fmt.Errorf("Error trying to acquire application lock: %s", err))
+		context.AddRequestError(r, errors.Wrap(err, "Error trying to acquire application lock"))
 		return
 	}
 	if ok {
@@ -150,23 +210,22 @@ func (m *appLockMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, ne
 		return
 	}
 	a, err := app.GetByName(appName)
-	httpErr := &errors.HTTP{Code: http.StatusInternalServerError}
 	if err != nil {
 		if err == app.ErrAppNotFound {
-			httpErr.Code = http.StatusNotFound
-			httpErr.Message = err.Error()
+			err = &tsuruErrors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
 		} else {
-			httpErr.Message = fmt.Sprintf("Error to get application: %s", err)
+			err = errors.Wrap(err, "Error to get application")
 		}
 	} else {
-		httpErr.Code = http.StatusConflict
+		httpErr := &tsuruErrors.HTTP{Code: http.StatusConflict}
 		if a.Lock.Locked {
-			httpErr.Message = fmt.Sprintf("%s", &a.Lock)
+			httpErr.Message = a.Lock.String()
 		} else {
 			httpErr.Message = "Not locked anymore, please try again."
 		}
+		err = httpErr
 	}
-	context.AddRequestError(r, httpErr)
+	context.AddRequestError(r, err)
 }
 
 func runDelayedHandler(w http.ResponseWriter, r *http.Request) {
@@ -174,4 +233,34 @@ func runDelayedHandler(w http.ResponseWriter, r *http.Request) {
 	if h != nil {
 		h.ServeHTTP(w, r)
 	}
+}
+
+type loggerMiddleware struct {
+	logger *stdLog.Logger
+}
+
+func newLoggerMiddleware() *loggerMiddleware {
+	return &loggerMiddleware{
+		logger: stdLog.New(os.Stdout, "", 0),
+	}
+}
+
+func (l *loggerMiddleware) ServeHTTP(rw http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
+	start := time.Now()
+	next(rw, r)
+	duration := time.Since(start)
+	statusCode := rw.(negroni.ResponseWriter).Status()
+	if statusCode == 0 {
+		statusCode = 200
+	}
+	nowFormatted := time.Now().Format(time.RFC3339Nano)
+	requestIDHeader, _ := config.GetString("request-id-header")
+	var requestID string
+	if requestIDHeader != "" {
+		requestID = context.GetRequestID(r, requestIDHeader)
+		if requestID != "" {
+			requestID = fmt.Sprintf(" [%s: %s]", requestIDHeader, requestID)
+		}
+	}
+	l.logger.Printf("%s %s %s %d in %0.6fms%s", nowFormatted, r.Method, r.URL.Path, statusCode, float64(duration)/float64(time.Millisecond), requestID)
 }

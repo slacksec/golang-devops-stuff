@@ -5,22 +5,37 @@
 package oauth
 
 import (
-	goauth2 "code.google.com/p/goauth2/oauth"
 	"encoding/json"
+	"io/ioutil"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/auth/native"
 	tsuruErrors "github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/log"
-	"net/http"
-	"strconv"
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
 )
 
 var (
 	ErrMissingCodeError       = &tsuruErrors.ValidationError{Message: "You must provide code to login"}
-	ErrMissingCodeRedirectUrl = &tsuruErrors.ValidationError{Message: "You must provide the used redirect url to login"}
+	ErrMissingCodeRedirectURL = &tsuruErrors.ValidationError{Message: "You must provide the used redirect url to login"}
 	ErrEmptyAccessToken       = &tsuruErrors.NotAuthorizedError{Message: "Couldn't convert code to access token."}
 	ErrEmptyUserEmail         = &tsuruErrors.NotAuthorizedError{Message: "Couldn't parse user email."}
+
+	requestLatencies = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "tsuru_oauth_request_duration_seconds",
+		Help: "The oauth requests latency distributions.",
+	})
+	requestErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tsuru_oauth_request_errors_total",
+		Help: "The total number of oauth request errors.",
+	})
 )
 
 type OAuthParser interface {
@@ -28,80 +43,28 @@ type OAuthParser interface {
 }
 
 type OAuthScheme struct {
-	BaseConfig   goauth2.Config
-	InfoUrl      string
+	BaseConfig   oauth2.Config
+	InfoURL      string
 	CallbackPort int
 	Parser       OAuthParser
 }
 
-type DBTokenCache struct {
-	scheme *OAuthScheme
-}
-
-func (c *DBTokenCache) Token() (*goauth2.Token, error) {
-	return nil, nil
-}
-
-func (c *DBTokenCache) PutToken(t *goauth2.Token) error {
-	if t.AccessToken == "" {
-		return ErrEmptyAccessToken
-	}
-	var email string
-	if t.Extra == nil || t.Extra["email"] == "" {
-		conf, err := c.scheme.loadConfig()
-		if err != nil {
-			return err
-		}
-		transport := &goauth2.Transport{Config: &conf}
-		transport.Token = t
-		client := transport.Client()
-		response, err := client.Get(c.scheme.InfoUrl)
-		if err != nil {
-			return err
-		}
-		email, err = c.scheme.Parser.Parse(response)
-		if email == "" {
-			return ErrEmptyUserEmail
-		}
-		user, err := auth.GetUserByEmail(email)
-		if err != nil {
-			if err != auth.ErrUserNotFound {
-				return err
-			}
-			registrationEnabled, _ := config.GetBool("auth:user-registration")
-			if !registrationEnabled {
-				return err
-			}
-			user = &auth.User{Email: email}
-			err := user.Create()
-			if err != nil {
-				return err
-			}
-		}
-		err = user.CreateOnGandalf()
-		if err != nil {
-			log.Errorf("Ignored error trying to create user on gandalf: %s", err.Error())
-		}
-		t.Extra = make(map[string]string)
-		t.Extra["email"] = email
-	}
-	return makeToken(t).save()
-}
-
 func init() {
 	auth.RegisterScheme("oauth", &OAuthScheme{})
+	prometheus.MustRegister(requestLatencies)
+	prometheus.MustRegister(requestErrors)
 }
 
 // This method loads basic config and returns a copy of the
 // config object.
-func (s *OAuthScheme) loadConfig() (goauth2.Config, error) {
-	if s.BaseConfig.ClientId != "" {
+func (s *OAuthScheme) loadConfig() (oauth2.Config, error) {
+	if s.BaseConfig.ClientID != "" {
 		return s.BaseConfig, nil
 	}
 	if s.Parser == nil {
 		s.Parser = s
 	}
-	var emptyConfig goauth2.Config
+	var emptyConfig oauth2.Config
 	clientId, err := config.GetString("auth:oauth:client-id")
 	if err != nil {
 		return emptyConfig, err
@@ -130,21 +93,22 @@ func (s *OAuthScheme) loadConfig() (goauth2.Config, error) {
 	if err != nil {
 		log.Debugf("auth:oauth:callback-port not found using random port: %s", err)
 	}
-	s.InfoUrl = infoURL
+	s.InfoURL = infoURL
 	s.CallbackPort = callbackPort
-	s.BaseConfig = goauth2.Config{
-		ClientId:     clientId,
+	s.BaseConfig = oauth2.Config{
+		ClientID:     clientId,
 		ClientSecret: clientSecret,
-		Scope:        scope,
-		AuthURL:      authURL,
-		TokenURL:     tokenURL,
-		TokenCache:   &DBTokenCache{s},
+		Scopes:       []string{scope},
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  authURL,
+			TokenURL: tokenURL,
+		},
 	}
 	return s.BaseConfig, nil
 }
 
 func (s *OAuthScheme) Login(params map[string]string) (auth.Token, error) {
-	config, err := s.loadConfig()
+	conf, err := s.loadConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -152,22 +116,73 @@ func (s *OAuthScheme) Login(params map[string]string) (auth.Token, error) {
 	if !ok {
 		return nil, ErrMissingCodeError
 	}
-	redirectUrl, ok := params["redirectUrl"]
+	redirectURL, ok := params["redirectUrl"]
 	if !ok {
-		return nil, ErrMissingCodeRedirectUrl
+		return nil, ErrMissingCodeRedirectURL
 	}
-	config.RedirectURL = redirectUrl
-	transport := &goauth2.Transport{Config: &config}
-	oauthToken, err := transport.Exchange(code)
+	conf.RedirectURL = redirectURL
+	oauthToken, err := conf.Exchange(context.Background(), code)
 	if err != nil {
 		return nil, err
 	}
-	return makeToken(oauthToken), nil
+	return s.handleToken(oauthToken)
+}
+
+func (s *OAuthScheme) handleToken(t *oauth2.Token) (*Token, error) {
+	if t.AccessToken == "" {
+		return nil, ErrEmptyAccessToken
+	}
+	conf, err := s.loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	client := conf.Client(context.Background(), t)
+	t0 := time.Now()
+	response, err := client.Get(s.InfoURL)
+	requestLatencies.Observe(time.Since(t0).Seconds())
+	if err != nil {
+		requestErrors.Inc()
+		return nil, err
+	}
+	defer response.Body.Close()
+	email, err := s.Parser.Parse(response)
+	if err != nil {
+		return nil, err
+	}
+	if email == "" {
+		return nil, ErrEmptyUserEmail
+	}
+	_, err = auth.GetUserByEmail(email)
+	if err != nil {
+		if err != auth.ErrUserNotFound {
+			return nil, err
+		}
+		registrationEnabled, _ := config.GetBool("auth:user-registration")
+		if !registrationEnabled {
+			return nil, err
+		}
+		user := &auth.User{Email: email}
+		err = user.Create()
+		if err != nil {
+			return nil, err
+		}
+	}
+	token := Token{*t, email}
+	err = token.save()
+	if err != nil {
+		return nil, err
+	}
+	return &token, nil
 }
 
 func (s *OAuthScheme) AppLogin(appName string) (auth.Token, error) {
 	nativeScheme := native.NativeScheme{}
 	return nativeScheme.AppLogin(appName)
+}
+
+func (s *OAuthScheme) AppLogout(token string) error {
+	nativeScheme := native.NativeScheme{}
+	return nativeScheme.AppLogout(token)
 }
 
 func (s *OAuthScheme) Logout(token string) error {
@@ -188,14 +203,16 @@ func (s *OAuthScheme) Auth(header string) (auth.Token, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport := goauth2.Transport{Config: &config}
-	transport.Token = &token.Token
-	client := transport.Client()
-	_, err = client.Get(s.InfoUrl)
+	client := config.Client(context.Background(), &token.Token)
+	t0 := time.Now()
+	rsp, err := client.Get(s.InfoURL)
+	requestLatencies.Observe(time.Since(t0).Seconds())
 	if err != nil {
+		requestErrors.Inc()
 		return nil, err
 	}
-	return makeToken(transport.Token), nil
+	defer rsp.Body.Close()
+	return token, nil
 }
 
 func (s *OAuthScheme) Name() string {
@@ -215,14 +232,22 @@ func (s *OAuthScheme) Parse(infoResponse *http.Response) (string, error) {
 	user := struct {
 		Email string `json:"email"`
 	}{}
-	err := json.NewDecoder(infoResponse.Body).Decode(&user)
+	data, err := ioutil.ReadAll(infoResponse.Body)
 	if err != nil {
-		return user.Email, err
+		return "", errors.Wrap(err, "unable to read user data response")
+	}
+	if infoResponse.StatusCode != http.StatusOK {
+		return "", errors.Errorf("unexpected user data response %d: %s", infoResponse.StatusCode, data)
+	}
+	err = json.Unmarshal(data, &user)
+	if err != nil {
+		return "", errors.Wrapf(err, "unable to parse user data: %s", data)
 	}
 	return user.Email, nil
 }
 
 func (s *OAuthScheme) Create(user *auth.User) (*auth.User, error) {
+	user.Password = ""
 	err := user.Create()
 	if err != nil {
 		return nil, err
@@ -230,12 +255,8 @@ func (s *OAuthScheme) Create(user *auth.User) (*auth.User, error) {
 	return user, nil
 }
 
-func (s *OAuthScheme) Remove(token auth.Token) error {
-	u, err := token.User()
-	if err != nil {
-		return err
-	}
-	err = deleteAllTokens(u.Email)
+func (s *OAuthScheme) Remove(u *auth.User) error {
+	err := deleteAllTokens(u.Email)
 	if err != nil {
 		return err
 	}

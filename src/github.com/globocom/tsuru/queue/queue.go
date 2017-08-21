@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -8,53 +8,110 @@
 package queue
 
 import (
-	"fmt"
+	"context"
+	"sync"
+	"time"
+
+	"github.com/pkg/errors"
 	"github.com/tsuru/config"
+	"github.com/tsuru/monsterqueue"
+	"github.com/tsuru/monsterqueue/mongodb"
+	"github.com/tsuru/tsuru/api/shutdown"
 )
 
-// PubSubQ represents an implementation that allows Publishing and
-// Subscribing messages.
-type PubSubQ interface {
-	// Publishes a message using the underlaying queue server.
-	Pub(msg []byte) error
-
-	// Returns a channel that will yield every message published to this
-	// queue.
-	Sub() (chan []byte, error)
-
-	// Unsubscribe the queue, this should make sure the channel returned
-	// by Sub() is closed.
-	UnSub() error
+type queueInstanceData struct {
+	sync.RWMutex
+	instance monsterqueue.Queue
 }
 
-// QFactory manages queues. It's able to create new queue and handler
-// instances.
-type QFactory interface {
-	// Get returns a queue instance, identified by the given name.
-	Get(name string) (PubSubQ, error)
+func (q *queueInstanceData) Shutdown(ctx context.Context) error {
+	q.Lock()
+	defer q.Unlock()
+	if q.instance != nil {
+		q.instance.Stop()
+		q.instance = nil
+	}
+	return nil
 }
 
-var factories = map[string]QFactory{
-	"redis": &redismqQFactory{},
+func (q *queueInstanceData) String() string {
+	return "queued tasks"
 }
 
-// Register registers a new queue factory. This is how one would add a new
-// queue to tsuru.
-func Register(name string, factory QFactory) {
-	factories[name] = factory
+var queueData queueInstanceData
+
+func ResetQueue() {
+	queueData.Lock()
+	defer queueData.Unlock()
+	if queueData.instance != nil {
+		queueData.instance.Stop()
+		queueData.instance.ResetStorage()
+		queueData.instance = nil
+	}
 }
 
-// Factory returns an instance of the QFactory used in tsuru. It reads tsuru
-// configuration to find the currently used queue system and returns an
-// instance of the configured system, if it's registered. Otherwise it
-// will return an error.
-func Factory() (QFactory, error) {
-	name, err := config.GetString("queue")
+func TestingWaitQueueTasks(n int, timeout time.Duration) error {
+	queueData.Lock()
+	defer queueData.Unlock()
+	if queueData.instance != nil {
+		timeoutCh := time.After(timeout)
+		for {
+			jobs, _ := queueData.instance.ListJobs()
+			runningCount := 0
+			for _, j := range jobs {
+				if j.Status().State != monsterqueue.JobStateEnqueued {
+					runningCount++
+				}
+			}
+			if n <= runningCount {
+				break
+			}
+			select {
+			case <-timeoutCh:
+				return errors.Errorf("timeout waiting for task after %v", timeout)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		queueData.instance.Stop()
+		queueData.instance.ResetStorage()
+		queueData.instance = nil
+	}
+	return nil
+}
+
+func Queue() (monsterqueue.Queue, error) {
+	queueData.RLock()
+	if queueData.instance != nil {
+		defer queueData.RUnlock()
+		return queueData.instance, nil
+	}
+	queueData.RUnlock()
+	queueData.Lock()
+	defer queueData.Unlock()
+	if queueData.instance != nil {
+		return queueData.instance, nil
+	}
+	queueMongoURL, _ := config.GetString("queue:mongo-url")
+	if queueMongoURL == "" {
+		queueMongoURL = "localhost:27017"
+	}
+	queueMongoDB, _ := config.GetString("queue:mongo-database")
+	pollingInterval, _ := config.GetFloat("queue:mongo-polling-interval")
+	if pollingInterval == 0.0 {
+		pollingInterval = 1.0
+	}
+	conf := mongodb.QueueConfig{
+		CollectionPrefix: "tsuru",
+		Url:              queueMongoURL,
+		Database:         queueMongoDB,
+		PollingInterval:  time.Duration(pollingInterval * float64(time.Second)),
+	}
+	var err error
+	queueData.instance, err = mongodb.NewQueue(conf)
 	if err != nil {
-		name = "redis"
+		return nil, errors.Wrap(err, "could not create queue instance, please check queue:mongo-url and queue:mongo-database config entries. error")
 	}
-	if f, ok := factories[name]; ok {
-		return f, nil
-	}
-	return nil, fmt.Errorf("Queue %q is not known.", name)
+	shutdown.Register(&queueData)
+	go queueData.instance.ProcessLoop()
+	return queueData.instance, nil
 }

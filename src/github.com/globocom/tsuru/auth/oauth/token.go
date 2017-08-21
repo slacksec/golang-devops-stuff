@@ -5,17 +5,19 @@
 package oauth
 
 import (
-	goauth2 "code.google.com/p/goauth2/oauth"
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/db/storage"
 	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/permission"
+	"golang.org/x/oauth2"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
 
 type Token struct {
-	goauth2.Token
+	oauth2.Token
 	UserEmail string `json:"email"`
 }
 
@@ -39,8 +41,8 @@ func (t *Token) GetAppName() string {
 	return ""
 }
 
-func makeToken(t *goauth2.Token) *Token {
-	return &Token{*t, t.Extra["email"]}
+func (t *Token) Permissions() ([]permission.Permission, error) {
+	return auth.BaseTokenPermission(t)
 }
 
 func getToken(header string) (*Token, error) {
@@ -58,7 +60,10 @@ func getToken(header string) (*Token, error) {
 	defer coll.Close()
 	err = coll.Find(bson.M{"token.accesstoken": token}).One(&t)
 	if err != nil {
-		return nil, auth.ErrInvalidToken
+		if err == mgo.ErrNotFound {
+			return nil, auth.ErrInvalidToken
+		}
+		return nil, err
 	}
 	return &t, nil
 }
@@ -92,5 +97,7 @@ func collection() *storage.Collection {
 	if err != nil {
 		log.Errorf("Failed to connect to the database: %s", err)
 	}
-	return conn.Collection(name)
+	coll := conn.Collection(name)
+	coll.EnsureIndex(mgo.Index{Key: []string{"token.accesstoken"}})
+	return coll
 }

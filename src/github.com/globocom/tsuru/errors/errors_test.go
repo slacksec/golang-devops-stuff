@@ -1,26 +1,36 @@
-// Copyright 2013 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package errors
 
 import (
-	"launchpad.net/gocheck"
+	"errors"
+	"fmt"
 	"testing"
+
+	pkgErrors "github.com/pkg/errors"
+	"gopkg.in/check.v1"
 )
 
-func Test(t *testing.T) { gocheck.TestingT(t) }
+func Test(t *testing.T) { check.TestingT(t) }
 
 type S struct{}
 
-var _ = gocheck.Suite(&S{})
+var _ = check.Suite(&S{})
 
-func (s *S) TestHTTPError(c *gocheck.C) {
+func (s *S) TestHTTPError(c *check.C) {
 	e := HTTP{500, "Internal server error"}
-	c.Assert(e.Error(), gocheck.Equals, e.Message)
+	c.Assert(e.Error(), check.Equals, e.Message)
 }
 
-func (s *S) TestValidationError(c *gocheck.C) {
+func (s *S) TestValidationError(c *check.C) {
 	e := ValidationError{Message: "something"}
-	c.Assert(e.Error(), gocheck.Equals, "something")
+	c.Assert(e.Error(), check.Equals, "something")
+}
+
+func (s *S) TestMultiErrorFormat(c *check.C) {
+	cause := errors.New("root error")
+	e := NewMultiError(errors.New("error 1"), pkgErrors.WithStack(cause))
+	c.Assert(fmt.Sprintf("%s", e), check.Equals, "error 1 root error")
 }

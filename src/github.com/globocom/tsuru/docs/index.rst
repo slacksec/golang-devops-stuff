@@ -1,4 +1,4 @@
-.. Copyright 2014 tsuru authors. All rights reserved.
+.. Copyright 2012 tsuru authors. All rights reserved.
    Use of this source code is governed by a BSD-style
    license that can be found in the LICENSE file.
 
@@ -9,7 +9,7 @@ Welcome
 =======
 
 tsuru is an open source PaaS that makes it easy and fast to deploy and manage applications
-on your own servers. 
+on your own servers.
 
 To get started, first read :ref:`understanding tsuru <understanding>`.
 
@@ -20,8 +20,11 @@ To get started, first read :ref:`understanding tsuru <understanding>`.
     installing/index
     managing/index
     using/index
-    contributing/index
     services/index
+    advanced_topics/index
+    contributing/index
     reference/index
     faq
     releases/index
+    experimental/index
+    roadmap

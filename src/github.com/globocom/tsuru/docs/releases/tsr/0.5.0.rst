@@ -1,14 +1,18 @@
+.. Copyright 2014 tsuru authors. All rights reserved.
+   Use of this source code is governed by a BSD-style
+   license that can be found in the LICENSE file.
+
 =======================
 tsr 0.5.0 release notes
 =======================
 
 Welcome to tsr 0.5.0!
 
-These release notes cover the `new features`_ and `backwards incompatible
-changes`_ you'll want to be aware of when upgrading from tsr 0.4.0 or older
-versions.
+These release notes cover the :ref:`new features <new-0.5.0>` and
+:ref:`backwards incompatible changes <backwards-0.5.0>` you'll want to be aware
+of when upgrading from tsr 0.4.0 or older versions.
 
-.. _`new features`: `What's new in tsr 0.5.0`_
+.. _new-0.5.0:
 
 What's new in tsr 0.5.0
 =======================
@@ -69,9 +73,11 @@ Other features
 Platforms
 ---------
 
-* :doc:`deployment hooks </using/deploy-hooks>` support for static and PHP applications (`#607
+* :ref:`deployment hooks <yaml_deployment_hooks>` support for static and PHP applications (`#607
   <https://github.com/tsuru/tsuru/issues/607>`_)
 * new platform: buildpack (used for buildpack support)
+
+.. _backwards-0.5.0:
 
 Backwards incompatible changes
 ==============================
@@ -84,7 +90,7 @@ Backwards incompatible changes
 * The field ``units`` was removed from the collection ``apps``. Information
   about units are now available in the provisioner.
   Now the unit state is controlled by provisioner. If you are upgrading tsuru
-  from 0.4.0 or an older version you should run the MongoDB script bellow,
+  from 0.4.0 or an older version you should run the MongoDB script below,
   where the `docker` collection name is the name configured by
   `docker:collection` in `tsuru.conf`:
 
@@ -101,7 +107,7 @@ Backwards incompatible changes
     db.apps.find().forEach(migration);
 
 * The scheduler collection has changed to group nodes by pool. If you are using
-  this scheduler you shoul run the MongoDB script bellow:
+  this scheduler you shoul run the MongoDB script below:
 
 .. highlight:: javascript
 

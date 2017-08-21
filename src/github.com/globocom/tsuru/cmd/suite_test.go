@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,33 +6,32 @@ package cmd
 
 import (
 	"bytes"
-	tTesting "github.com/tsuru/tsuru/testing"
-	"launchpad.net/gocheck"
 	"os"
 	"testing"
+
+	"gopkg.in/check.v1"
 )
 
-func Test(t *testing.T) { gocheck.TestingT(t) }
+func Test(t *testing.T) { check.TestingT(t) }
 
-type S struct {
-	stdin   *os.File
-	recover []string
-}
+type S struct{}
 
-var _ = gocheck.Suite(&S{})
-var manager *Manager
+var _ = check.Suite(&S{})
+var globalManager *Manager
 
-func (s *S) SetUpSuite(c *gocheck.C) {
-	s.recover = tTesting.SetTargetFile(c, []byte("http://localhost"))
-}
-
-func (s *S) TearDownSuite(c *gocheck.C) {
-	tTesting.RollbackFile(s.recover)
-}
-
-func (s *S) SetUpTest(c *gocheck.C) {
+func (s *S) SetUpTest(c *check.C) {
 	var stdout, stderr bytes.Buffer
-	manager = NewManager("glb", "1.0", "", &stdout, &stderr, os.Stdin, nil)
+	globalManager = NewManager("glb", "1.0", "", &stdout, &stderr, os.Stdin, nil)
 	var exiter recordingExiter
-	manager.e = &exiter
+	globalManager.e = &exiter
+	os.Setenv("TSURU_TARGET", "http://localhost")
+	os.Setenv("TSURU_TOKEN", "abc123")
+	if env := os.Getenv("TERM"); env == "" {
+		os.Setenv("TERM", "tsuruterm")
+	}
+}
+
+func (s *S) TearDownTest(c *check.C) {
+	os.Unsetenv("TSURU_TARGET")
+	os.Unsetenv("TSURU_TOKEN")
 }

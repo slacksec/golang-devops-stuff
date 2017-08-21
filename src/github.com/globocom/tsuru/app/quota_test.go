@@ -1,74 +1,80 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2013 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package app
 
 import (
-	"github.com/tsuru/tsuru/quota"
-	"gopkg.in/mgo.v2/bson"
-	"launchpad.net/gocheck"
 	"runtime"
 	"sync"
+
+	"github.com/tsuru/tsuru/quota"
+	"gopkg.in/check.v1"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
-func (s *S) TestReserveUnits(c *gocheck.C) {
+func (s *S) TestReserveUnits(c *check.C) {
 	app := &App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 7},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 7},
+		Router: "fake",
 	}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
 	err := reserveUnits(app, 6)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	app, err = GetByName(app.Name)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(app.Quota.InUse, gocheck.Equals, 6)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 6)
 }
 
-func (s *S) TestReserveUnitsAppNotFound(c *gocheck.C) {
+func (s *S) TestReserveUnitsAppNotFound(c *check.C) {
 	app := App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 7},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 7},
+		Router: "fake",
 	}
 	err := reserveUnits(&app, 6)
-	c.Assert(err, gocheck.Equals, ErrAppNotFound)
+	c.Assert(err, check.Equals, ErrAppNotFound)
 }
 
-func (s *S) TestReserveUnitsQuotaExceeded(c *gocheck.C) {
+func (s *S) TestReserveUnitsQuotaExceeded(c *check.C) {
 	app := App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 7},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 7},
+		Router: "fake",
 	}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
 	err := reserveUnits(&app, 6)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	err = reserveUnits(&app, 2)
-	c.Assert(err, gocheck.NotNil)
+	c.Assert(err, check.NotNil)
 	e, ok := err.(*quota.QuotaExceededError)
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(e.Requested, gocheck.Equals, uint(2))
-	c.Assert(e.Available, gocheck.Equals, uint(1))
+	c.Assert(ok, check.Equals, true)
+	c.Assert(e.Requested, check.Equals, uint(2))
+	c.Assert(e.Available, check.Equals, uint(1))
 }
 
-func (s *S) TestReserveUnitsUnlimitedQuota(c *gocheck.C) {
-	app := &App{Name: "together", Quota: quota.Unlimited}
+func (s *S) TestReserveUnitsUnlimitedQuota(c *check.C) {
+	app := &App{Name: "together", Quota: quota.Unlimited, Router: "fake"}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
 	err := reserveUnits(app, 6)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	app, err = GetByName(app.Name)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(app.Quota.InUse, gocheck.Equals, 6)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 6)
 }
 
-func (s *S) TestReserveUnitsIsAtomic(c *gocheck.C) {
+func (s *S) TestReserveUnitsIsAtomic(c *check.C) {
 	ncpu := runtime.NumCPU()
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(ncpu))
 	app := &App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 40},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 40},
+		Router: "fake",
 	}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
@@ -82,42 +88,45 @@ func (s *S) TestReserveUnitsIsAtomic(c *gocheck.C) {
 	}
 	wg.Wait()
 	app, err := GetByName(app.Name)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(app.Quota.InUse, gocheck.Equals, 39)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 39)
 }
 
-func (s *S) TestReleaseUnits(c *gocheck.C) {
+func (s *S) TestReleaseUnits(c *check.C) {
 	app := &App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 7, InUse: 7},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 7, InUse: 7},
+		Router: "fake",
 	}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
 	err := releaseUnits(app, 6)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
 	app, err = GetByName(app.Name)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(app.Quota.InUse, gocheck.Equals, 1)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 1)
 }
 
-func (s *S) TestReleaseUnreservedUnits(c *gocheck.C) {
+func (s *S) TestReleaseUnreservedUnits(c *check.C) {
 	app := App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 7, InUse: 7},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 7, InUse: 7},
+		Router: "fake",
 	}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
 	err := releaseUnits(&app, 8)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err.Error(), gocheck.Equals, "Not enough reserved units")
+	c.Assert(err, check.NotNil)
+	c.Assert(err.Error(), check.Equals, "Not enough reserved units")
 }
 
-func (s *S) TestReleaseUnitsIsAtomic(c *gocheck.C) {
+func (s *S) TestReleaseUnitsIsAtomic(c *check.C) {
 	ncpu := runtime.NumCPU()
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(ncpu))
 	app := &App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 40, InUse: 40},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 40, InUse: 40},
+		Router: "fake",
 	}
 	s.conn.Apps().Insert(app)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
@@ -131,15 +140,72 @@ func (s *S) TestReleaseUnitsIsAtomic(c *gocheck.C) {
 	}
 	wg.Wait()
 	app, err := GetByName(app.Name)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(app.Quota.InUse, gocheck.Equals, 1)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 1)
 }
 
-func (s *S) TestReleaseUnitsAppNotFound(c *gocheck.C) {
+func (s *S) TestReleaseUnitsAppNotFound(c *check.C) {
 	app := App{
-		Name:  "together",
-		Quota: quota.Quota{Limit: 7, InUse: 7},
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 7, InUse: 7},
+		Router: "fake",
 	}
 	err := releaseUnits(&app, 6)
-	c.Assert(err, gocheck.Equals, ErrAppNotFound)
+	c.Assert(err, check.Equals, ErrAppNotFound)
+}
+
+func (s *S) TestChangeQuota(c *check.C) {
+	app := &App{
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 3, InUse: 3},
+		Router: "fake",
+	}
+	s.conn.Apps().Insert(app)
+	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
+	err := ChangeQuota(app, 30)
+	c.Assert(err, check.IsNil)
+	app, err = GetByName(app.Name)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 3)
+	c.Assert(app.Quota.Limit, check.Equals, 30)
+}
+
+func (s *S) TestChangeQuotaUnlimited(c *check.C) {
+	app := &App{
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 3, InUse: 2},
+		Router: "fake",
+	}
+	s.conn.Apps().Insert(app)
+	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
+	err := ChangeQuota(app, -5)
+	c.Assert(err, check.IsNil)
+	app, err = GetByName(app.Name)
+	c.Assert(err, check.IsNil)
+	c.Assert(app.Quota.InUse, check.Equals, 2)
+	c.Assert(app.Quota.Limit, check.Equals, -1)
+}
+
+func (s *S) TestChangeQuotaLessThanInUse(c *check.C) {
+	app := &App{
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 3, InUse: 3},
+		Router: "fake",
+	}
+	s.conn.Apps().Insert(app)
+	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
+	err := ChangeQuota(app, 2)
+	c.Assert(err, check.NotNil)
+	c.Assert(err.Error(), check.Equals, "new limit is lesser than the current allocated value")
+}
+
+func (s *S) TestChangeQuotaAppNotFound(c *check.C) {
+	app := &App{
+		Name:   "together",
+		Quota:  quota.Quota{Limit: 3, InUse: 3},
+		Router: "fake",
+	}
+	err := ChangeQuota(app, 20)
+	c.Assert(err, check.NotNil)
+	c.Assert(err, check.Equals, mgo.ErrNotFound)
 }

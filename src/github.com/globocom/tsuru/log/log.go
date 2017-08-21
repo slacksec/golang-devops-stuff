@@ -1,19 +1,23 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 // Package log provides logging utility.
 //
 // It abstracts the logger from the standard log package, allowing the
-// developer to patck the logging target, changing this to a file, or syslog,
+// developer to pick the logging target, changing this to a file, or syslog,
 // for example.
 package log
 
 import (
-	"github.com/tsuru/config"
+	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/config"
 )
 
 type Logger interface {
@@ -27,18 +31,24 @@ type Logger interface {
 }
 
 func Init() {
-	debug, err := config.GetBool("debug")
-	if err != nil {
-		debug = false
+	var loggers []Logger
+	debug, _ := config.GetBool("debug")
+	if logFileName, err := config.GetString("log:file"); err == nil {
+		loggers = append(loggers, NewFileLogger(logFileName, debug))
+	} else if err == config.ErrMismatchConf {
+		panic(fmt.Sprintf("%s please see http://docs.tsuru.io/en/latest/reference/config.html#log-file", err))
 	}
-	logFileName, err := config.GetString("log:file")
-	var logger Logger
-	if err != nil {
-		logger = NewSyslogLogger("tsr", debug)
-	} else {
-		logger = NewFileLogger(logFileName, debug)
+	if disableSyslog, _ := config.GetBool("log:disable-syslog"); !disableSyslog {
+		tag, _ := config.GetString("log:syslog-tag")
+		if tag == "" {
+			tag = "tsurud"
+		}
+		loggers = append(loggers, NewSyslogLogger(tag, debug))
 	}
-	SetLogger(logger)
+	if useStderr, _ := config.GetBool("log:use-stderr"); useStderr {
+		loggers = append(loggers, NewWriterLogger(os.Stderr, debug))
+	}
+	SetLogger(NewMultiLogger(loggers...))
 }
 
 // Target is the current target for the log package.
@@ -58,12 +68,16 @@ func (t *Target) SetLogger(l Logger) {
 
 // Error writes the given values to the Target
 // logger.
-func (t *Target) Error(v string) {
+func (t *Target) Error(v error) {
 	t.mut.RLock()
 	defer t.mut.RUnlock()
 	if t.logger != nil {
-		t.logger.Error(v)
+		t.logger.Errorf("%+v", v)
 	}
+}
+
+type withStack interface {
+	StackTrace() errors.StackTrace
 }
 
 // Errorf writes the formatted string to the Target
@@ -73,6 +87,11 @@ func (t *Target) Errorf(format string, v ...interface{}) {
 	defer t.mut.RUnlock()
 	if t.logger != nil {
 		t.logger.Errorf(format, v...)
+		for _, item := range v {
+			if _, hasStack := item.(withStack); hasStack {
+				t.logger.Errorf("stack for error: %+v", item)
+			}
+		}
 	}
 }
 
@@ -130,7 +149,7 @@ func (t *Target) GetStdLogger() *log.Logger {
 var DefaultTarget = new(Target)
 
 // Error is a wrapper for DefaultTarget.Error.
-func Error(v string) {
+func Error(v error) {
 	DefaultTarget.Error(v)
 }
 
@@ -167,6 +186,13 @@ func GetStdLogger() *log.Logger {
 // SetLogger is a wrapper for DefaultTarget.SetLogger.
 func SetLogger(logger Logger) {
 	DefaultTarget.SetLogger(logger)
+}
+
+func WrapError(err error) error {
+	if err != nil {
+		Error(err)
+	}
+	return err
 }
 
 func Write(w io.Writer, content []byte) error {

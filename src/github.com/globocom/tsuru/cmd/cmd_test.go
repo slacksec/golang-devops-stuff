@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,332 +6,424 @@ package cmd
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
-	tsuruErrors "github.com/tsuru/tsuru/errors"
-	"github.com/tsuru/tsuru/fs"
-	"github.com/tsuru/tsuru/fs/testing"
 	"io"
-	"launchpad.net/gnuflag"
-	"launchpad.net/gocheck"
-	"net/http"
 	"os"
+	"strings"
+
+	"github.com/tsuru/gnuflag"
+	"github.com/tsuru/tsuru/fs"
+	"github.com/tsuru/tsuru/fs/fstest"
+	"gopkg.in/check.v1"
 )
 
-type recordingExiter int
-
-func (e *recordingExiter) Exit(code int) {
-	*e = recordingExiter(code)
+func (s *S) TestDeprecatedCommand(c *check.C) {
+	var stdout, stderr bytes.Buffer
+	cmd := TestCommand{}
+	globalManager.RegisterDeprecated(&cmd, "bar")
+	globalManager.stdout = &stdout
+	globalManager.stderr = &stderr
+	globalManager.Run([]string{"bar"})
+	c.Assert(stdout.String(), check.Equals, "Running TestCommand")
+	warnMessage := `WARNING: "bar" has been deprecated, please use "foo" instead.` + "\n\n"
+	c.Assert(stderr.String(), check.Equals, warnMessage)
+	stdout.Reset()
+	stderr.Reset()
+	globalManager.Run([]string{"foo"})
+	c.Assert(stdout.String(), check.Equals, "Running TestCommand")
+	c.Assert(stderr.String(), check.Equals, "")
 }
 
-func (e recordingExiter) value() int {
-	return int(e)
+func (s *S) TestDeprecatedCommandFlags(c *check.C) {
+	var stdout, stderr bytes.Buffer
+	cmd := CommandWithFlags{}
+	globalManager.RegisterDeprecated(&cmd, "bar")
+	globalManager.stdout = &stdout
+	globalManager.stderr = &stderr
+	globalManager.Run([]string{"bar", "--age", "10"})
+	warnMessage := `WARNING: "bar" has been deprecated, please use "with-flags" instead.` + "\n\n"
+	c.Assert(stderr.String(), check.Equals, warnMessage)
+	c.Assert(cmd.age, check.Equals, 10)
 }
 
-type TestNamedCommand struct {
-	nameCalls int
-	infoCalls int
+func (s *S) TestRegister(c *check.C) {
+	globalManager.Register(&TestCommand{})
+	badCall := func() { globalManager.Register(&TestCommand{}) }
+	c.Assert(badCall, check.PanicMatches, "command already registered: foo")
 }
 
-func (c *TestNamedCommand) Name() string {
-	c.nameCalls++
-	return "nameInName"
+func (s *S) TestRegisterDeprecated(c *check.C) {
+	originalCmd := &TestCommand{}
+	globalManager.RegisterDeprecated(originalCmd, "bar")
+	badCall := func() { globalManager.Register(originalCmd) }
+	c.Assert(badCall, check.PanicMatches, "command already registered: foo")
+	cmd, ok := globalManager.Commands["bar"].(*DeprecatedCommand)
+	c.Assert(ok, check.Equals, true)
+	c.Assert(cmd.Command, check.Equals, originalCmd)
+	c.Assert(globalManager.Commands["foo"], check.Equals, originalCmd)
 }
 
-func (c *TestNamedCommand) Info() *Info {
-	c.infoCalls++
+func (s *S) TestRegisterRemoved(c *check.C) {
+	globalManager.RegisterRemoved("spoon", "There is no spoon.")
+	_, ok := globalManager.Commands["spoon"].(*RemovedCommand)
+	c.Assert(ok, check.Equals, true)
+	var stdout, stderr bytes.Buffer
+	globalManager.stdout = &stdout
+	globalManager.stderr = &stderr
+	globalManager.Run([]string{"spoon"})
+	c.Assert(stdout.String(), check.Matches, "(?s).*This command was removed. There is no spoon.*")
+}
+
+func (s *S) TestRegisterTopic(c *check.C) {
+	mngr := Manager{}
+	mngr.RegisterTopic("target", "targeting everything!")
+	c.Assert(mngr.topics["target"], check.Equals, "targeting everything!")
+}
+
+func (s *S) TestRegisterTopicDuplicated(c *check.C) {
+	mngr := Manager{}
+	mngr.RegisterTopic("target", "targeting everything!")
+	defer func() {
+		r := recover()
+		c.Assert(r, check.NotNil)
+	}()
+	mngr.RegisterTopic("target", "wat")
+}
+
+func (s *S) TestRegisterTopicMultiple(c *check.C) {
+	mngr := Manager{}
+	mngr.RegisterTopic("target", "targeted")
+	mngr.RegisterTopic("app", "what's an app?")
+	expected := map[string]string{
+		"target": "targeted",
+		"app":    "what's an app?",
+	}
+	c.Assert(mngr.topics, check.DeepEquals, expected)
+}
+
+type TopicCommand struct {
+	name     string
+	executed bool
+	args     []string
+}
+
+func (c *TopicCommand) Info() *Info {
 	return &Info{
-		Name: "nameInInfo",
+		Name:  c.name,
+		Desc:  "desc " + c.name,
+		Usage: "usage",
 	}
 }
 
-func (c *TestNamedCommand) Run(context *Context, client *Client) error {
-	return nil
-}
-
-type TestCommand struct{}
-
-func (c *TestCommand) Info() *Info {
-	return &Info{
-		Name:  "foo",
-		Desc:  "Foo do anything or nothing.",
-		Usage: "foo",
-	}
-}
-
-func (c *TestCommand) Run(context *Context, client *Client) error {
-	io.WriteString(context.Stdout, "Running TestCommand")
-	return nil
-}
-
-type ErrorCommand struct {
-	msg string
-}
-
-func (c *ErrorCommand) Info() *Info {
-	return &Info{Name: "error"}
-}
-
-func (c *ErrorCommand) Run(context *Context, client *Client) error {
-	return errors.New(c.msg)
-}
-
-type UnauthorizedErrorCommand struct{}
-
-func (c *UnauthorizedErrorCommand) Info() *Info {
-	return &Info{Name: "unauthorized-error"}
-}
-
-func (c *UnauthorizedErrorCommand) Run(context *Context, client *Client) error {
-	return &tsuruErrors.HTTP{Code: http.StatusUnauthorized, Message: "my error"}
-}
-
-type CommandWithFlags struct {
-	fs      *gnuflag.FlagSet
-	age     int
-	minArgs int
-	args    []string
-}
-
-func (c *CommandWithFlags) Info() *Info {
-	return &Info{Name: "with-flags", MinArgs: c.minArgs}
-}
-
-func (c *CommandWithFlags) Run(context *Context, client *Client) error {
+func (c *TopicCommand) Run(context *Context, client *Client) error {
+	c.executed = true
 	c.args = context.Args
 	return nil
 }
 
-func (c *CommandWithFlags) Flags() *gnuflag.FlagSet {
-	if c.fs == nil {
-		c.fs = gnuflag.NewFlagSet("with-flags", gnuflag.ContinueOnError)
-		c.fs.IntVar(&c.age, "age", 0, "your age")
+func (s *S) TestImplicitTopicsHelp(c *check.C) {
+	globalManager.Register(&TopicCommand{name: "foo-bar"})
+	globalManager.Register(&TopicCommand{name: "foo-baz"})
+	context := Context{[]string{"foo"}, globalManager.stdout, globalManager.stderr, globalManager.stdin}
+	command := help{manager: globalManager}
+	err := command.Run(&context, nil)
+	c.Assert(err, check.IsNil)
+	expected := `glb version 1.0.
+
+The following commands are available in the "foo" topic:
+
+  foo-bar              Desc foo-bar
+  foo-baz              Desc foo-baz
+
+Use glb help <commandname> to get more information about a command.
+`
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestNormalizedCommandsExec(c *check.C) {
+	cmds := map[string]*TopicCommand{
+		"foo":             {name: "foo"},
+		"foo-bar":         {name: "foo-bar"},
+		"foo-bar-zzz":     {name: "foo-bar-zzz"},
+		"foo-bar-zzz-a-b": {name: "foo-bar-zzz-a-b"},
 	}
-	return c.fs
-}
-
-func (s *S) TestRegister(c *gocheck.C) {
-	manager.Register(&TestCommand{})
-	badCall := func() { manager.Register(&TestCommand{}) }
-	c.Assert(badCall, gocheck.PanicMatches, "command already registered: foo")
-}
-
-func (s *S) TestRegisterCallsNameOnNamedCommand(c *gocheck.C) {
-	instance := &TestNamedCommand{}
-	manager.Register(instance)
-	c.Assert(manager.Commands["nameInName"], gocheck.Equals, instance)
-	c.Assert(instance.nameCalls, gocheck.Equals, 1)
-	c.Assert(instance.infoCalls, gocheck.Equals, 0)
-}
-
-func (s *S) TestRegisterTopic(c *gocheck.C) {
-	manager := Manager{}
-	manager.RegisterTopic("target", "targetting everything!")
-	c.Assert(manager.topics["target"], gocheck.Equals, "targetting everything!")
-}
-
-func (s *S) TestRegisterTopicDuplicated(c *gocheck.C) {
-	manager := Manager{}
-	manager.RegisterTopic("target", "targetting everything!")
-	defer func() {
-		r := recover()
-		c.Assert(r, gocheck.NotNil)
-	}()
-	manager.RegisterTopic("target", "wat")
-}
-
-func (s *S) TestRegisterTopicMultiple(c *gocheck.C) {
-	manager := Manager{}
-	manager.RegisterTopic("target", "targetted")
-	manager.RegisterTopic("app", "what's an app?")
-	expected := map[string]string{
-		"target": "targetted",
-		"app":    "what's an app?",
+	for _, v := range cmds {
+		globalManager.Register(v)
 	}
-	c.Assert(manager.topics, gocheck.DeepEquals, expected)
+	tests := []struct {
+		args         []string
+		expected     string
+		expectedArgs []string
+	}{
+		{args: []string{"fo"}, expected: ""},
+		{args: []string{"foo"}, expected: "foo"},
+		{args: []string{"foo", "ba"}, expected: "foo", expectedArgs: []string{"ba"}},
+		{args: []string{"foo-bar"}, expected: "foo-bar"},
+		{args: []string{"foo-bar", "zz"}, expected: "foo-bar", expectedArgs: []string{"zz"}},
+		{args: []string{"foo", "bar"}, expected: "foo-bar"},
+		{args: []string{"foo", "bar", "zz"}, expected: "foo-bar", expectedArgs: []string{"zz"}},
+		{args: []string{"foo-bar-zzz"}, expected: "foo-bar-zzz"},
+		{args: []string{"foo-bar-zzz", "x"}, expected: "foo-bar-zzz", expectedArgs: []string{"x"}},
+		{args: []string{"foo-bar", "zzz"}, expected: "foo-bar-zzz"},
+		{args: []string{"foo", "bar-zzz"}, expected: "foo-bar-zzz"},
+		{args: []string{"foo", "bar", "zzz"}, expected: "foo-bar-zzz"},
+		{args: []string{"foo", "bar", "zzz", "x"}, expected: "foo-bar-zzz", expectedArgs: []string{"x"}},
+		{args: []string{"foo-bar-zzz-a-b"}, expected: "foo-bar-zzz-a-b"},
+		{args: []string{"foo-bar-zzz-a-b", "x"}, expected: "foo-bar-zzz-a-b", expectedArgs: []string{"x"}},
+		{args: []string{"foo", "bar", "zzz", "a", "b"}, expected: "foo-bar-zzz-a-b"},
+		{args: []string{"foo", "bar", "zzz", "a", "b", "x"}, expected: "foo-bar-zzz-a-b", expectedArgs: []string{"x"}},
+	}
+	for i, tt := range tests {
+		globalManager.Run(tt.args)
+		for k, v := range cmds {
+			c.Assert(v.executed, check.Equals, k == tt.expected, check.Commentf("test %d, expected %s executed, got %s", i, tt.expected, k))
+			if k == tt.expected {
+				c.Assert(v.args, check.DeepEquals, tt.expectedArgs, check.Commentf("test %d", i))
+			}
+			v.executed = false
+			v.args = nil
+		}
+	}
 }
 
-func (s *S) TestCustomLookup(c *gocheck.C) {
+func (s *S) TestCustomLookup(c *check.C) {
 	lookup := func(ctx *Context) error {
 		fmt.Fprintf(ctx.Stdout, "test")
 		return nil
 	}
 	var stdout, stderr bytes.Buffer
-	manager := NewManager("glb", "0.x", "Foo-Tsuru", &stdout, &stderr, os.Stdin, lookup)
-	manager.Run([]string{"custom"})
-	c.Assert(stdout.String(), gocheck.Equals, "test")
+	mngr := NewManager("glb", "0.x", "Foo-Tsuru", &stdout, &stderr, os.Stdin, lookup)
+	var exiter recordingExiter
+	mngr.e = &exiter
+	mngr.Run([]string{"custom"})
+	c.Assert(stdout.String(), check.Equals, "test")
 }
 
-func (s *S) TestCustomLookupNotFound(c *gocheck.C) {
+func (s *S) TestCustomLookupNotFound(c *check.C) {
 	lookup := func(ctx *Context) error {
-		return os.ErrNotExist
+		return ErrLookup
 	}
 	var stdout, stderr bytes.Buffer
-	manager := NewManager("glb", "0.x", "Foo-Tsuru", &stdout, &stderr, os.Stdin, lookup)
+	mngr := NewManager("glb", "0.x", "Foo-Tsuru", &stdout, &stderr, os.Stdin, lookup)
 	var exiter recordingExiter
-	manager.e = &exiter
-	manager.Run([]string{"custom"})
-	c.Assert(stderr.String(), gocheck.Equals, "Error: command \"custom\" does not exist\n")
-	c.Assert(manager.e.(*recordingExiter).value(), gocheck.Equals, 1)
+	mngr.e = &exiter
+	mngr.Register(&TestCommand{})
+	mngr.Run([]string{"foo"})
+	c.Assert(stdout.String(), check.Equals, "Running TestCommand")
 }
 
-func (s *S) TestManagerRunShouldWriteErrorsOnStderr(c *gocheck.C) {
-	manager.Register(&ErrorCommand{msg: "You are wrong\n"})
-	manager.Run([]string{"error"})
-	c.Assert(manager.stderr.(*bytes.Buffer).String(), gocheck.Equals, "Error: You are wrong\n")
+func (s *S) TestManagerRunShouldWriteErrorsOnStderr(c *check.C) {
+	globalManager.Register(&ErrorCommand{msg: "You are wrong\n"})
+	globalManager.Run([]string{"error"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, "Error: You are wrong\n")
 }
 
-func (s *S) TestManagerRunShouldReturnStatus1WhenCommandFail(c *gocheck.C) {
-	manager.Register(&ErrorCommand{msg: "You are wrong\n"})
-	manager.Run([]string{"error"})
-	c.Assert(manager.e.(*recordingExiter).value(), gocheck.Equals, 1)
+func (s *S) TestManagerRunShouldReturnStatus1WhenCommandFail(c *check.C) {
+	globalManager.Register(&ErrorCommand{msg: "You are wrong\n"})
+	globalManager.Run([]string{"error"})
+	c.Assert(globalManager.e.(*recordingExiter).value(), check.Equals, 1)
 }
 
-func (s *S) TestManagerRunShouldAppendNewLineOnErrorWhenItsNotPresent(c *gocheck.C) {
-	manager.Register(&ErrorCommand{msg: "You are wrong"})
-	manager.Run([]string{"error"})
-	c.Assert(manager.stderr.(*bytes.Buffer).String(), gocheck.Equals, "Error: You are wrong\n")
+func (s *S) TestManagerRunShouldAppendNewLineOnErrorWhenItsNotPresent(c *check.C) {
+	globalManager.Register(&ErrorCommand{msg: "You are wrong"})
+	globalManager.Run([]string{"error"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, "Error: You are wrong\n")
 }
 
-func (s *S) TestManagerRunWithHTTPUnauthorizedError(c *gocheck.C) {
-	manager.Register(&UnauthorizedErrorCommand{})
-	manager.Run([]string{"unauthorized-error"})
-	c.Assert(manager.stderr.(*bytes.Buffer).String(), gocheck.Equals, `Error: You're not authenticated or your session has expired. Please use "login" command for authentication.`+"\n")
+func (s *S) TestManagerRunShouldNotWriteErrorOnStderrWhenErrAbortIsTriggered(c *check.C) {
+	globalManager.Register(&ErrorCommand{msg: "abort"})
+	globalManager.Run([]string{"error"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, "")
+	c.Assert(globalManager.e.(*recordingExiter).value(), check.Equals, 1)
 }
 
-func (s *S) TestManagerRunWithFlags(c *gocheck.C) {
+func (s *S) TestManagerRunWithHTTPUnauthorizedError(c *check.C) {
+	globalManager.Register(&UnauthorizedErrorCommand{})
+	globalManager.Run([]string{"unauthorized-error"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, `Error: You're not authenticated or your session has expired. Please use "login" command for authentication.`+"\n")
+}
+
+func (s *S) TestManagerRunWithHTTPUnauthorizedErrorAndLoginRegistered(c *check.C) {
+	expectedStderr := `Error: you're not authenticated or your session has expired.
+Calling the "login" command...
+
+`
+	expectedStdout := `logged in!
+worked nicely!
+`
+	globalManager.Register(&FailAndWorkCommand{})
+	globalManager.Register(&SuccessLoginCommand{})
+	globalManager.Run([]string{"fail-and-work"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, expectedStderr)
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expectedStdout)
+}
+
+func (s *S) TestManagerRunWithHTTPUnauthorizedErrorAndLoginFailure(c *check.C) {
+	expected := `Error: you're not authenticated or your session has expired.
+Calling the "login" command...
+Error: You're not authenticated or your session has expired. Please use "login" command for authentication.
+`
+	globalManager.Register(&FailAndWorkCommand{})
+	globalManager.Register(&UnauthorizedLoginErrorCommand{})
+	globalManager.Run([]string{"fail-and-work"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestManagerRunLoginWithHTTPUnauthorizedError(c *check.C) {
+	globalManager.Register(&UnauthorizedLoginErrorCommand{})
+	globalManager.Run([]string{"login"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, "Error: unauthorized\n")
+}
+
+func (s *S) TestManagerRunWithFlags(c *check.C) {
 	cmd := &CommandWithFlags{}
-	manager.Register(cmd)
-	manager.Run([]string{"with-flags", "--age", "10"})
-	c.Assert(cmd.fs.Parsed(), gocheck.Equals, true)
-	c.Assert(cmd.age, gocheck.Equals, 10)
+	globalManager.Register(cmd)
+	globalManager.Run([]string{"with-flags", "--age", "10"})
+	c.Assert(cmd.fs.Parsed(), check.Equals, true)
+	c.Assert(cmd.age, check.Equals, 10)
 }
 
-func (s *S) TestManagerRunWithFlagsAndArgs(c *gocheck.C) {
+func (s *S) TestManagerRunWithFlagsAndArgs(c *check.C) {
 	cmd := &CommandWithFlags{minArgs: 2}
-	manager.Register(cmd)
-	manager.Run([]string{"with-flags", "something", "--age", "20", "otherthing"})
-	c.Assert(cmd.args, gocheck.DeepEquals, []string{"something", "otherthing"})
+	globalManager.Register(cmd)
+	globalManager.Run([]string{"with-flags", "something", "--age", "20", "otherthing"})
+	c.Assert(cmd.args, check.DeepEquals, []string{"something", "otherthing"})
 }
 
-func (s *S) TestManagerRunWithInvalidValueForFlag(c *gocheck.C) {
+func (s *S) TestManagerRunWithInvalidValueForFlag(c *check.C) {
 	var exiter recordingExiter
-	old := manager.e
-	manager.e = &exiter
+	old := globalManager.e
+	globalManager.e = &exiter
 	defer func() {
-		manager.e = old
+		globalManager.e = old
 	}()
 	cmd := &CommandWithFlags{}
-	manager.Register(cmd)
-	manager.Run([]string{"with-flags", "--age", "tsuru"})
-	c.Assert(cmd.fs.Parsed(), gocheck.Equals, true)
-	c.Assert(exiter.value(), gocheck.Equals, 1)
+	globalManager.Register(cmd)
+	globalManager.Run([]string{"with-flags", "--age", "tsuru"})
+	c.Assert(cmd.fs.Parsed(), check.Equals, true)
+	c.Assert(exiter.value(), check.Equals, 1)
 }
 
-func (s *S) TestRun(c *gocheck.C) {
-	manager.Register(&TestCommand{})
-	manager.Run([]string{"foo"})
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, "Running TestCommand")
+func (s *S) TestRun(c *check.C) {
+	globalManager.Register(&TestCommand{})
+	globalManager.Run([]string{"foo"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, "Running TestCommand")
 }
 
-func (s *S) TestRunCommandThatDoesNotExist(c *gocheck.C) {
-	manager.Run([]string{"bar"})
-	c.Assert(manager.stderr.(*bytes.Buffer).String(), gocheck.Equals, `Error: command "bar" does not exist`+"\n")
-	c.Assert(manager.e.(*recordingExiter).value(), gocheck.Equals, 1)
+func (s *S) TestRunCommandThatDoesNotExist(c *check.C) {
+	globalManager.Run([]string{"bar"})
+	c.Assert(globalManager.stderr.(*bytes.Buffer).String(), check.Equals, `glb: "bar" is not a glb command. See "glb help".`+"\n")
+	c.Assert(globalManager.e.(*recordingExiter).value(), check.Equals, 1)
 }
 
-func (s *S) TestHelp(c *gocheck.C) {
+func (s *S) TestHelp(c *check.C) {
 	expected := `glb version 1.0.
 
 Usage: glb command [args]
 
 Available commands:
-  help
-  user-create
-  version
+  help                 
+  version              Display the current version
 
 Use glb help <commandname> to get more information about a command.
 `
-	manager.Register(&userCreate{})
-	context := Context{[]string{}, manager.stdout, manager.stderr, manager.stdin}
-	command := help{manager: manager}
+	globalManager.RegisterDeprecated(&login{}, "login")
+	context := Context{[]string{}, globalManager.stdout, globalManager.stderr, globalManager.stdin}
+	command := help{manager: globalManager}
 	err := command.Run(&context, nil)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
+	c.Assert(err, check.IsNil)
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
 }
 
-func (s *S) TestHelpWithTopics(c *gocheck.C) {
+func (s *S) TestHelpWithTopics(c *check.C) {
 	expected := `glb version 1.0.
 
 Usage: glb command [args]
 
 Available commands:
-  help
-  user-create
-  version
+  help                 
+  login                Initiates a new tsuru session for a user
+  version              Display the current version
 
 Use glb help <commandname> to get more information about a command.
 
 Available topics:
-  target
+  target               Something
 
 Use glb help <topicname> to get more information about a topic.
 `
-	manager.Register(&userCreate{})
-	manager.RegisterTopic("target", "something")
-	context := Context{[]string{}, manager.stdout, manager.stderr, manager.stdin}
-	command := help{manager: manager}
+	globalManager.Register(&login{})
+	globalManager.RegisterTopic("target", "something")
+	context := Context{[]string{}, globalManager.stdout, globalManager.stderr, globalManager.stdin}
+	command := help{manager: globalManager}
 	err := command.Run(&context, nil)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
+	c.Assert(err, check.IsNil)
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
 }
 
-func (s *S) TestHelpFromTopic(c *gocheck.C) {
+func (s *S) TestHelpFromTopic(c *check.C) {
 	expected := `glb version 1.0.
 
 Targets
 
 Tsuru likes to manage targets
 `
-	manager.RegisterTopic("target", "Targets\n\nTsuru likes to manage targets\n")
-	context := Context{[]string{"target"}, manager.stdout, manager.stderr, manager.stdin}
-	command := help{manager: manager}
+	globalManager.RegisterTopic("target", "Targets\n\nTsuru likes to manage targets\n")
+	context := Context{[]string{"target"}, globalManager.stdout, globalManager.stderr, globalManager.stdin}
+	command := help{manager: globalManager}
 	err := command.Run(&context, nil)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
+	c.Assert(err, check.IsNil)
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
 }
 
-func (s *S) TestHelpCommandShouldBeRegisteredByDefault(c *gocheck.C) {
+func (s *S) TestHelpCommandShouldBeRegisteredByDefault(c *check.C) {
 	var stdout, stderr bytes.Buffer
 	m := NewManager("tsuru", "1.0", "", &stdout, &stderr, os.Stdin, nil)
+	var exiter recordingExiter
+	m.e = &exiter
 	_, exists := m.Commands["help"]
-	c.Assert(exists, gocheck.Equals, true)
+	c.Assert(exists, check.Equals, true)
 }
 
-func (s *S) TestHelpReturnErrorIfTheGivenCommandDoesNotExist(c *gocheck.C) {
-	command := help{manager: manager}
-	context := Context{[]string{"user-create"}, manager.stdout, manager.stderr, manager.stdin}
+func (s *S) TestHelpReturnErrorIfTheGivenCommandDoesNotExist(c *check.C) {
+	command := help{manager: globalManager}
+	context := Context{[]string{"user-create"}, globalManager.stdout, globalManager.stderr, globalManager.stdin}
 	err := command.Run(&context, nil)
-	c.Assert(err, gocheck.NotNil)
-	c.Assert(err, gocheck.ErrorMatches, `^command "user-create" does not exist.$`)
+	c.Assert(err, check.NotNil)
+	c.Assert(err, check.ErrorMatches, `^command "user-create" does not exist.$`)
 }
 
-func (s *S) TestRunWithoutArgsShouldRunHelp(c *gocheck.C) {
+func (s *S) TestRunWithoutArgsShouldRunHelp(c *check.C) {
 	expected := `glb version 1.0.
 
 Usage: glb command [args]
 
 Available commands:
-  help
-  version
+  help                 
+  version              Display the current version
 
 Use glb help <commandname> to get more information about a command.
 `
-	manager.Run([]string{})
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
+	globalManager.Run([]string{})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
 }
 
-func (s *S) TestHelpShouldReturnHelpForACmd(c *gocheck.C) {
+func (s *S) TestDashDashHelp(c *check.C) {
+	expected := `glb version 1.0.
+
+Usage: glb command [args]
+
+Available commands:
+  help                 
+  version              Display the current version
+
+Use glb help <commandname> to get more information about a command.
+`
+	globalManager.Run([]string{"--help"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestRunCommandWithDashHelp(c *check.C) {
 	expected := `glb version 1.0.
 
 Usage: glb foo
@@ -339,29 +431,168 @@ Usage: glb foo
 Foo do anything or nothing.
 
 `
-	manager.Register(&TestCommand{})
-	manager.Run([]string{"help", "foo"})
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
+	globalManager.Register(&TestCommand{})
+	globalManager.Run([]string{"foo", "--help"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
 }
 
-func (s *S) TestVersion(c *gocheck.C) {
+func (s *S) TestRunCommandWithDashH(c *check.C) {
+	expected := `glb version 1.0.
+
+Usage: glb foo
+
+Foo do anything or nothing.
+
+`
+	globalManager.Register(&TestCommand{})
+	globalManager.Run([]string{"foo", "-h"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestHelpShouldReturnHelpForACmd(c *check.C) {
+	expected := `glb version 1.0.
+
+Usage: glb foo
+
+Foo do anything or nothing.
+
+`
+	globalManager.Register(&TestCommand{})
+	globalManager.Run([]string{"help", "foo"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestDashDashHelpShouldReturnHelpForACmd(c *check.C) {
+	expected := `glb version 1.0.
+
+Usage: glb foo
+
+Foo do anything or nothing.
+
+`
+	globalManager.Register(&TestCommand{})
+	globalManager.Run([]string{"--help", "foo"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestDuplicateHelpFlag(c *check.C) {
+	expected := "help called? true"
+	globalManager.Register(&HelpCommandWithFlags{})
+	globalManager.Run([]string{"hflags", "--help"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestDuplicateHFlag(c *check.C) {
+	expected := "help called? true"
+	globalManager.Register(&HelpCommandWithFlags{})
+	globalManager.Run([]string{"hflags", "-h"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestHelpFlaggedCommand(c *check.C) {
+	expected := `glb version 1.0.
+
+Usage: glb with-flags
+
+with-flags doesn't do anything, really.
+
+Flags:
+  
+  -a, --age  (= 0)
+      your age
+  
+`
+	globalManager.Register(&CommandWithFlags{})
+	globalManager.Run([]string{"help", "with-flags"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestHelpFlaggedMultilineCommand(c *check.C) {
+	expected := `glb version 1.0.
+
+Usage: glb with-flags
+
+with-flags doesn't do anything, really.
+
+Flags:
+  
+  -a, --age  (= 0)
+      velvet darkness
+      they fear
+  
+`
+	globalManager.Register(&CommandWithFlags{multi: true})
+	globalManager.Run([]string{"help", "with-flags"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestHelpDeprecatedCmd(c *check.C) {
+	expectedStdout := `glb version 1.0.
+
+Usage: glb foo
+
+Foo do anything or nothing.
+
+`
+	expectedStderr := `WARNING: "bar" is deprecated. Showing help for "foo" instead.` + "\n\n"
 	var stdout, stderr bytes.Buffer
-	manager := NewManager("tsuru", "5.0", "", &stdout, &stderr, os.Stdin, nil)
-	command := version{manager: manager}
-	context := Context{[]string{}, manager.stdout, manager.stderr, manager.stdin}
-	err := command.Run(&context, nil)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, "tsuru version 5.0.\n")
+	globalManager.stdout = &stdout
+	globalManager.stderr = &stderr
+	globalManager.RegisterDeprecated(&TestCommand{}, "bar")
+	globalManager.Run([]string{"help", "bar"})
+	c.Assert(stdout.String(), check.Equals, expectedStdout)
+	c.Assert(stderr.String(), check.Equals, expectedStderr)
+	stdout.Reset()
+	stderr.Reset()
+	globalManager.Run([]string{"help", "foo"})
+	c.Assert(stdout.String(), check.Equals, expectedStdout)
+	c.Assert(stderr.String(), check.Equals, "")
 }
 
-func (s *S) TestVersionInfo(c *gocheck.C) {
+func (s *S) TestHelpDeprecatedCmdWritesWarningFirst(c *check.C) {
+	expected := `WARNING: "bar" is deprecated. Showing help for "foo" instead.
+
+glb version 1.0.
+
+Usage: glb foo
+
+Foo do anything or nothing.
+
+`
+	var output bytes.Buffer
+	globalManager.stdout = &output
+	globalManager.stderr = &output
+	globalManager.RegisterDeprecated(&TestCommand{}, "bar")
+	globalManager.Run([]string{"help", "bar"})
+	c.Assert(output.String(), check.Equals, expected)
+}
+
+func (s *S) TestVersion(c *check.C) {
+	var stdout, stderr bytes.Buffer
+	mngr := NewManager("tsuru", "5.0", "", &stdout, &stderr, os.Stdin, nil)
+	var exiter recordingExiter
+	mngr.e = &exiter
+	command := version{manager: mngr}
+	context := Context{[]string{}, mngr.stdout, mngr.stderr, mngr.stdin}
+	err := command.Run(&context, nil)
+	c.Assert(err, check.IsNil)
+	c.Assert(mngr.stdout.(*bytes.Buffer).String(), check.Equals, "tsuru version 5.0.\n")
+}
+
+func (s *S) TestDashDashVersion(c *check.C) {
+	expected := "glb version 1.0.\n"
+	globalManager.Run([]string{"--version"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+}
+
+func (s *S) TestVersionInfo(c *check.C) {
 	expected := &Info{
 		Name:    "version",
 		MinArgs: 0,
 		Usage:   "version",
 		Desc:    "display the current version",
 	}
-	c.Assert((&version{}).Info(), gocheck.DeepEquals, expected)
+	c.Assert((&version{}).Info(), check.DeepEquals, expected)
 }
 
 type ArgCmd struct{}
@@ -380,7 +611,7 @@ func (cmd *ArgCmd) Run(ctx *Context, client *Client) error {
 	return nil
 }
 
-func (s *S) TestRunWrongArgsNumberShouldRunsHelpAndReturnStatus1(c *gocheck.C) {
+func (s *S) TestRunWrongArgsNumberShouldRunsHelpAndReturnStatus1(c *check.C) {
 	expected := `glb version 1.0.
 
 ERROR: wrong number of arguments.
@@ -392,13 +623,13 @@ some desc
 Minimum # of arguments: 1
 Maximum # of arguments: 2
 `
-	manager.Register(&ArgCmd{})
-	manager.Run([]string{"arg"})
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
-	c.Assert(manager.e.(*recordingExiter).value(), gocheck.Equals, 1)
+	globalManager.Register(&ArgCmd{})
+	globalManager.Run([]string{"arg"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+	c.Assert(globalManager.e.(*recordingExiter).value(), check.Equals, 1)
 }
 
-func (s *S) TestRunWithTooManyArguments(c *gocheck.C) {
+func (s *S) TestRunWithTooManyArguments(c *check.C) {
 	expected := `glb version 1.0.
 
 ERROR: wrong number of arguments.
@@ -410,13 +641,13 @@ some desc
 Minimum # of arguments: 1
 Maximum # of arguments: 2
 `
-	manager.Register(&ArgCmd{})
-	manager.Run([]string{"arg", "param1", "param2", "param3"})
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
-	c.Assert(manager.e.(*recordingExiter).value(), gocheck.Equals, 1)
+	globalManager.Register(&ArgCmd{})
+	globalManager.Run([]string{"arg", "param1", "param2", "param3"})
+	c.Assert(globalManager.stdout.(*bytes.Buffer).String(), check.Equals, expected)
+	c.Assert(globalManager.e.(*recordingExiter).value(), check.Equals, 1)
 }
 
-func (s *S) TestHelpShouldReturnUsageWithTheCommandName(c *gocheck.C) {
+func (s *S) TestHelpShouldReturnUsageWithTheCommandName(c *check.C) {
 	expected := `tsuru version 1.0.
 
 Usage: tsuru foo
@@ -425,154 +656,172 @@ Foo do anything or nothing.
 
 `
 	var stdout, stderr bytes.Buffer
-	manager := NewManager("tsuru", "1.0", "", &stdout, &stderr, os.Stdin, nil)
-	manager.Register(&TestCommand{})
-	context := Context{[]string{"foo"}, manager.stdout, manager.stderr, manager.stdin}
-	command := help{manager: manager}
+	mngr := NewManager("tsuru", "1.0", "", &stdout, &stderr, os.Stdin, nil)
+	var exiter recordingExiter
+	mngr.e = &exiter
+	mngr.Register(&TestCommand{})
+	context := Context{[]string{"foo"}, mngr.stdout, mngr.stderr, mngr.stdin}
+	command := help{manager: mngr}
 	err := command.Run(&context, nil)
-	c.Assert(err, gocheck.IsNil)
-	c.Assert(manager.stdout.(*bytes.Buffer).String(), gocheck.Equals, expected)
+	c.Assert(err, check.IsNil)
+	c.Assert(mngr.stdout.(*bytes.Buffer).String(), check.Equals, expected)
 }
 
-func (s *S) TestExtractProgramNameWithAbsolutePath(c *gocheck.C) {
+func (s *S) TestExtractProgramNameWithAbsolutePath(c *check.C) {
 	got := ExtractProgramName("/usr/bin/tsuru")
-	c.Assert(got, gocheck.Equals, "tsuru")
+	c.Assert(got, check.Equals, "tsuru")
 }
 
-func (s *S) TestExtractProgramNameWithRelativePath(c *gocheck.C) {
+func (s *S) TestExtractProgramNameWithRelativePath(c *check.C) {
 	got := ExtractProgramName("./tsuru")
-	c.Assert(got, gocheck.Equals, "tsuru")
+	c.Assert(got, check.Equals, "tsuru")
 }
 
-func (s *S) TestExtractProgramNameWithinThePATH(c *gocheck.C) {
+func (s *S) TestExtractProgramNameWithinThePATH(c *check.C) {
 	got := ExtractProgramName("tsuru")
-	c.Assert(got, gocheck.Equals, "tsuru")
+	c.Assert(got, check.Equals, "tsuru")
 }
 
-func (s *S) TestFinisherReturnsOsExiterIfNotDefined(c *gocheck.C) {
+func (s *S) TestFinisherReturnsOsExiterIfNotDefined(c *check.C) {
 	m := Manager{}
-	c.Assert(m.finisher(), gocheck.FitsTypeOf, osExiter{})
+	c.Assert(m.finisher(), check.FitsTypeOf, osExiter{})
 }
 
-func (s *S) TestFinisherReturnTheDefinedE(c *gocheck.C) {
+func (s *S) TestFinisherReturnTheDefinedE(c *check.C) {
 	var exiter recordingExiter
 	m := Manager{e: &exiter}
-	c.Assert(m.finisher(), gocheck.FitsTypeOf, &exiter)
+	c.Assert(m.finisher(), check.FitsTypeOf, &exiter)
 }
 
-func (s *S) TestLoginIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	lgn, ok := manager.Commands["login"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(lgn, gocheck.FitsTypeOf, &login{})
+func (s *S) TestLoginIsRegistered(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	lgn, ok := mngr.Commands["login"]
+	c.Assert(ok, check.Equals, true)
+	c.Assert(lgn, check.FitsTypeOf, &login{})
 }
 
-func (s *S) TestLogoutIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	lgt, ok := manager.Commands["logout"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(lgt, gocheck.FitsTypeOf, &logout{})
+func (s *S) TestLogoutIsRegistered(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	lgt, ok := mngr.Commands["logout"]
+	c.Assert(ok, check.Equals, true)
+	c.Assert(lgt, check.FitsTypeOf, &logout{})
 }
 
-func (s *S) TestUserCreateIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	user, ok := manager.Commands["user-create"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(user, gocheck.FitsTypeOf, &userCreate{})
+func (s *S) TestTargetListIsRegistered(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	tgt, ok := mngr.Commands["target-list"]
+	c.Assert(ok, check.Equals, true)
+	c.Assert(tgt, check.FitsTypeOf, &targetList{})
 }
 
-func (s *S) TestTeamCreateIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	create, ok := manager.Commands["team-create"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(create, gocheck.FitsTypeOf, &teamCreate{})
+func (s *S) TestTargetTopicIsRegistered(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	var exiter recordingExiter
+	mngr.e = &exiter
+	c.Assert(mngr.topics["target"], check.Equals, targetTopic)
 }
 
-func (s *S) TestTeamListIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	list, ok := manager.Commands["team-list"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(list, gocheck.FitsTypeOf, &teamList{})
-}
-
-func (s *S) TestTeamAddUserIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	adduser, ok := manager.Commands["team-user-add"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(adduser, gocheck.FitsTypeOf, &teamUserAdd{})
-}
-
-func (s *S) TestTeamRemoveUserIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	removeuser, ok := manager.Commands["team-user-remove"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(removeuser, gocheck.FitsTypeOf, &teamUserRemove{})
-}
-
-func (s *S) TestTeamUserListIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	listuser, ok := manager.Commands["team-user-list"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(listuser, gocheck.FitsTypeOf, teamUserList{})
-}
-
-func (s *S) TestTargetListIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	tgt, ok := manager.Commands["target-list"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(tgt, gocheck.FitsTypeOf, &targetList{})
-}
-
-func (s *S) TestTargetTopicIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	expected := fmt.Sprintf(targetTopic, "tsuru")
-	c.Assert(manager.topics["target"], gocheck.Equals, expected)
-}
-
-func (s *S) TestUserRemoveIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	rmUser, ok := manager.Commands["user-remove"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(rmUser, gocheck.FitsTypeOf, &userRemove{})
-}
-
-func (s *S) TestTeamRemoveIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	rmTeam, ok := manager.Commands["team-remove"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(rmTeam, gocheck.FitsTypeOf, &teamRemove{})
-}
-
-func (s *S) TestChangePasswordIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	chpass, ok := manager.Commands["change-password"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(chpass, gocheck.FitsTypeOf, &changePassword{})
-}
-
-func (s *S) TestResetPasswordIsRegistered(c *gocheck.C) {
-	manager := BuildBaseManager("tsuru", "1.0", "", nil)
-	reset, ok := manager.Commands["reset-password"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(reset, gocheck.FitsTypeOf, &resetPassword{})
-}
-
-func (s *S) TestVersionIsRegisteredByNewManager(c *gocheck.C) {
+func (s *S) TestVersionIsRegisteredByNewManager(c *check.C) {
 	var stdout, stderr bytes.Buffer
-	manager := NewManager("tsuru", "1.0", "", &stdout, &stderr, os.Stdin, nil)
-	ver, ok := manager.Commands["version"]
-	c.Assert(ok, gocheck.Equals, true)
-	c.Assert(ver, gocheck.FitsTypeOf, &version{})
+	mngr := NewManager("tsuru", "1.0", "", &stdout, &stderr, os.Stdin, nil)
+	ver, ok := mngr.Commands["version"]
+	c.Assert(ok, check.Equals, true)
+	c.Assert(ver, check.FitsTypeOf, &version{})
 }
 
-func (s *S) TestFileSystem(c *gocheck.C) {
-	fsystem = &testing.RecordingFs{}
-	c.Assert(filesystem(), gocheck.DeepEquals, fsystem)
+func (s *S) TestUserInfoIsRegisteredByBaseManager(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	info, ok := mngr.Commands["user-info"]
+	c.Assert(ok, check.Equals, true)
+	c.Assert(info, check.FitsTypeOf, userInfo{})
+}
+
+func (s *S) TestInvalidCommandTopicMatch(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	var stdout, stderr bytes.Buffer
+	var exiter recordingExiter
+	mngr.e = &exiter
+	mngr.stdout = &stdout
+	mngr.stderr = &stderr
+	mngr.Run([]string{"target"})
+	expectedOutput := fmt.Sprintf(`%s
+
+The following commands are available in the "target" topic:
+
+  target-add           Adds a new entry to the list of available targets
+  target-list          Displays the list of targets, marking the current
+  target-remove        Remove a target from target-list (tsuru server)
+  target-set           Change current target (tsuru server)
+
+Use tsuru help <commandname> to get more information about a command.
+`, targetTopic)
+	c.Assert(stderr.String(), check.Equals, "")
+	c.Assert(stdout.String(), check.Equals, expectedOutput)
+	c.Assert(mngr.e.(*recordingExiter).value(), check.Equals, 0)
+}
+
+func (s *S) TestInvalidCommandFuzzyMatch02(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	var stdout, stderr bytes.Buffer
+	var exiter recordingExiter
+	mngr.e = &exiter
+	mngr.stdout = &stdout
+	mngr.stderr = &stderr
+	mngr.Run([]string{"target-lisr"})
+	expectedOutput := `.*: "target-lisr" is not a tsuru command. See "tsuru help".
+
+Did you mean?
+	target-list
+`
+	expectedOutput = strings.Replace(expectedOutput, "\n", "\\W", -1)
+	expectedOutput = strings.Replace(expectedOutput, "\t", "\\W+", -1)
+	c.Assert(stderr.String(), check.Matches, expectedOutput)
+	c.Assert(mngr.e.(*recordingExiter).value(), check.Equals, 1)
+}
+
+func (s *S) TestInvalidCommandFuzzyMatch03(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	var stdout, stderr bytes.Buffer
+	var exiter recordingExiter
+	mngr.e = &exiter
+	mngr.stdout = &stdout
+	mngr.stderr = &stderr
+	mngr.Run([]string{"list"})
+	expectedOutput := `.*: "list" is not a tsuru command. See "tsuru help".
+
+Did you mean?
+	target-list
+`
+	expectedOutput = strings.Replace(expectedOutput, "\n", "\\W", -1)
+	expectedOutput = strings.Replace(expectedOutput, "\t", "\\W+", -1)
+	c.Assert(stderr.String(), check.Matches, expectedOutput)
+	c.Assert(mngr.e.(*recordingExiter).value(), check.Equals, 1)
+}
+
+func (s *S) TestInvalidCommandFuzzyMatch04(c *check.C) {
+	mngr := BuildBaseManager("tsuru", "1.0", "", nil)
+	var stdout, stderr bytes.Buffer
+	var exiter recordingExiter
+	mngr.e = &exiter
+	mngr.stdout = &stdout
+	mngr.stderr = &stderr
+	mngr.Run([]string{"not-command"})
+	expectedOutput := `.*: "not-command" is not a tsuru command. See "tsuru help".
+`
+	expectedOutput = strings.Replace(expectedOutput, "\n", "\\W", -1)
+	expectedOutput = strings.Replace(expectedOutput, "\t", "\\W+", -1)
+	c.Assert(stderr.String(), check.Matches, expectedOutput)
+	c.Assert(mngr.e.(*recordingExiter).value(), check.Equals, 1)
+}
+
+func (s *S) TestFileSystem(c *check.C) {
+	fsystem = &fstest.RecordingFs{}
+	c.Assert(filesystem(), check.DeepEquals, fsystem)
 	fsystem = nil
-	c.Assert(filesystem(), gocheck.DeepEquals, fs.OsFs{})
+	c.Assert(filesystem(), check.DeepEquals, fs.OsFs{})
 }
 
-func (s *S) TestValidateVersion(c *gocheck.C) {
+func (s *S) TestValidateVersion(c *check.C) {
 	var cases = []struct {
 		current, support string
 		expected         bool
@@ -617,8 +866,186 @@ func (s *S) TestValidateVersion(c *gocheck.C) {
 			support:  "0.7.15",
 			expected: true,
 		},
+		{
+			current:  "0.8",
+			support:  "0.8",
+			expected: true,
+		},
+		{
+			current:  "1.0-rc2",
+			support:  "1.0-rc1",
+			expected: true,
+		},
+		{
+			current:  "1.0-rc1",
+			support:  "1.0-rc1",
+			expected: true,
+		},
+		{
+			current:  "1.0-rc1",
+			support:  "1.0-rc2",
+			expected: false,
+		},
+		{
+			current:  "1.0-rc1",
+			support:  "1.0",
+			expected: false,
+		},
+		{
+			current:  "1.0",
+			support:  "1.0-rc1",
+			expected: true,
+		},
 	}
-	for _, cs := range cases {
-		c.Check(validateVersion(cs.support, cs.current), gocheck.Equals, cs.expected)
+	for i, cs := range cases {
+		c.Check(validateVersion(cs.support, cs.current), check.Equals, cs.expected, check.Commentf("error on %d", i))
 	}
+}
+
+type recordingExiter int
+
+func (e *recordingExiter) Exit(code int) {
+	*e = recordingExiter(code)
+}
+
+func (e recordingExiter) value() int {
+	return int(e)
+}
+
+type TestCommand struct{}
+
+func (c *TestCommand) Info() *Info {
+	return &Info{
+		Name:  "foo",
+		Desc:  "Foo do anything or nothing.",
+		Usage: "foo",
+	}
+}
+
+func (c *TestCommand) Run(context *Context, client *Client) error {
+	io.WriteString(context.Stdout, "Running TestCommand")
+	return nil
+}
+
+type ErrorCommand struct {
+	msg string
+}
+
+func (c *ErrorCommand) Info() *Info {
+	return &Info{Name: "error"}
+}
+
+func (c *ErrorCommand) Run(context *Context, client *Client) error {
+	if c.msg == "abort" {
+		return ErrAbortCommand
+	}
+	return fmt.Errorf(c.msg)
+}
+
+type FailAndWorkCommand struct {
+	calls int
+}
+
+func (c *FailAndWorkCommand) Info() *Info {
+	return &Info{Name: "fail-and-work"}
+}
+
+func (c *FailAndWorkCommand) Run(context *Context, client *Client) error {
+	c.calls++
+	if c.calls == 1 {
+		return errUnauthorized
+	}
+	fmt.Fprintln(context.Stdout, "worked nicely!")
+	return nil
+}
+
+type SuccessLoginCommand struct{}
+
+func (c *SuccessLoginCommand) Info() *Info {
+	return &Info{Name: "login"}
+}
+
+func (c *SuccessLoginCommand) Run(context *Context, client *Client) error {
+	fmt.Fprintln(context.Stdout, "logged in!")
+	return nil
+}
+
+type UnauthorizedErrorCommand struct{}
+
+func (c *UnauthorizedErrorCommand) Info() *Info {
+	return &Info{Name: "unauthorized-error"}
+}
+
+func (c *UnauthorizedErrorCommand) Run(context *Context, client *Client) error {
+	return errUnauthorized
+}
+
+type UnauthorizedLoginErrorCommand struct {
+	UnauthorizedErrorCommand
+}
+
+func (c *UnauthorizedLoginErrorCommand) Info() *Info {
+	return &Info{Name: "login"}
+}
+
+type CommandWithFlags struct {
+	fs      *gnuflag.FlagSet
+	age     int
+	minArgs int
+	args    []string
+	multi   bool
+}
+
+func (c *CommandWithFlags) Info() *Info {
+	return &Info{
+		Name:    "with-flags",
+		Desc:    "with-flags doesn't do anything, really.",
+		Usage:   "with-flags",
+		MinArgs: c.minArgs,
+	}
+}
+
+func (c *CommandWithFlags) Run(context *Context, client *Client) error {
+	c.args = context.Args
+	return nil
+}
+
+func (c *CommandWithFlags) Flags() *gnuflag.FlagSet {
+	if c.fs == nil {
+		c.fs = gnuflag.NewFlagSet("with-flags", gnuflag.ContinueOnError)
+		desc := "your age"
+		if c.multi {
+			desc = "velvet darkness\nthey fear"
+		}
+		c.fs.IntVar(&c.age, "age", 0, desc)
+		c.fs.IntVar(&c.age, "a", 0, desc)
+	}
+	return c.fs
+}
+
+type HelpCommandWithFlags struct {
+	fs *gnuflag.FlagSet
+	h  bool
+}
+
+func (c *HelpCommandWithFlags) Info() *Info {
+	return &Info{
+		Name:  "hflags",
+		Desc:  "hflags doesn't do anything, really.",
+		Usage: "hflags",
+	}
+}
+
+func (c *HelpCommandWithFlags) Run(context *Context, client *Client) error {
+	fmt.Fprintf(context.Stdout, "help called? %v", c.h)
+	return nil
+}
+
+func (c *HelpCommandWithFlags) Flags() *gnuflag.FlagSet {
+	if c.fs == nil {
+		c.fs = gnuflag.NewFlagSet("with-flags", gnuflag.ContinueOnError)
+		c.fs.BoolVar(&c.h, "help", false, "help?")
+		c.fs.BoolVar(&c.h, "h", false, "help?")
+	}
+	return c.fs
 }

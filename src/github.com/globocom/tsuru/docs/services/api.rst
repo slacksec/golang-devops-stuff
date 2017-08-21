@@ -1,4 +1,4 @@
-.. Copyright 2014 tsuru authors. All rights reserved.
+.. Copyright 2012 tsuru authors. All rights reserved.
    Use of this source code is governed by a BSD-style
    license that can be found in the LICENSE file.
 
@@ -8,13 +8,13 @@ API workflow
 
 tsuru sends requests to the service API to the following actions:
 
-* create a new instance of the service (``tsuru service-add``)
-* bind an app with the service instance (``tsuru bind``)
-* unbind an app from the service instance (``tsuru unbind``)
-* destroy the service instance (``tsuru service-remove``)
-* check the status of the service instance (``tsuru service-status``)
+* create a new instance of the service (``tsuru service-instance-add``)
+* bind an app with the service instance (``tsuru service-instance-bind``)
+* unbind an app from the service instance (``tsuru service-instance-unbind``)
+* destroy the service instance (``tsuru service-instance-remove``)
+* check the status of the service instance (``tsuru service-instance-status``)
 * display additional info about a service, including instances and available
-  plans (``tsuru service-info``)
+  plans (``tsuru service-info`` and ``tsuru service-instance-info``)
 
 .. _service_api_flow_authentication:
 
@@ -22,7 +22,7 @@ Authentication
 ==============
 
 tsuru will authenticate with the service API using HTTP basic authentication.
-The user is the name of the service and the password is defined in the
+The user can be username or name of the service, and the password is defined in the
 :ref:`service manifest <service_manifest>`.
 
 Content-types
@@ -61,8 +61,6 @@ It will display all instances of the service that the user has access to, and
 also the list of plans, that tsuru gets from the service API by issuing a GET
 on ``/resources/plans``. Example of request:
 
-.. highlight:: text
-
 ::
 
     GET /resources/plans HTTP/1.1
@@ -78,8 +76,6 @@ response body:
     * 200: if the operation has succeeded. The response body should include the
       list of the plans, in JSON format. Each plan contains a "name" and a
       "description". Example of response:
-
-.. highlight:: text
 
 ::
 
@@ -103,25 +99,23 @@ via command line tool:
 
 ::
 
-    $ tsuru service-add mysql mysql_instance
+    $ tsuru service-instance-add mysql mysql_instance
 
 tsuru calls the service API to create a new instance via POST on ``/resources``
 (please notice that tsuru does not include a trailing slash) with the name,
 plan and the team that owns the instance. Example of request:
 
-.. highlight:: text
-
 ::
 
     POST /resources HTTP/1.1
     Host: myserviceapi.com
-    Content-Length: 19
+    Content-Length: 56
     User-Agent: Go 1.1 package http
     Accept: application/json
     Authorization: Basic dXNlcjpwYXNzd29yZA==
     Content-Type: application/x-www-form-urlencoded
 
-    name=mysql_instance&plan=small&team=myteam
+    name=mysql_instance&plan=small&team=myteam&user=username
 
 The API should return the following HTTP response codes with the respective
 response body:
@@ -142,19 +136,19 @@ service via command line tool:
 
 ::
 
-    $ tsuru bind mysql_instance --app my_app
+    $ tsuru service-instance-bind mysql mysql_instance --app my_app
 
-tsuru calls the service API to bind an app with an instance via POST on
-``/resources/<service-instance-name>`` (please notice that tsuru does not
-include a trailing slash) with app-host and unit-host, where app-host
+Now, tsuru services has two bind endpoints:
+``/resources/<service-instance-name>/bind`` and
+``/resources/<service-instance-name>/bind-app``.
+The first endpoint will be called every time an app adds an unit.
+This endpoint is a POST with app-host and unit-host, where app-host
 represents the host to which the app is accessible, and unit-host is the
 address of the unit. Example of request:
 
-.. highlight:: text
-
 ::
 
-    POST /resources/myinstance HTTP/1.1
+    POST /resources/myinstance/bind HTTP/1.1
     Host: myserviceapi.com
     User-Agent: Go 1.1 package http
     Content-Length: 48
@@ -164,6 +158,23 @@ address of the unit. Example of request:
 
     app-host=myapp.cloud.tsuru.io&unit-host=10.4.3.2
 
+The second endpoint ``/resources/<service-instance-name>/bind-app`` will be
+called once when an app is bound to a service.  This endpoint is a POST with
+app-host, where app-host represents the host to which the app is accessible.
+Example of request:
+
+::
+
+    POST /resources/myinstance/bind-app HTTP/1.1
+    Host: myserviceapi.com
+    User-Agent: Go 1.1 package http
+    Content-Length: 48
+    Accept: application/json
+    Authorization: Basic dXNlcjpwYXNzd29yZA==
+    Content-Type: application/x-www-form-urlencoded
+
+    app-host=myapp.cloud.tsuru.io
+
 The service API should return the following HTTP response code with the
 respective response body:
 
@@ -172,8 +183,6 @@ respective response body:
       instance that should be exported in the app in order to connect to the
       instance. If the service does not export any environment variable, it can
       return ``null`` or ``{}`` in the response body. Example of response:
-
-.. highlight:: text
 
 ::
 
@@ -204,22 +213,39 @@ the service via command line:
 
 ::
 
-    $ tsuru unbind mysql_instance --app my_app
+    $ tsuru service-instance-unbind mysql mysql_instance --app my_app
 
-tsuru calls the service API to unbind the app from the instance via DELETE on
-``/resources/<service-name>/hostname/<app-hostname>`` (please notice that tsuru
-does not include a trailing slash). Example of request:
-
-.. highlight:: text
+Now, tsuru services has two unbind endpoints:
+``/resources/<service-instance-name>/bind`` and
+``/resources/<service-instance-name>/bind-app``.
+The first endpoint will be called every time an app removes an unit.
+This endpoint is a DELETE with app-host and unit-host. Example of request:
 
 ::
 
-    DELETE /resources/myinstance/hostname/myapp.cloud.tsuru.io HTTP/1.1
+    DELETE /resources/myinstance/bind HTTP/1.1
     Host: myserviceapi.com
     User-Agent: Go 1.1 package http
     Accept: application/json
     Authorization: Basic dXNlcjpwYXNzd29yZA==
     Content-Type: application/x-www-form-urlencoded
+
+    app-host=myapp.cloud.tsuru.io&unit-host=10.4.3.2
+
+The second endpoint ``/resources/<service-instance-name>/bind-app`` will be
+called once when the binding between a service and an application is removed.
+This endpoint is a DELETE with app-host. Example of request:
+
+::
+
+    DELETE /resources/myinstance/bind-app HTTP/1.1
+    Host: myserviceapi.com
+    User-Agent: Go 1.1 package http
+    Accept: application/json
+    Authorization: Basic dXNlcjpwYXNzd29yZA==
+    Content-Type: application/x-www-form-urlencoded
+
+    app-host=myapp.cloud.tsuru.io
 
 The API should return the following HTTP response code with the respective
 response body:
@@ -242,13 +268,11 @@ via command line:
 
 ::
 
-    $ tsuru service-remove mysql_instance -y
+    $ tsuru service-instance-remove mysql mysql_instance -y
 
 tsuru calls the service API to remove the instancevia DELETE on
 ``/resources/<service-name>`` (please notice that tsuru does not include a
 trailing slash). Example of request:
-
-.. highlight:: text
 
 ::
 
@@ -279,13 +303,11 @@ instance via command line:
 
 ::
 
-    $ tsuru service-status mysql_instance
+    $ tsuru service-instance-status mysql mysql_instance
 
 tsuru calls the service API to check the status of the instance via GET on
 ``/resources/mysql_instance/status`` (please notice that tsuru does not include
 a trailing slash). Example of request:
-
-.. highlight:: text
 
 ::
 
@@ -308,12 +330,11 @@ response body:
 Additional info about an instance
 =================================
 
-When the user run ``tsuru service-info <service>``, tsuru will get informations
+When the user run ``tsuru service-info <service>`` or 
+``tsuru service-instance-info``, tsuru will get informations
 from all instances. This is an optional endpoint in the service API. Some
 services does not provide any extra information for instances. Example of
 request:
-
-.. highlight:: text
 
 ::
 
@@ -331,8 +352,6 @@ The API should return the following HTTP response codes:
     * 200: when there's extra information of the service instance. The response
       body must be a JSON containing a list of items. Each item is a JSON
       object combosed by a label and a value. Example response:
-
-.. highlight:: text
 
 ::
 

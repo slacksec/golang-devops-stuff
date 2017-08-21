@@ -6,38 +6,55 @@
 Recovering an application
 +++++++++++++++++++++++++
 
-Your application may be downtime for a number of reasons. 
-This page will help you discover why and what you can do to fix the problem.
+Your application may be down for a number of reasons. This page can help you
+discover why and guide you to fix the problem.
 
 Check your application logs
 ===========================
 
-The first step is to check the application logs. To view your logs, run:
+tsuru aggregates stdout and stderr from every application process making it easier
+to troubleshoot problems.
 
-.. highlight:: bash
-
-::
-
-    $ tsuru log -a appname
+To know more how the tsuru log works see the :doc:`log documentation
+</using/logging>`.
 
 Restart your application
 ========================
 
-Some application issues are solved by restart. 
-For example, your application may need to be restarted after a 
-schema change to your database.
+Some application issues are solved by a simple restart. For example, your
+application may need to be restarted after a schema change to your database.
 
 .. highlight:: bash
 
 ::
 
-    $ tsuru restart -a appname
+    $ tsuru app-restart -a appname
 
-Checking units status
-=====================
+Checking the status of application units
+========================================
 
 .. highlight:: bash
 
 ::
 
     $ tsuru app-info -a appname
+
+Open a shell to the application
+===============================
+
+You can also use `tsuru app-shell` to open a remote shell to one of the units
+of the application.
+
+.. highlight:: bash
+
+::
+
+    $ tsuru app-shell -a appname
+
+You can also specify the unit ID to connect:
+
+.. highlight:: bash
+
+::
+
+    $ tsuru app-shell -a appname <container-id>

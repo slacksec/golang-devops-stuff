@@ -1,47 +1,57 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2012 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package app
 
 import (
+	"encoding/json"
 	"fmt"
+	"testing"
+
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/auth/native"
+	"github.com/tsuru/tsuru/builder"
+	"github.com/tsuru/tsuru/builder/fake"
 	"github.com/tsuru/tsuru/db"
+	"github.com/tsuru/tsuru/db/dbtest"
+	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/pool"
+	"github.com/tsuru/tsuru/provision/provisiontest"
+	"github.com/tsuru/tsuru/queue"
 	"github.com/tsuru/tsuru/quota"
-	"github.com/tsuru/tsuru/service"
-	ttesting "github.com/tsuru/tsuru/testing"
-	"gopkg.in/mgo.v2/bson"
-	"io"
-	"io/ioutil"
-	"launchpad.net/gocheck"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path"
-	"testing"
+	"github.com/tsuru/tsuru/repository"
+	"github.com/tsuru/tsuru/repository/repositorytest"
+	"github.com/tsuru/tsuru/router/rebuild"
+	"github.com/tsuru/tsuru/router/routertest"
+	_ "github.com/tsuru/tsuru/storage/mongodb"
+	appTypes "github.com/tsuru/tsuru/types/app"
+	authTypes "github.com/tsuru/tsuru/types/auth"
+	"gopkg.in/check.v1"
 )
 
-func Test(t *testing.T) { gocheck.TestingT(t) }
+func Test(t *testing.T) { check.TestingT(t) }
 
 type S struct {
 	conn        *db.Storage
-	team        auth.Team
+	logConn     *db.LogStorage
+	team        authTypes.Team
 	user        *auth.User
-	adminTeam   auth.Team
-	admin       *auth.User
-	t           *ttesting.T
-	provisioner *ttesting.FakeProvisioner
+	provisioner *provisiontest.FakeProvisioner
+	defaultPlan appTypes.Plan
+	Pool        string
+	zeroLock    map[string]interface{}
 }
 
-var _ = gocheck.Suite(&S{})
+var _ = check.Suite(&S{})
 
 type greaterChecker struct{}
 
-func (c *greaterChecker) Info() *gocheck.CheckerInfo {
-	return &gocheck.CheckerInfo{Name: "Greater", Params: []string{"expected", "obtained"}}
+func (c *greaterChecker) Info() *check.CheckerInfo {
+	return &check.CheckerInfo{Name: "Greater", Params: []string{"expected", "obtained"}}
 }
 
 func (c *greaterChecker) Check(params []interface{}, names []string) (bool, string) {
@@ -63,117 +73,95 @@ func (c *greaterChecker) Check(params []interface{}, names []string) (bool, stri
 	return false, err
 }
 
-var Greater gocheck.Checker = &greaterChecker{}
+var Greater check.Checker = &greaterChecker{}
 
-func (s *S) createUserAndTeam(c *gocheck.C) {
+func (s *S) createUserAndTeam(c *check.C) {
 	s.user = &auth.User{
 		Email: "whydidifall@thewho.com",
 		Quota: quota.Unlimited,
 	}
 	err := s.user.Create()
-	c.Assert(err, gocheck.IsNil)
-	s.team = auth.Team{Name: "tsuruteam", Users: []string{s.user.Email}}
-	err = s.conn.Teams().Insert(s.team)
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
+	s.team = authTypes.Team{Name: "tsuruteam"}
+	err = auth.TeamService().Insert(s.team)
+	c.Assert(err, check.IsNil)
 }
 
 var nativeScheme = auth.Scheme(native.NativeScheme{})
 
-func (s *S) SetUpSuite(c *gocheck.C) {
+func (s *S) SetUpSuite(c *check.C) {
 	err := config.ReadConfigFile("testdata/config.yaml")
-	c.Assert(err, gocheck.IsNil)
+	c.Assert(err, check.IsNil)
+	config.Set("log:disable-syslog", true)
+	config.Set("queue:mongo-url", "127.0.0.1:27017")
+	config.Set("queue:mongo-database", "queue_app_pkg_tests")
+	config.Set("queue:mongo-polling-interval", 0.01)
+	config.Set("docker:registry", "registry.somewhere")
+	config.Set("routers:fake-tls:type", "fake-tls")
+	config.Set("auth:hash-cost", bcrypt.MinCost)
 	s.conn, err = db.Conn()
-	c.Assert(err, gocheck.IsNil)
-	s.t = &ttesting.T{}
-	s.createUserAndTeam(c)
-	s.t.SetGitConfs(c)
-	s.provisioner = ttesting.NewFakeProvisioner()
-	Provisioner = s.provisioner
+	c.Assert(err, check.IsNil)
+	s.logConn, err = db.LogConn()
+	c.Assert(err, check.IsNil)
+	s.provisioner = provisiontest.ProvisionerInstance
+	builder.DefaultBuilder = "fake"
+	builder.Register("fake", fake.NewFakeBuilder())
+	provision.DefaultProvisioner = "fake"
 	AuthScheme = nativeScheme
-	platform := Platform{Name: "python"}
-	s.conn.Platforms().Insert(platform)
+	data, err := json.Marshal(AppLock{})
+	c.Assert(err, check.IsNil)
+	err = json.Unmarshal(data, &s.zeroLock)
+	c.Assert(err, check.IsNil)
 }
 
-func (s *S) TearDownSuite(c *gocheck.C) {
+func (s *S) TearDownSuite(c *check.C) {
+	defer s.conn.Close()
+	defer s.logConn.Close()
 	s.conn.Apps().Database.DropDatabase()
+	s.logConn.Logs("myapp").Database.DropDatabase()
 }
 
-func (s *S) TearDownTest(c *gocheck.C) {
-	s.t.RollbackGitConfs(c)
+func (s *S) SetUpTest(c *check.C) {
+	// Reset fake routers twice, first time will remove registered failures and
+	// allow pending enqueued tasks to run, second time (after queue is reset)
+	// will remove any routes added by executed queue tasks.
+	routertest.FakeRouter.Reset()
+	routertest.HCRouter.Reset()
+	routertest.TLSRouter.Reset()
+	routertest.OptsRouter.Reset()
+	queue.ResetQueue()
+	routertest.FakeRouter.Reset()
+	routertest.HCRouter.Reset()
+	routertest.TLSRouter.Reset()
+	routertest.OptsRouter.Reset()
+	err := rebuild.RegisterTask(func(appName string) (rebuild.RebuildApp, error) {
+		a, err := GetByName(appName)
+		if err == ErrAppNotFound {
+			return nil, nil
+		}
+		return a, err
+	})
+	c.Assert(err, check.IsNil)
+	config.Set("docker:router", "fake")
 	s.provisioner.Reset()
-	LogRemove(nil)
-	s.conn.Users().Update(
-		bson.M{"email": s.user.Email},
-		bson.M{"$set": bson.M{"quota": quota.Unlimited}},
-	)
-}
-
-func (s *S) getTestData(p ...string) io.ReadCloser {
-	p = append([]string{}, ".", "testdata")
-	fp := path.Join(p...)
-	f, _ := os.OpenFile(fp, os.O_RDONLY, 0)
-	return f
-}
-
-func (s *S) createAdminUserAndTeam(c *gocheck.C) {
-	s.admin = &auth.User{Email: "superuser@gmail.com"}
-	err := s.admin.Create()
-	c.Assert(err, gocheck.IsNil)
-	adminTeamName, err := config.GetString("admin-team")
-	c.Assert(err, gocheck.IsNil)
-	s.adminTeam = auth.Team{Name: adminTeamName, Users: []string{s.admin.Email}}
-	err = s.conn.Teams().Insert(&s.adminTeam)
-	c.Assert(err, gocheck.IsNil)
-}
-
-func (s *S) removeAdminUserAndTeam(c *gocheck.C) {
-	err := s.conn.Teams().RemoveId(s.adminTeam.Name)
-	c.Assert(err, gocheck.IsNil)
-	err = s.conn.Users().Remove(bson.M{"email": s.admin.Email})
-	c.Assert(err, gocheck.IsNil)
-}
-
-func (s *S) addServiceInstance(c *gocheck.C, appName string, fn http.HandlerFunc) func() {
-	ts := httptest.NewServer(fn)
-	ret := func() {
-		ts.Close()
-		s.conn.Services().Remove(bson.M{"_id": "mysql"})
-		s.conn.ServiceInstances().Remove(bson.M{"_id": "my-mysql"})
+	repositorytest.Reset()
+	dbtest.ClearAllCollections(s.conn.Apps().Database)
+	s.createUserAndTeam(c)
+	platform := appTypes.Platform{Name: "python"}
+	PlatformService().Insert(platform)
+	PlatformService().Insert(appTypes.Platform{Name: "heimerdinger"})
+	s.defaultPlan = appTypes.Plan{
+		Name:     "default-plan",
+		Memory:   1024,
+		Swap:     1024,
+		CpuShare: 100,
+		Default:  true,
 	}
-	srvc := service.Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
-	err := srvc.Create()
-	c.Assert(err, gocheck.IsNil)
-	instance := service.ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
-	err = instance.Create()
-	c.Assert(err, gocheck.IsNil)
-	err = instance.AddApp(appName)
-	c.Assert(err, gocheck.IsNil)
-	err = s.conn.ServiceInstances().Update(bson.M{"name": instance.Name}, instance)
-	c.Assert(err, gocheck.IsNil)
-	return ret
-}
-
-type testHandler struct {
-	body    [][]byte
-	method  []string
-	url     []string
-	content string
-	header  []http.Header
-}
-
-func (h *testHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.method = append(h.method, r.Method)
-	h.url = append(h.url, r.URL.String())
-	b, _ := ioutil.ReadAll(r.Body)
-	h.body = append(h.body, b)
-	h.header = append(h.header, r.Header)
-	w.Write([]byte(h.content))
-}
-
-type testBadHandler struct {
-	msg string
-}
-
-func (h *testBadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, h.msg, http.StatusInternalServerError)
+	err = PlanService().Insert(s.defaultPlan)
+	c.Assert(err, check.IsNil)
+	s.Pool = "pool1"
+	opts := pool.AddPoolOptions{Name: s.Pool, Default: true}
+	err = pool.AddPool(opts)
+	c.Assert(err, check.IsNil)
+	repository.Manager().CreateUser(s.user.Email)
 }

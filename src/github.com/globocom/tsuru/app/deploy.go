@@ -6,149 +6,315 @@ package app
 
 import (
 	"fmt"
-	"github.com/tsuru/go-gandalfclient"
-	"github.com/tsuru/tsuru/action"
-	"github.com/tsuru/tsuru/db"
-	"github.com/tsuru/tsuru/provision"
-	"github.com/tsuru/tsuru/repository"
-	"github.com/tsuru/tsuru/service"
-	"gopkg.in/mgo.v2/bson"
 	"io"
+	"regexp"
 	"time"
+
+	"github.com/pkg/errors"
+	"github.com/tsuru/tsuru/app/image"
+	"github.com/tsuru/tsuru/builder"
+	"github.com/tsuru/tsuru/db"
+	"github.com/tsuru/tsuru/event"
+	tsuruIo "github.com/tsuru/tsuru/io"
+	"github.com/tsuru/tsuru/log"
+	"github.com/tsuru/tsuru/permission"
+	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/router/rebuild"
+	"github.com/tsuru/tsuru/set"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
-type deploy struct {
-	ID        bson.ObjectId `bson:"_id,omitempty"`
-	App       string
-	Timestamp time.Time
-	Duration  time.Duration
-	Commit    string
-	Error     string
+type DeployKind string
+
+const (
+	DeployArchiveURL  DeployKind = "archive-url"
+	DeployGit         DeployKind = "git"
+	DeployImage       DeployKind = "image"
+	DeployRollback    DeployKind = "rollback"
+	DeployUpload      DeployKind = "upload"
+	DeployUploadBuild DeployKind = "uploadbuild"
+	DeployRebuild     DeployKind = "rebuild"
+)
+
+var reImageVersion = regexp.MustCompile("v[0-9]+$")
+
+type DeployData struct {
+	ID          bson.ObjectId `bson:"_id,omitempty"`
+	App         string
+	Timestamp   time.Time
+	Duration    time.Duration
+	Commit      string
+	Error       string
+	Image       string
+	Log         string
+	User        string
+	Origin      string
+	CanRollback bool
+	RemoveDate  time.Time `bson:",omitempty"`
+	Diff        string
 }
 
-func (app *App) ListDeploys() ([]deploy, error) {
-	return listDeploys(app, nil)
-}
-
-func ListDeploys(s *service.Service) ([]deploy, error) {
-	return listDeploys(nil, s)
-}
-
-func listDeploys(app *App, s *service.Service) ([]deploy, error) {
-	var list []deploy
-	conn, err := db.Conn()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	var qr bson.M
-	if app != nil {
-		qr = bson.M{"app": app.Name}
-	}
-	if s != nil {
-		var instances []service.ServiceInstance
-		q := bson.M{"service_name": s.Name}
-		err = conn.ServiceInstances().Find(q).All(&instances)
-		if err != nil {
+func findValidImages(apps ...App) (set.Set, error) {
+	validImages := set.Set{}
+	for _, a := range apps {
+		imgs, err := image.ListAppImages(a.Name)
+		if err != nil && err != mgo.ErrNotFound {
 			return nil, err
 		}
-		var appNames []string
-		for _, instance := range instances {
-			for _, apps := range instance.Apps {
-				appNames = append(appNames, apps)
+		validImages.Add(imgs...)
+	}
+	return validImages, nil
+}
+
+// ListDeploys returns the list of deploy that match a given filter.
+func ListDeploys(filter *Filter, skip, limit int) ([]DeployData, error) {
+	appsList, err := List(filter)
+	if err != nil {
+		return nil, err
+	}
+	apps := make([]string, len(appsList))
+	for i, a := range appsList {
+		apps[i] = a.GetName()
+	}
+	evts, err := event.List(&event.Filter{
+		Target:   event.Target{Type: event.TargetTypeApp},
+		Raw:      bson.M{"target.value": bson.M{"$in": apps}},
+		KindName: permission.PermAppDeploy.FullName(),
+		KindType: event.KindTypePermission,
+		Limit:    limit,
+		Skip:     skip,
+	})
+	if err != nil {
+		return nil, err
+	}
+	validImages, err := findValidImages(appsList...)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]DeployData, len(evts))
+	for i := range evts {
+		list[i] = *eventToDeployData(&evts[i], validImages, false)
+	}
+	return list, nil
+}
+
+func GetDeploy(id string) (*DeployData, error) {
+	if !bson.IsObjectIdHex(id) {
+		return nil, errors.Errorf("id parameter is not ObjectId: %s", id)
+	}
+	objID := bson.ObjectIdHex(id)
+	evt, err := event.GetByID(objID)
+	if err != nil {
+		return nil, err
+	}
+	return eventToDeployData(evt, nil, true), nil
+}
+
+func eventToDeployData(evt *event.Event, validImages set.Set, full bool) *DeployData {
+	data := &DeployData{
+		ID:        evt.UniqueID,
+		App:       evt.Target.Value,
+		Timestamp: evt.StartTime,
+		Duration:  evt.EndTime.Sub(evt.StartTime),
+		Error:     evt.Error,
+		User:      evt.Owner.Name,
+	}
+	var startOpts DeployOptions
+	err := evt.StartData(&startOpts)
+	if err == nil {
+		data.Commit = startOpts.Commit
+		data.Origin = startOpts.GetOrigin()
+	}
+	if full {
+		data.Log = evt.Log
+		var otherData map[string]string
+		err = evt.OtherData(&otherData)
+		if err == nil {
+			data.Diff = otherData["diff"]
+		}
+	}
+	var endData map[string]string
+	err = evt.EndData(&endData)
+	if err == nil {
+		data.Image = endData["image"]
+		if validImages != nil {
+			data.CanRollback = validImages.Includes(data.Image)
+			if reImageVersion.MatchString(data.Image) {
+				parts := reImageVersion.FindAllStringSubmatch(data.Image, -1)
+				data.Image = parts[0][0]
 			}
 		}
-		qr = bson.M{"app": bson.M{"$in": appNames}}
 	}
-	if err := conn.Deploys().Find(qr).Sort("-timestamp").All(&list); err != nil {
-		return nil, err
-	}
-	return list, err
-}
-
-func GetDeploy(id string) (*deploy, error) {
-	var dep deploy
-	conn, err := db.Conn()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	if err := conn.Deploys().FindId(bson.ObjectIdHex(id)).One(&dep); err != nil {
-		return nil, err
-	}
-	return &dep, nil
-}
-
-func GetDiffInDeploys(d *deploy) (string, error) {
-	var list []deploy
-	conn, err := db.Conn()
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-	if err := conn.Deploys().Find(bson.M{"app": d.App}).Sort("-timestamp").All(&list); err != nil {
-		return "", err
-	}
-	if len(list) < 2 {
-		return "", fmt.Errorf("The deployment must have at least two commits for the diff.")
-	}
-	gandalfClient := gandalf.Client{Endpoint: repository.ServerURL()}
-	diffOutput, err := gandalfClient.GetDiff(d.App, list[1].Commit, list[0].Commit)
-	if err != nil {
-		return "", fmt.Errorf("Caught error getting repository metadata: %s", err.Error())
-	}
-	return diffOutput, nil
+	return data
 }
 
 type DeployOptions struct {
 	App          *App
-	Version      string
 	Commit       string
 	ArchiveURL   string
-	OutputStream io.Writer
+	FileSize     int64
+	File         io.ReadCloser `bson:"-"`
+	OutputStream io.Writer     `bson:"-"`
+	User         string
+	Image        string
+	Origin       string
+	Rollback     bool
+	Build        bool
+	Event        *event.Event `bson:"-"`
+	Kind         DeployKind
+	Message      string
+}
+
+func (o *DeployOptions) GetOrigin() string {
+	if o.Origin != "" {
+		return o.Origin
+	}
+	if o.Commit != "" {
+		return "git"
+	}
+	return ""
+}
+
+func (o *DeployOptions) GetKind() (kind DeployKind) {
+	defer func() {
+		o.Kind = kind
+	}()
+	if o.Rollback {
+		return DeployRollback
+	}
+	if o.Image != "" {
+		return DeployImage
+	}
+	if o.File != nil {
+		if o.Build {
+			return DeployUploadBuild
+		}
+		return DeployUpload
+	}
+	if o.Commit != "" {
+		return DeployGit
+	}
+	return DeployArchiveURL
 }
 
 // Deploy runs a deployment of an application. It will first try to run an
 // archive based deploy (if opts.ArchiveURL is not empty), and then fallback to
 // the Git based deployment.
-func Deploy(opts DeployOptions) error {
-	var pipeline *action.Pipeline
-	start := time.Now()
-	if cprovisioner, ok := Provisioner.(provision.CustomizedDeployPipelineProvisioner); ok {
-		pipeline = cprovisioner.DeployPipeline()
-	} else {
-		actions := []*action.Action{&ProvisionerDeploy, &IncrementDeploy}
-		pipeline = action.NewPipeline(actions...)
+func Deploy(opts DeployOptions) (string, error) {
+	if opts.Event == nil {
+		return "", errors.Errorf("missing event in deploy opts")
 	}
-	logWriter := LogWriter{App: opts.App, Writer: opts.OutputStream}
-	err := pipeline.Execute(opts, &logWriter)
-	elapsed := time.Since(start)
+	if opts.Rollback && !regexp.MustCompile(":v[0-9]+$").MatchString(opts.Image) {
+		imageName, err := image.GetAppImageBySuffix(opts.App.Name, opts.Image)
+		if err != nil {
+			return "", err
+		}
+		opts.Image = imageName
+	}
+	logWriter := LogWriter{App: opts.App}
+	logWriter.Async()
+	defer logWriter.Close()
+	opts.Event.SetLogWriter(io.MultiWriter(&tsuruIo.NoErrorWriter{Writer: opts.OutputStream}, &logWriter))
+	imageID, err := deployToProvisioner(&opts, opts.Event)
+	rebuild.RoutesRebuildOrEnqueue(opts.App.Name)
 	if err != nil {
-		saveDeployData(opts.App.Name, opts.Commit, elapsed, err)
-		return err
+		return "", err
 	}
-	if opts.App.UpdatePlatform == true {
+	err = incrementDeploy(opts.App)
+	if err != nil {
+		log.Errorf("WARNING: couldn't increment deploy count, deploy opts: %#v", opts)
+	}
+	if opts.App.UpdatePlatform {
 		opts.App.SetUpdatePlatform(false)
 	}
-	return saveDeployData(opts.App.Name, opts.Commit, elapsed, nil)
+	return imageID, nil
 }
 
-func saveDeployData(appName, commit string, duration time.Duration, deployError error) error {
-	conn, err := db.Conn()
+func RollbackUpdate(appName, imageID, reason string, disableRollback bool) error {
+	imgName, err := image.GetAppImageBySuffix(appName, imageID)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	deploy := deploy{
-		App:       appName,
-		Timestamp: time.Now(),
-		Duration:  duration,
-		Commit:    commit,
+	return image.UpdateAppImageRollback(imgName, reason, disableRollback)
+}
+
+func deployToProvisioner(opts *DeployOptions, evt *event.Event) (string, error) {
+	prov, err := opts.App.getProvisioner()
+	if err != nil {
+		return "", err
 	}
-	if deployError != nil {
-		deploy.Error = deployError.Error()
+	if opts.Kind == "" {
+		opts.GetKind()
 	}
-	return conn.Deploys().Insert(deploy)
+	if (opts.App.GetPlatform() == "") && ((opts.Kind != DeployImage) && (opts.Kind != DeployRollback)) {
+		return "", errors.Errorf("can't deploy app without platform, if it's not an image or rollback")
+	}
+	switch opts.Kind {
+	case DeployRollback:
+		if deployer, ok := prov.(provision.RollbackableDeployer); ok {
+			return deployer.Rollback(opts.App, opts.Image, evt)
+		}
+	case DeployImage:
+		if deployer, ok := prov.(provision.BuilderDeploy); ok {
+			return builderDeploy(deployer, opts, evt, false)
+		}
+		if deployer, ok := prov.(provision.ImageDeployer); ok {
+			return deployer.ImageDeploy(opts.App, opts.Image, evt)
+		}
+	case DeployUpload, DeployUploadBuild:
+		if deployer, ok := prov.(provision.BuilderDeploy); ok {
+			return builderDeploy(deployer, opts, evt, false)
+		}
+		if deployer, ok := prov.(provision.UploadDeployer); ok {
+			return deployer.UploadDeploy(opts.App, opts.File, opts.FileSize, opts.Build, evt)
+		}
+	case DeployRebuild:
+		if deployer, ok := prov.(provision.BuilderDeploy); ok {
+			return builderDeploy(deployer, opts, evt, true)
+		}
+		if deployer, ok := prov.(provision.RebuildableDeployer); ok {
+			return deployer.Rebuild(opts.App, evt)
+		}
+	default:
+		if deployer, ok := prov.(provision.BuilderDeploy); ok {
+			return builderDeploy(deployer, opts, evt, false)
+		}
+		if deployer, ok := prov.(provision.ArchiveDeployer); ok {
+			return deployer.ArchiveDeploy(opts.App, opts.ArchiveURL, evt)
+		}
+	}
+	return "", provision.ProvisionerNotSupported{Prov: prov, Action: fmt.Sprintf("%s deploy", opts.Kind)}
+}
+
+func builderDeploy(prov provision.BuilderDeploy, opts *DeployOptions, evt *event.Event, isRebuild bool) (string, error) {
+	buildOpts := builder.BuildOpts{
+		BuildFromFile: opts.Build,
+		ArchiveURL:    opts.ArchiveURL,
+		ArchiveFile:   opts.File,
+		ArchiveSize:   opts.FileSize,
+		Rebuild:       isRebuild,
+		ImageID:       opts.Image,
+	}
+	build, err := opts.App.getBuilder()
+	if err != nil {
+		return "", err
+	}
+	imageID, err := build.Build(prov, opts.App, evt, buildOpts)
+	if err != nil {
+		return "", err
+	}
+	return prov.Deploy(opts.App, imageID, evt)
+}
+
+func ValidateOrigin(origin string) bool {
+	originList := []string{"app-deploy", "git", "rollback", "drag-and-drop", "image", "rebuild"}
+	for _, ol := range originList {
+		if ol == origin {
+			return true
+		}
+	}
+	return false
 }
 
 func incrementDeploy(app *App) error {
@@ -157,8 +323,66 @@ func incrementDeploy(app *App) error {
 		return err
 	}
 	defer conn.Close()
-	return conn.Apps().Update(
+	err = conn.Apps().Update(
 		bson.M{"name": app.Name},
 		bson.M{"$inc": bson.M{"deploys": 1}},
 	)
+	if err == nil {
+		app.Deploys += 1
+	}
+	return err
+}
+
+func deployDataToEvent(data *DeployData) error {
+	var evt event.Event
+	evt.UniqueID = data.ID
+	evt.Target = event.Target{Type: event.TargetTypeApp, Value: data.App}
+	evt.Owner = event.Owner{Type: event.OwnerTypeUser, Name: data.User}
+	evt.Kind = event.Kind{Type: event.KindTypePermission, Name: permission.PermAppDeploy.FullName()}
+	evt.StartTime = data.Timestamp
+	evt.EndTime = data.Timestamp.Add(data.Duration)
+	evt.Error = data.Error
+	evt.Log = data.Log
+	evt.RemoveDate = data.RemoveDate
+	a, err := GetByName(data.App)
+	if err == nil {
+		evt.Allowed = event.Allowed(permission.PermAppReadEvents, append(permission.Contexts(permission.CtxTeam, a.Teams),
+			permission.Context(permission.CtxApp, a.Name),
+			permission.Context(permission.CtxPool, a.Pool),
+		)...)
+	} else {
+		evt.Allowed = event.Allowed(permission.PermAppReadEvents)
+	}
+	startOpts := DeployOptions{
+		Commit: data.Commit,
+		Origin: data.Origin,
+	}
+	var otherData map[string]string
+	if data.Diff != "" {
+		otherData = map[string]string{"diff": data.Diff}
+	}
+	endData := map[string]string{"image": data.Image}
+	err = evt.RawInsert(startOpts, otherData, endData)
+	if mgo.IsDup(err) {
+		return nil
+	}
+	return err
+}
+
+func MigrateDeploysToEvents() error {
+	conn, err := db.Conn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	oldDeploysColl := conn.Collection("deploys")
+	iter := oldDeploysColl.Find(nil).Iter()
+	var data DeployData
+	for iter.Next(&data) {
+		err = deployDataToEvent(&data)
+		if err != nil {
+			return err
+		}
+	}
+	return iter.Close()
 }

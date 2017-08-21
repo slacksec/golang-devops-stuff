@@ -1,4 +1,4 @@
-.. Copyright 2014 tsuru authors. All rights reserved.
+.. Copyright 2012 tsuru authors. All rights reserved.
    Use of this source code is governed by a BSD-style
    license that can be found in the LICENSE file.
 
@@ -152,8 +152,8 @@ Binding instances to apps
 -------------------------
 
 In the bind action, tsuru calls your service via POST on
-``/resources/<service_name>`` with the parameters needed for binding an app
-into a service instance.
+``/resources/<service-instance-name>/bind-app`` with the parameters needed for
+binding an app into a service instance.
 
 If the bind operation succeeds, the API should return 201 as status code with
 the variables to be exported in the app environment on body in JSON format.
@@ -170,12 +170,11 @@ called "SOMEVAR" to be injected in the app environment:
     from flask import request
 
 
-    @app.route("/resources/<name>", methods=["POST"])
-    def bind(name):
+    @app.route("/resources/<name>/bind-app", methods=["POST"])
+    def bind_app(name):
         app_host = request.form.get("app-host")
-        unit_host = request.form.get("unit-host")
-        # use name, app_host and unit_host to bind the service instance and the
-        # application
+        # use name and app_host to bind the service instance and the #
+        application
         envs = {"SOMEVAR": "somevalue"}
         return json.dumps(envs), 201
 
@@ -183,7 +182,7 @@ Unbinding instances from apps
 -----------------------------
 
 In the unbind action, tsuru issues a ``DELETE`` request to the URL
-``/resources/<service_name>/hostname/<unit_hostname>``.
+``/resources/<service-instance-name>/bind-app``.
 
 If the unbind operation succeeds, the API should return 200 as status code.
 Let's create the view for this action:
@@ -192,10 +191,35 @@ Let's create the view for this action:
 
 ::
 
-    @app.route("/resources/<name>/hostname/<host>", methods=["DELETE"])
-    def unbind(name, host):
-        # use name and host to remove the bind
+    @app.route("/resources/<name>/bind-app", methods=["DELETE"])
+    def unbind_app(name):
+        app_host = request.form.get("app-host")
+        # use name and app-host to remove the bind
         return "", 200
+
+Whitelisting units
+------------------
+
+When binding and unbindin application and service instances, tsuru will also
+provide information about units that will have access to the service instance,
+so the service API can handle any required whitelisting (writing ACL rules to a
+network switch or authorizing access in a firewall, for example).
+
+tsuru will send POST and DELETE requests to the route
+``/resources/<name>/bind``, with the host of the app and the unit, so any
+access control can be handled by the API:
+
+.. highlight:: python
+
+::
+
+    @app.route("/resources/<name>/bind", methods=["POST", "DELETE"])
+    def access_control(name):
+        app_host = request.form.get("app-host")
+        unit_host = request.form.get("unit-host")
+        # use unit-host and app-host, according to the access control tool, and
+        # the request method.
+        return "", 201
 
 Removing instances
 ------------------
@@ -243,7 +267,7 @@ The final code for our "fake API" developed in Flask is:
 
     import json
 
-    from flask import Flask
+    from flask import Flask, request
 
     app = Flask(__name__)
 
@@ -266,19 +290,19 @@ The final code for our "fake API" developed in Flask is:
         return "", 201
 
 
-    @app.route("/resources/<name>", methods=["POST"])
-    def bind(name):
+    @app.route("/resources/<name>/bind-app", methods=["POST"])
+    def bind_app(name):
         app_host = request.form.get("app-host")
-        unit_host = request.form.get("unit-host")
-        # use name, app_host and unit_host to bind the service instance and the
-        # application
+        # use name and app_host to bind the service instance and the #
+        application
         envs = {"SOMEVAR": "somevalue"}
         return json.dumps(envs), 201
 
 
-    @app.route("/resources/<name>/hostname/<host>", methods=["DELETE"])
-    def unbind(name, host):
-        # use name and host to remove the bind
+    @app.route("/resources/<name>/bind-app", methods=["DELETE"])
+    def unbind_app(name):
+        app_host = request.form.get("app-host")
+        # use name and app-host to remove the bind
         return "", 200
 
 
@@ -286,6 +310,15 @@ The final code for our "fake API" developed in Flask is:
     def remove_instance(name):
         # remove the instance named "name"
         return "", 200
+
+
+    @app.route("/resources/<name>/bind", methods=["POST", "DELETE"])
+    def access_control(name):
+        app_host = request.form.get("app-host")
+        unit_host = request.form.get("unit-host")
+        # use unit-host and app-host, according to the access control tool, and
+        # the request method.
+        return "", 201
 
 
     @app.route("/resources/<name>/status", methods=["GET"])
@@ -301,13 +334,13 @@ The final code for our "fake API" developed in Flask is:
 Creating a service manifest
 ===========================
 
-Using crane you can create a manifest template:
+Using tsuru-client you can create a manifest template:
 
 .. highlight:: bash
 
 ::
 
-    $ crane template
+    $ tsuru service-template
 
 This will create a manifest.yaml in your current path with this content:
 
@@ -320,7 +353,7 @@ This will create a manifest.yaml in your current path with this content:
     endpoint:
         production: production-endpoint.com
 
-The manifest.yaml is used by crane to defined the ID, the password and the
+The manifest.yaml is used to defined the ID, the password and the
 production endpoint of your service.
 
 Change these information in the created manifest, and the `submit your
@@ -330,10 +363,12 @@ service`_:
 
 ::
 
-    id: fakeserviceid1
-    password: secret123
+    id: servicename
+    username: username_to_auth
+    password: 1CWpoX2Zr46Jhc7u
     endpoint:
-        production: fakeserviceid1.com
+      production: production-endpoint.com
+        test: test-endpoint.com:8080
 
 _`submit your service`: `Submiting your service API`_
 
@@ -346,7 +381,7 @@ To submit your service, you can run:
 
 ::
 
-    $ crane create manifest.yaml
+    $ tsuru service-create manifest.yaml
 
 For more details, check the :doc:`service API workflow </services/api>` and the
-:doc:`crane usage guide </services/usage>`.
+`tsuru-client service management reference <https://tsuru-client.readthedocs.io/en/latest/reference.html#service-management>`_.

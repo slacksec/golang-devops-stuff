@@ -7,17 +7,17 @@ package native
 import (
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/db"
-	tsuruErrors "github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/validation"
 )
 
 var (
-	ErrMissingPasswordError = &tsuruErrors.ValidationError{Message: "You must provide a password to login"}
-	ErrMissingEmailError    = &tsuruErrors.ValidationError{Message: "You must provide a email to login"}
-	ErrInvalidEmail         = &tsuruErrors.ValidationError{Message: "Invalid email."}
-	ErrInvalidPassword      = &tsuruErrors.ValidationError{Message: "Password length should be least 6 characters and at most 50 characters."}
-	ErrEmailRegistered      = &tsuruErrors.ConflictError{Message: "This email is already registered."}
-	ErrPasswordMismatch     = &tsuruErrors.NotAuthorizedError{Message: "The given password didn't match the user's current password."}
+	ErrMissingPasswordError = &errors.ValidationError{Message: "you must provide a password to login"}
+	ErrMissingEmailError    = &errors.ValidationError{Message: "you must provide a email to login"}
+	ErrInvalidEmail         = &errors.ValidationError{Message: "invalid email"}
+	ErrInvalidPassword      = &errors.ValidationError{Message: "password length should be least 6 characters and at most 50 characters"}
+	ErrEmailRegistered      = &errors.ConflictError{Message: "this email is already registered"}
+	ErrPasswordMismatch     = &errors.NotAuthorizedError{Message: "the given password didn't match the user's current password"}
 )
 
 type NativeScheme struct{}
@@ -56,6 +56,10 @@ func (s NativeScheme) Logout(token string) error {
 
 func (s NativeScheme) AppLogin(appName string) (auth.Token, error) {
 	return createApplicationToken(appName)
+}
+
+func (s NativeScheme) AppLogout(token string) error {
+	return s.Logout(token)
 }
 
 func (s NativeScheme) Create(user *auth.User) (*auth.User, error) {
@@ -113,6 +117,7 @@ func (s NativeScheme) ResetPassword(user *auth.User, resetToken string) error {
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 	passToken, err := getPasswordToken(resetToken)
 	if err != nil {
 		return err
@@ -129,12 +134,8 @@ func (s NativeScheme) ResetPassword(user *auth.User, resetToken string) error {
 	return user.Update()
 }
 
-func (s NativeScheme) Remove(token auth.Token) error {
-	u, err := token.User()
-	if err != nil {
-		return err
-	}
-	err = deleteAllTokens(u.Email)
+func (s NativeScheme) Remove(u *auth.User) error {
+	err := deleteAllTokens(u.Email)
 	if err != nil {
 		return err
 	}

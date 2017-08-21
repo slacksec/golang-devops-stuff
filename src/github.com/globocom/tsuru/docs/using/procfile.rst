@@ -1,3 +1,8 @@
+.. Copyright 2014 tsuru authors. All rights reserved.
+   Use of this source code is governed by a BSD-style
+   license that can be found in the LICENSE file.
+
+++++++++
 Procfile
 ++++++++
 
@@ -23,7 +28,7 @@ Syntax
 application.
 
 Each project should be represented by a name and a command,
-like bellow:
+like below:
 
 .. highlight:: bash
 
@@ -49,4 +54,4 @@ You can reference yours environment variables in the command:
     web: ./manage.py runserver 0.0.0.0:$PORT
 
 For more information about `Procfile` you can see the honcho documentation
-about `Procfile`: http://honcho.rtfd.org/en/latest/using_procfiles.html.
+about `Procfiles`: http://honcho.rtfd.org/en/latest/using_procfiles.html.
